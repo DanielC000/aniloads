@@ -1,0 +1,109 @@
+# Host paths, the external Docker network, and the user/group IDs must be set in
+# the environment (see .env.example) — there are no host-specific defaults, so a
+# missing value fails fast instead of silently using someone else's layout. TZ
+# defaults to UTC; anime-loads.org login creds are optional.
+networks:
+  anime-net:
+    external: true
+    name: "${ANIME_NETWORK:?set in .env (see .env.example)}"
+
+services:
+  jdownloader:
+    container_name: jdownloader
+    image: jlesage/jdownloader-2:latest
+    restart: unless-stopped
+    ports:
+      - "5800:5800"   # Web UI
+      - "3129:3129"   # MyJDownloader API
+    environment:
+      - "TZ=${TZ:-UTC}"
+      - "USER_ID=${PUID:?set in .env (see .env.example)}"
+      - "GROUP_ID=${PGID:?set in .env (see .env.example)}"
+      - KEEP_APP_RUNNING=1
+      - CLEAN_TMP_DIR=1
+      - TAKE_CONFIG_OWNERSHIP=1
+    volumes:
+      - jdownloader-config:/config
+      - "${ANIME_DOWNLOAD_DIR:?set in .env (see .env.example)}:/output"
+    networks:
+      anime-net:
+
+  anime-loads:
+    container_name: anime-loads
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    image: anime-loads:local
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TVDB_API_KEY=${TVDB_API_KEY:-}
+      # anime-loads.org login (optional; required for Click'n'Load batch downloads).
+      - AL_USER=${AL_USER:-}
+      - AL_PASS=${AL_PASS:-}
+      - LOGLEVEL=${LOGLEVEL:-INFO}
+      - SELENIUM_HOMEPAGE_LOAD_TIMEOUT=${SELENIUM_HOMEPAGE_LOAD_TIMEOUT:-30}
+      - SELENIUM_PAGE_LOAD_TIMEOUT=${SELENIUM_PAGE_LOAD_TIMEOUT:-60}
+      - BROWSER_INIT_WAIT=${BROWSER_INIT_WAIT:-3}
+      - BROWSER_PAGE_WAIT=${BROWSER_PAGE_WAIT:-10}
+      - BROWSER_DOWNLOAD_PAGE_WAIT=${BROWSER_DOWNLOAD_PAGE_WAIT:-15}
+      - CAPTCHA_FETCH_DELAY_MIN=${CAPTCHA_FETCH_DELAY_MIN:-1.5}
+      - CAPTCHA_FETCH_DELAY_MAX=${CAPTCHA_FETCH_DELAY_MAX:-3.0}
+      - CAPTCHA_VERIFY_DELAY_MIN=${CAPTCHA_VERIFY_DELAY_MIN:-0.8}
+      - CAPTCHA_VERIFY_DELAY_MAX=${CAPTCHA_VERIFY_DELAY_MAX:-2.0}
+      - CAPTCHA_DOWNLOAD_DELAY_MIN=${CAPTCHA_DOWNLOAD_DELAY_MIN:-0.5}
+      - CAPTCHA_DOWNLOAD_DELAY_MAX=${CAPTCHA_DOWNLOAD_DELAY_MAX:-1.5}
+      - CNL_RETRY_DELAY_MIN=${CNL_RETRY_DELAY_MIN:-5}
+      - CNL_RETRY_DELAY_MAX=${CNL_RETRY_DELAY_MAX:-10}
+      - JD_HTTP_TIMEOUT=${JD_HTTP_TIMEOUT:-30}
+      - TVDB_HTTP_TIMEOUT=${TVDB_HTTP_TIMEOUT:-10}
+    volumes:
+      - "${ANIME_CONFIG_DIR:?set in .env (see .env.example)}:/config"
+    networks:
+      anime-net:
+    depends_on:
+      - jdownloader
+
+  anime-web:
+    container_name: anime-web
+    image: anime-loads:local
+    restart: unless-stopped
+    entrypoint: python3
+    command: ["/app/app.py"]
+    ports:
+      - "8085:8080"
+    user: "${PUID:?set in .env (see .env.example)}:${PGID:?set in .env (see .env.example)}"
+    shm_size: "256m"
+    environment:
+      - "TZ=${TZ:-UTC}"
+      - CONFIG_DIR=/config
+      - PORT=8080
+      - HOME=/tmp
+      - TVDB_API_KEY=${TVDB_API_KEY:-}
+      - DOWNLOAD_DIR=/data/downloads/anime
+      - MEDIA_DIR=/data/media/anime
+      - MOVIE_MEDIA_DIR=/data/media/anime movies
+      - LOGLEVEL=${LOGLEVEL:-INFO}
+      - MIN_AGE_MINUTES=${MIN_AGE_MINUTES:-5}
+      - MOVE_POLL_SECONDS=${MOVE_POLL_SECONDS:-300}
+      - MOVE_STARTUP_DELAY=${MOVE_STARTUP_DELAY:-30}
+      - DOCKER_SOCKET_TIMEOUT=${DOCKER_SOCKET_TIMEOUT:-10}
+      - RESOLVE_PENDING_STARTUP_DELAY=${RESOLVE_PENDING_STARTUP_DELAY:-10}
+      - RESOLVE_PENDING_EMPTY_INTERVAL=${RESOLVE_PENDING_EMPTY_INTERVAL:-60}
+      - RESOLVE_PENDING_PER_ENTRY_DELAY=${RESOLVE_PENDING_PER_ENTRY_DELAY:-5}
+      - RESOLVE_PENDING_BATCH_INTERVAL=${RESOLVE_PENDING_BATCH_INTERVAL:-120}
+      - TVDB_HTTP_TIMEOUT=${TVDB_HTTP_TIMEOUT:-10}
+    volumes:
+      - "${ANIME_CONFIG_DIR:?set in .env (see .env.example)}:/config"
+      - "${ANIME_SETUP_DIR:?set in .env (see .env.example)}/web/app.py:/app/app.py:ro"
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - "${ANIME_DATA_DIR:?set in .env (see .env.example)}:/data"
+    group_add:
+      - "${DOCKER_GID:?set in .env (see .env.example)}"
+    networks:
+      anime-net:
+    depends_on:
+      - anime-loads
+
+volumes:
+  jdownloader-config:

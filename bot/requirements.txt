@@ -1,0 +1,9 @@
+requests
+html-table-parser-python3
+lxml
+numpy
+pycryptodomex
+selenium
+pushbullet.py
+myjdapi
+opencv-python

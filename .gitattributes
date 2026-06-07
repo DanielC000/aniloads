@@ -1,0 +1,4 @@
+# Keep LF in the repository for all text files. A Windows checkout must never
+# introduce CRLF, which would break the shell/Python scripts and the Dockerfile
+# on the Linux deploy target. Binary files are left untouched by `text=auto`.
+* text=auto eol=lf

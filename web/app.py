@@ -381,14 +381,19 @@ def save_ani(data):
 
 def load_prefs():
     defaults = {
-        "language": "german",
+        "audio_language": "german",
+        "sub_language": "any",
         "min_resolution": 1080,
         "auto_select": True,
     }
     try:
         with open(PREFS_FILE, "r") as f:
             stored = json.load(f)
-            defaults.update(stored)
+        # Back-compat: old single `language` pref maps to audio_language.
+        if "language" in stored and "audio_language" not in stored:
+            stored["audio_language"] = stored["language"]
+        stored.pop("language", None)
+        defaults.update(stored)
     except (FileNotFoundError, json.JSONDecodeError):
         pass
     return defaults
@@ -399,18 +404,42 @@ def save_prefs(prefs):
         json.dump(prefs, f, indent=2)
 
 
-def match_language(dubs, pref_lang):
-    dubs_lower = [d.lower() for d in dubs]
-    if pref_lang == "german":
-        return any("deutsch" in d or "german" in d or "ger" in d for d in dubs_lower)
-    elif pref_lang == "japanese":
-        return any("japan" in d or "jap" in d for d in dubs_lower)
-    return True
+# Alias-tolerant language matching. Site labels are German ("Deutsch",
+# "Japanisch", "Englisch"); each pref maps to a set of substrings to look for.
+LANG_ALIASES = {
+    "german": ("deutsch", "german", "ger"),
+    "japanese": ("japan", "jap"),
+    "english": ("englisch", "english", "eng"),
+}
+
+
+def lang_in_list(pref_lang, langs):
+    """True if pref_lang matches any entry in langs (a list of language labels).
+
+    pref_lang is one of german|japanese|english|any. "any" (and any unknown
+    value) always matches. Matching is alias-tolerant substring membership so
+    German site labels like "Japanisch" match the japanese pref.
+    """
+    if pref_lang == "any" or pref_lang not in LANG_ALIASES:
+        return True
+    aliases = LANG_ALIASES[pref_lang]
+    return any(
+        any(alias in (entry or "").lower() for alias in aliases)
+        for entry in (langs or [])
+    )
 
 
 def pick_best_release(releases, prefs):
+    """Pick the best matching release, or None if nothing matches (STRICT).
+
+    A release matches iff audio_language is "any" or its alias is in the
+    release's dubs list, AND sub_language is "any" or its alias is in the subs
+    list. min_resolution is a hard filter. Matches rank by resolution+episodes.
+    If no release matches, return None — the caller must not auto-select.
+    """
     min_res = prefs.get("min_resolution", 1080)
-    pref_lang = prefs.get("language", "german")
+    audio_pref = prefs.get("audio_language", "german")
+    sub_pref = prefs.get("sub_language", "any")
 
     scored = []
     for rel in releases:
@@ -418,7 +447,6 @@ def pick_best_release(releases, prefs):
             res = int(rel.get("resolution", 0) or 0)
         except (ValueError, TypeError):
             res = 0
-        lang_match = match_language(rel.get("dubs", []), pref_lang)
         try:
             eps = int(rel.get("episodes", 0) or 0)
         except (ValueError, TypeError):
@@ -426,28 +454,18 @@ def pick_best_release(releases, prefs):
 
         if res < min_res:
             continue
+        if not lang_in_list(audio_pref, rel.get("dubs", [])):
+            continue
+        if not lang_in_list(sub_pref, rel.get("subs", [])):
+            continue
 
-        score = 0
-        if lang_match:
-            score += 1000
-        score += res
-        score += eps
-        scored.append((score, rel))
+        scored.append((res + eps, rel))
 
     if not scored:
-        for rel in releases:
-            try:
-                res = int(rel.get("resolution", 0) or 0)
-            except (ValueError, TypeError):
-                res = 0
-            lang_match = match_language(rel.get("dubs", []), pref_lang)
-            score = (1000 if lang_match else 0) + res
-            scored.append((score, rel))
+        return None
 
-    if scored:
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return scored[0][1]
-    return releases[0] if releases else None
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[0][1]
 
 
 def search_anime(query):
@@ -962,7 +980,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: var(--fs-xs); font-weight: 500; line-height: 1.5; }
   /* default badges are neutral; color is reserved for state that matters */
-  .badge-neutral, .badge-lang, .badge-res, .badge-ep { background: var(--neutral-bg); color: var(--neutral-text); }
+  .badge-neutral, .badge-lang, .badge-sub, .badge-res, .badge-ep { background: var(--neutral-bg); color: var(--neutral-text); }
   .badge-ok { background: var(--ok-bg); color: var(--ok-text); }
   .badge-warn { background: var(--warn-bg); color: var(--warn-text); }
   .badge-danger, .badge-retry { background: var(--danger-bg); color: var(--danger-text); }
@@ -1109,11 +1127,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <form method="POST" action="/save-prefs">
         <div class="form-grid">
           <div class="form-group">
-            <label>Preferred Language</label>
-            <select name="language">
-              <option value="german" %%LANG_GER%%>German (Deutsch)</option>
-              <option value="japanese" %%LANG_JAP%%>Japanese</option>
-              <option value="any" %%LANG_ANY%%>Any</option>
+            <label>Audio Language (Dub)</label>
+            <select name="audio_language">
+              <option value="german" %%AUDIO_GER%%>German (Deutsch)</option>
+              <option value="japanese" %%AUDIO_JAP%%>Japanese</option>
+              <option value="english" %%AUDIO_ENG%%>English</option>
+              <option value="any" %%AUDIO_ANY%%>Any</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Subtitle Language (Sub)</label>
+            <select name="sub_language">
+              <option value="german" %%SUB_GER%%>German (Deutsch)</option>
+              <option value="japanese" %%SUB_JAP%%>Japanese</option>
+              <option value="english" %%SUB_ENG%%>English</option>
+              <option value="any" %%SUB_ANY%%>Any</option>
             </select>
           </div>
           <div class="form-group">
@@ -1134,7 +1162,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
       </form>
       <div class="prefs-current">
-        <span class="badge badge-lang">%%PREF_LANG_DISPLAY%%</span>
+        <span class="badge badge-lang">Dub: %%PREF_AUDIO_DISPLAY%%</span>
+        <span class="badge badge-sub">Sub: %%PREF_SUB_DISPLAY%%</span>
         <span class="badge badge-res">&ge; %%PREF_RES%%p</span>
         %%AUTO_BADGE%%
       </div>
@@ -1345,11 +1374,14 @@ def render_watchlist(anime_list, pending_list=None):
         for i, a in enumerate(pending_list):
             name = a.get("name", "Unknown")
             url = a.get("url", "")
-            pref_lang = a.get("pref_language", "")
+            pref_audio = a.get("pref_audio_language", a.get("pref_language", ""))
+            pref_sub = a.get("pref_sub_language", "")
             pref_res = a.get("pref_resolution", "")
             pref_badges = ""
-            if pref_lang:
-                pref_badges += '<span class="badge badge-lang">{}</span> '.format(pref_lang.title())
+            if pref_audio:
+                pref_badges += '<span class="badge badge-lang">Dub: {}</span> '.format(pref_audio.title())
+            if pref_sub:
+                pref_badges += '<span class="badge badge-sub">Sub: {}</span> '.format(pref_sub.title())
             if pref_res:
                 pref_badges += '<span class="badge badge-res">{}p</span> '.format(pref_res)
 
@@ -1376,11 +1408,14 @@ def render_watchlist(anime_list, pending_list=None):
 
         url_html = '<div class="anime-url">{}</div>'.format(escape(url)) if url else ""
 
-        pref_lang = a.get("pref_language", "")
+        pref_audio = a.get("pref_audio_language", a.get("pref_language", ""))
+        pref_sub = a.get("pref_sub_language", "")
         pref_res = a.get("pref_resolution", "")
         pref_badges = ""
-        if pref_lang:
-            pref_badges += '<span class="badge badge-lang">{}</span> '.format(pref_lang.title())
+        if pref_audio:
+            pref_badges += '<span class="badge badge-lang">Dub: {}</span> '.format(pref_audio.title())
+        if pref_sub:
+            pref_badges += '<span class="badge badge-sub">Sub: {}</span> '.format(pref_sub.title())
         if pref_res:
             pref_badges += '<span class="badge badge-res">{}p</span> '.format(pref_res)
 
@@ -1751,7 +1786,11 @@ def render_page(status="", search_html="", prefs_open=False):
     move_status_html, move_last_html = render_move_status()
     move_history_html = render_move_history()
 
-    lang_display = {"german": "German", "japanese": "Japanese", "any": "Any"}.get(prefs["language"], "Any")
+    lang_names = {"german": "German", "japanese": "Japanese", "english": "English", "any": "Any"}
+    audio_pref = prefs.get("audio_language", "german")
+    sub_pref = prefs.get("sub_language", "any")
+    audio_display = lang_names.get(audio_pref, "Any")
+    sub_display = lang_names.get(sub_pref, "Any")
 
     page = HTML_TEMPLATE
     page = page.replace("%%STATUS_MSG%%", status)
@@ -1766,14 +1805,20 @@ def render_page(status="", search_html="", prefs_open=False):
     page = page.replace("%%WATCHLIST%%", render_watchlist(anime_list, pending_list))
     page = page.replace("%%COUNT%%", str(total))
     page = page.replace("%%PREFS_OPEN%%", "open" if prefs_open else "")
-    page = page.replace("%%LANG_GER%%", 'selected' if prefs["language"] == "german" else "")
-    page = page.replace("%%LANG_JAP%%", 'selected' if prefs["language"] == "japanese" else "")
-    page = page.replace("%%LANG_ANY%%", 'selected' if prefs["language"] == "any" else "")
+    page = page.replace("%%AUDIO_GER%%", 'selected' if audio_pref == "german" else "")
+    page = page.replace("%%AUDIO_JAP%%", 'selected' if audio_pref == "japanese" else "")
+    page = page.replace("%%AUDIO_ENG%%", 'selected' if audio_pref == "english" else "")
+    page = page.replace("%%AUDIO_ANY%%", 'selected' if audio_pref == "any" else "")
+    page = page.replace("%%SUB_GER%%", 'selected' if sub_pref == "german" else "")
+    page = page.replace("%%SUB_JAP%%", 'selected' if sub_pref == "japanese" else "")
+    page = page.replace("%%SUB_ENG%%", 'selected' if sub_pref == "english" else "")
+    page = page.replace("%%SUB_ANY%%", 'selected' if sub_pref == "any" else "")
     page = page.replace("%%RES_480%%", 'selected' if prefs["min_resolution"] == 480 else "")
     page = page.replace("%%RES_720%%", 'selected' if prefs["min_resolution"] == 720 else "")
     page = page.replace("%%RES_1080%%", 'selected' if prefs["min_resolution"] == 1080 else "")
     page = page.replace("%%AUTO_CHECKED%%", 'checked' if prefs.get("auto_select") else "")
-    page = page.replace("%%PREF_LANG_DISPLAY%%", lang_display)
+    page = page.replace("%%PREF_AUDIO_DISPLAY%%", audio_display)
+    page = page.replace("%%PREF_SUB_DISPLAY%%", sub_display)
     page = page.replace("%%PREF_RES%%", str(prefs["min_resolution"]))
     page = page.replace("%%AUTO_BADGE%%",
         '<span class="badge badge-auto">Auto-select ON</span>' if prefs.get("auto_select") else "")
@@ -1865,7 +1910,8 @@ class Handler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/save-prefs":
             prefs = {
-                "language": params.get("language", "german"),
+                "audio_language": params.get("audio_language", "german"),
+                "sub_language": params.get("sub_language", "any"),
                 "min_resolution": int(params.get("min_resolution", "1080")),
                 "auto_select": "auto_select" in params,
             }
@@ -2260,8 +2306,11 @@ def resolve_pending():
                         continue
 
                     entry_prefs = dict(prefs)
-                    if entry.get("pref_language"):
-                        entry_prefs["language"] = entry["pref_language"]
+                    audio_override = entry.get("pref_audio_language", entry.get("pref_language"))
+                    if audio_override:
+                        entry_prefs["audio_language"] = audio_override
+                    if entry.get("pref_sub_language"):
+                        entry_prefs["sub_language"] = entry["pref_sub_language"]
                     if entry.get("pref_resolution"):
                         entry_prefs["min_resolution"] = entry["pref_resolution"]
 

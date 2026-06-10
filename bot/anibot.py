@@ -82,6 +82,19 @@ def printException(e):
     fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
     _log.error("Error: %s %s %s", exc_type, fname, exc_tb.tb_lineno)
 
+def _boot_backoff(attempt, cap=300):
+    """Capped exponential backoff (seconds) for in-process boot retries.
+
+    Keeps the container alive and self-healing on a transient boot failure
+    instead of exiting and relying on Docker's restart backoff. Under
+    `restart: unless-stopped` a crash-loop accumulates an exponential delay
+    that can leave the container "not running" for long stretches — which is
+    exactly the "the bot didn't start automatically" symptom. Retrying inside
+    the process keeps the container up and the dashboard's status/controls live.
+
+    Sequence: 5, 10, 20, 40, 80, 160, 300, 300, ... seconds (capped)."""
+    return min(cap, 5 * (2 ** min(attempt, 6)))
+
 def loadconfig():
     try:
         os.makedirs(os.path.dirname(botfolder), exist_ok=True)
@@ -92,6 +105,12 @@ def loadconfig():
         printException(e)
         print("ani.json nicht gefunden, ")
         return False, False, False, False, False, False, False, False, False, False, False, False, False
+    # Sentinel defaults: if the file has no "settings" block at all, fall through
+    # to a clean False-tuple (→ caller treats it as "no/bad config" and retries)
+    # instead of raising UnboundLocalError on the return below.
+    jdhost = hoster = browser = browserlocation = pushkey = timedelay = False
+    myjd_user = myjd_pass = myjd_device = jd_deprecated = jd_deprecatedport = False
+    al_user = al_pass = False
     for key in data:
         if(key == "settings"):
             try:
@@ -110,7 +129,9 @@ def loadconfig():
             except Exception as e:
                 printException(e)
                 print("Fehlerhafte ani.json Konfiguration")
-                return False, False, False, False, False, False, False, False, False, False, False
+                # 13-tuple to match the caller's unpack — a short tuple here would
+                # raise ValueError at the call site and crash the process.
+                return False, False, False, False, False, False, False, False, False, False, False, False, False
             # anime-loads.org login: prefer the environment (AL_USER/AL_PASS from
             # .env), fall back to ani.json settings for backward compatibility.
             al_user = os.environ.get('AL_USER') or value.get('al_user')
@@ -652,22 +673,51 @@ def startbot():
     if "--interactive" in sys.argv:
         interactive = True
 
+    config_attempt = 0
     while(jdhost == False):
         if(interactive):
             print("Noch keine oder Fehlerhafte konfiguration, leite weiter zu Einstellungen")
             editconfig()
             jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport, al_user, al_pass = loadconfig()
         else:
-            _log.error("Keine oder fehlerhafte Konfiguration und Script ist nicht interaktiv, beende...")
-            interactive = False
-            sys.exit(1)
+            # Non-interactive (Docker): do NOT sys.exit — a transient cause such as
+            # the /config volume not being mounted yet on host boot would otherwise
+            # crash-loop the container under `restart: unless-stopped`. Stay alive
+            # and re-read the config with backoff so it self-heals once available.
+            config_attempt += 1
+            delay = _boot_backoff(config_attempt)
+            _log.error("Keine oder fehlerhafte Konfiguration (Versuch %d) — erneuter Versuch in %ds "
+                       "(haeufige Ursache: /config noch nicht gemountet oder ani.json fehlt)",
+                       config_attempt, delay)
+            time.sleep(delay)
+            jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport, al_user, al_pass = loadconfig()
 
     if(pushkey != ""):
         pb = Pushbullet(pushkey)
     else:
         pb = ""
     
-    al = animeloads(browser=browser, browserloc=browserlocation)
+    # The animeloads() constructor launches headless Firefox/geckodriver to fetch
+    # DDoS-Guard cookies. A cold-start Selenium failure (resource contention while
+    # the host is still bringing services up, a stale profile/geckodriver hiccup)
+    # raises here. Unguarded, that exception exits the process and crash-loops the
+    # container under `restart: unless-stopped` — the most likely "didn't start
+    # automatically" path. Retry in-process with backoff so a transient failure
+    # self-recovers and the container stays up.
+    al = None
+    init_attempt = 0
+    while al is None:
+        try:
+            al = animeloads(browser=browser, browserloc=browserlocation)
+        except Exception as e:
+            if interactive:
+                raise
+            init_attempt += 1
+            delay = _boot_backoff(init_attempt)
+            printException(e)
+            _log.error("Browser/Selenium-Initialisierung fehlgeschlagen (Versuch %d) — "
+                       "erneuter Versuch in %ds", init_attempt, delay)
+            time.sleep(delay)
     tvdb = TVDBClient()
 
     if(interactive):
@@ -692,24 +742,44 @@ def startbot():
 
     if(jdhost == "" and myjd_pass == ""):
         if(interactive == False):
-            _log.error("Kein MyJdownloader Passwort gesetzt, beende..")
-            sys.exit(1)
-        print("Kein MyJdownloader Passwort gesetzt")  # interactive prompt
-        logincorrect = False 
-        jd=myjdapi.Myjdapi()
-        jd.set_app_key("animeloads")
-        while(logincorrect == False):
-            myjd_pass = getpass("MyJdownloader Passwort: ")
-          
-            try:
-              jd.connect(myjd_user, myjd_pass)
-              logincorrect = True
-            except:
-                print("Fehlerhafte Logindaten")
+            # Misconfiguration: neither a local JD host nor a MyJDownloader
+            # password. Don't sys.exit (crash-loops under unless-stopped); stay
+            # alive and re-read the config with backoff so the owner can fix it
+            # without manually restarting the container.
+            jdpw_attempt = 0
+            while(jdhost == "" and myjd_pass == ""):
+                jdpw_attempt += 1
+                delay = _boot_backoff(jdpw_attempt)
+                _log.error("Kein MyJdownloader Passwort und kein JD-Host gesetzt — "
+                           "Container bleibt aktiv, erneute Pruefung in %ds", delay)
+                time.sleep(delay)
+                jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport, al_user, al_pass = loadconfig()
+        else:
+            print("Kein MyJdownloader Passwort gesetzt")  # interactive prompt
+            logincorrect = False
+            jd=myjdapi.Myjdapi()
+            jd.set_app_key("animeloads")
+            while(logincorrect == False):
+                myjd_pass = getpass("MyJdownloader Passwort: ")
+
+                try:
+                  jd.connect(myjd_user, myjd_pass)
+                  logincorrect = True
+                except:
+                    print("Fehlerhafte Logindaten")
     _log.info("Erfolgreich eingeloggt")
-    if (jd_deprecated and jd_deprecatedport == ""):
-        _log.error("Kein JD port gesetzt. beende...")
-        sys.exit(1)
+    port_attempt = 0
+    while (jd_deprecated and jd_deprecatedport == ""):
+        if interactive:
+            _log.error("Kein JD port gesetzt. beende...")
+            sys.exit(1)
+        # Non-interactive: keep the container alive and re-read config so a fix
+        # (or a late volume mount) is picked up without a manual restart.
+        port_attempt += 1
+        delay = _boot_backoff(port_attempt)
+        _log.error("Kein JD port gesetzt — Container bleibt aktiv, erneute Pruefung in %ds", delay)
+        time.sleep(delay)
+        jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport, al_user, al_pass = loadconfig()
 
     while(True):
         os.makedirs(os.path.dirname(botfolder), exist_ok=True)
@@ -721,8 +791,16 @@ def startbot():
         try:
             anidata = data['anime']
         except:
-            _log.error("Du hast keine Anime in deiner Liste")
-            return
+            # No anime configured yet (fresh deploy, or none added via the
+            # dashboard). Do NOT return — that exits the process (exit 0) and
+            # stops/tight-loops the container under `restart: unless-stopped`,
+            # which reads as "the bot won't stay running". Stay alive and
+            # re-check after the poll interval so entries added later via the
+            # dashboard are picked up without a manual container restart.
+            recheck = timedelay if isinstance(timedelay, int) and timedelay > 0 else 600
+            _log.info("Keine Anime in der Liste — erneute Pruefung in " + str(recheck) + " Sekunden")
+            time.sleep(recheck)
+            continue
 
         def save_ani():
             os.makedirs(os.path.dirname(botfolder), exist_ok=True)

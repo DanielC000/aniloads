@@ -36,6 +36,7 @@ services:
     image: anime-loads:local
     restart: unless-stopped
     environment:
+      - "TZ=${TZ:-UTC}"
       - PYTHONUNBUFFERED=1
       - TVDB_API_KEY=${TVDB_API_KEY:-}
       # anime-loads.org login (optional; required for Click'n'Load batch downloads).

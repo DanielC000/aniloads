@@ -1171,7 +1171,10 @@ def render_run_history(runs, max_runs=20):
     for run in display_runs:
         time_str = run.get("time", "")
         anime = run.get("anime", "")
-        events = run.get("events", [])
+        # [COMPLETE] entries are run-history noise the owner doesn't want surfaced.
+        # Drop them from the rendered feed only — the bot still logs [COMPLETE] and
+        # parse_bot_logs() still parses it; this is a presentation-layer suppression.
+        events = [ev for ev in run.get("events", []) if ev.get("type") != "complete"]
 
         if not anime and not events:
             continue

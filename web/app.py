@@ -873,97 +873,166 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Anime-Loads Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23161922'/%3E%3Cpath d='M16 6v11m0 0l-4.5-4.5M16 17l4.5-4.5' fill='none' stroke='%237985e0' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M9 23.5h14' stroke='%237985e0' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
 <style>
+  /* ---- Design tokens: one place for color, spacing, type ---- */
+  :root {
+    /* cool-tinted neutral surfaces (never pure gray) */
+    --bg: #0d0f14;
+    --surface: #161922;
+    --surface-2: #1e222d;
+    --surface-3: #11141b;
+    --border: #272c39;
+    --border-light: #313847;
+
+    --text: #e4e7ee;
+    --text-heading: #f3f5fa;
+    --text-muted: #9aa3b2;
+    --text-faint: #717a8b;
+
+    /* one disciplined accent (muted indigo) — links / interactive only */
+    --accent: #7985e0;
+    --accent-hover: #9aa4ef;
+    --accent-bg: #5b66c9;
+    --accent-bg-hover: #6c77d6;
+
+    /* semantic tones, desaturated for dark surfaces */
+    --ok-bg: #18301f;       --ok-text: #8fd0a6;
+    --warn-bg: #33291a;     --warn-text: #e0bd86;
+    --danger-bg: #361f23;   --danger-text: #e79aa0;
+    --neutral-bg: #252a36;  --neutral-text: #aab3c2;
+    --accent-soft-bg: #232847; --accent-soft-text: #abb3f2;
+
+    --danger-btn: #b3433f;  --danger-btn-hover: #c24f4a;
+    --success-btn: #3f7d4a; --success-btn-hover: #4a8c55;
+    --warning-btn: #b06438; --warning-btn-hover: #c0703f; /* desaturated caution tone */
+
+    /* 4pt spacing scale */
+    --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px; --s7: 48px;
+
+    /* modular type scale (base 16px, ratio ~1.25) */
+    --fs-xs: 0.8rem; --fs-sm: 0.9rem; --fs-base: 1rem;
+    --fs-lg: 1.125rem; --fs-h2: 1.25rem; --fs-h1: 1.6rem;
+
+    --radius: 8px; --radius-sm: 6px;
+    --tr: 0.12s ease;
+  }
+
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f0f; color: #e0e0e0; padding: 20px; max-width: 900px; margin: 0 auto; }
-  h1 { color: #7c4dff; margin-bottom: 20px; font-size: 1.5rem; }
-  h2 { color: #b388ff; margin: 20px 0 10px; font-size: 1.2rem; }
-  .card { background: #1a1a1a; border-radius: 8px; padding: 16px; margin-bottom: 12px; border: 1px solid #2a2a2a; }
-  .card:hover { border-color: #7c4dff; }
-  .anime-name { font-weight: 600; font-size: 1.1rem; color: #fff; }
-  .anime-meta { color: #888; font-size: 0.85rem; margin-top: 4px; }
-  .anime-url { color: #7c4dff; font-size: 0.8rem; word-break: break-all; }
-  .btn { display: inline-block; padding: 8px 16px; border-radius: 6px; border: none; cursor: pointer; font-size: 0.9rem; font-weight: 500; text-decoration: none; }
-  .btn-primary { background: #7c4dff; color: #fff; }
-  .btn-primary:hover { background: #651fff; }
-  .btn-danger { background: #d32f2f; color: #fff; }
-  .btn-danger:hover { background: #b71c1c; }
-  .btn-success { background: #2e7d32; color: #fff; }
-  .btn-success:hover { background: #1b5e20; }
-  .btn-sm { padding: 4px 10px; font-size: 0.8rem; }
-  .btn-warning { background: #e65100; color: #fff; }
-  .btn-warning:hover { background: #bf360c; }
-  input[type=text], input[type=url], select { width: 100%; padding: 10px 14px; border-radius: 6px; border: 1px solid #333; background: #222; color: #e0e0e0; font-size: 0.95rem; margin-bottom: 10px; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: var(--s5) var(--s4); max-width: 900px; margin: 0 auto; line-height: 1.55; }
+  h1 { color: var(--text-heading); margin-bottom: var(--s5); font-size: var(--fs-h1); font-weight: 650; letter-spacing: -0.01em; line-height: 1.2; }
+  h2 { color: var(--text-heading); margin: var(--s5) 0 var(--s3); font-size: var(--fs-h2); font-weight: 600; line-height: 1.2; }
+  h3 { color: var(--text-heading); font-size: var(--fs-lg); font-weight: 600; }
+  a { color: var(--accent); }
+
+  .muted { color: var(--text-muted); }
+  .faint { color: var(--text-faint); }
+  .hint { color: var(--text-muted); font-size: var(--fs-xs); }
+
+  .card { background: var(--surface); border-radius: var(--radius); padding: var(--s4); margin-bottom: var(--s3); border: 1px solid var(--border); }
+  .card-accent { border-color: var(--accent); }
+  .card-selected { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+  .anime-name { font-weight: 600; font-size: var(--fs-lg); color: var(--text-heading); }
+  .anime-meta { color: var(--text-muted); font-size: var(--fs-xs); margin-top: var(--s2); display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .anime-url { color: var(--accent); font-size: var(--fs-xs); word-break: break-all; }
+
+  .btn { display: inline-flex; align-items: center; justify-content: center; min-height: 38px; padding: 9px 16px; border-radius: var(--radius-sm); border: none; cursor: pointer; font-size: var(--fs-sm); font-weight: 500; text-decoration: none; transition: background-color var(--tr), border-color var(--tr), color var(--tr); }
+  .btn-primary { background: var(--accent-bg); color: #fff; }
+  .btn-primary:hover { background: var(--accent-bg-hover); }
+  .btn-danger { background: var(--danger-btn); color: #fff; }
+  .btn-danger:hover { background: var(--danger-btn-hover); }
+  .btn-success { background: var(--success-btn); color: #fff; }
+  .btn-success:hover { background: var(--success-btn-hover); }
+  .btn-warning { background: var(--warning-btn); color: #fff; }
+  .btn-warning:hover { background: var(--warning-btn-hover); }
+  .btn-sm { min-height: 32px; padding: 6px 12px; font-size: var(--fs-xs); }
+  .btn-ghost { background: var(--surface-2); color: var(--text-muted); border: 1px solid var(--border); }
+  .btn-ghost:hover { background: var(--border); color: var(--text); }
+
+  input[type=text], input[type=url], input[type=number], select { width: 100%; padding: 10px 14px; border-radius: var(--radius-sm); border: 1px solid var(--border-light); background: var(--surface-2); color: var(--text); font-size: var(--fs-sm); margin-bottom: var(--s3); transition: border-color var(--tr); }
   select { appearance: none; -webkit-appearance: none; }
-  input:focus, select:focus { outline: none; border-color: #7c4dff; }
-  .form-row { display: flex; gap: 10px; align-items: end; }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .form-row { display: flex; gap: var(--s3); align-items: end; }
   .form-row input, .form-row select { flex: 1; margin-bottom: 0; }
-  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  .form-group label { display: block; color: #888; font-size: 0.85rem; margin-bottom: 4px; }
-  .empty { color: #666; font-style: italic; padding: 20px; text-align: center; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 500; }
-  .badge-lang { background: #1b5e20; color: #a5d6a7; }
-  .badge-res { background: #0d47a1; color: #90caf9; }
-  .badge-ep { background: #4a148c; color: #ce93d8; }
-  .badge-auto { background: #e65100; color: #ffcc80; }
-  .release-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 8px 0; border-bottom: 1px solid #2a2a2a; }
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s3); }
+  .form-group label { display: block; color: var(--text-muted); font-size: var(--fs-xs); margin-bottom: var(--s1); }
+  .empty { color: var(--text-muted); font-style: italic; padding: var(--s5); text-align: center; }
+
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: var(--fs-xs); font-weight: 500; line-height: 1.5; }
+  /* default badges are neutral; color is reserved for state that matters */
+  .badge-neutral, .badge-lang, .badge-res, .badge-ep { background: var(--neutral-bg); color: var(--neutral-text); }
+  .badge-ok { background: var(--ok-bg); color: var(--ok-text); }
+  .badge-warn { background: var(--warn-bg); color: var(--warn-text); }
+  .badge-danger, .badge-retry { background: var(--danger-bg); color: var(--danger-text); }
+  .badge-accent, .badge-auto { background: var(--accent-soft-bg); color: var(--accent-soft-text); }
+
+  .release-row { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; padding: var(--s2) 0; border-bottom: 1px solid var(--border); }
   .release-row:last-child { border-bottom: none; }
-  .status-msg { padding: 10px; border-radius: 6px; margin-bottom: 15px; }
-  .status-ok { background: #1b5e20; color: #a5d6a7; }
-  .status-err { background: #b71c1c; color: #ef9a9a; }
-  .section { margin-bottom: 30px; }
-  .toggle { display: flex; align-items: center; gap: 8px; }
-  .toggle input[type=checkbox] { width: 18px; height: 18px; accent-color: #7c4dff; }
-  .prefs-current { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
-  details summary { cursor: pointer; color: #b388ff; font-size: 1rem; font-weight: 500; }
-  details summary:hover { color: #7c4dff; }
-  details[open] summary { margin-bottom: 12px; }
+  .status-msg { padding: var(--s3); border-radius: var(--radius-sm); margin-bottom: var(--s4); }
+  .status-ok { background: var(--ok-bg); color: var(--ok-text); }
+  .status-err { background: var(--danger-bg); color: var(--danger-text); }
+  .section { margin-bottom: var(--s6); }
+  .toggle { display: flex; align-items: center; gap: var(--s2); }
+  .toggle input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--accent); }
+  .prefs-current { display: flex; gap: var(--s2); flex-wrap: wrap; margin-top: var(--s2); }
+  details summary { cursor: pointer; color: var(--text-heading); font-size: var(--fs-base); font-weight: 600; }
+  details summary:hover { color: var(--accent); }
+  details[open] summary { margin-bottom: var(--s3); }
 
   /* Activity section */
-  .activity-grid { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 16px; align-items: center; }
-  .activity-label { color: #888; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px; }
-  .activity-value { font-size: 1rem; font-weight: 500; margin-top: 2px; }
+  .activity-grid { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: var(--s4); align-items: center; }
+  .activity-label { color: var(--text-muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; }
+  .activity-value { font-size: var(--fs-base); font-weight: 500; margin-top: 2px; }
   .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
-  .status-dot.running { background: #4caf50; }
-  .status-dot.stopped { background: #f44336; }
-  .status-dot.unknown { background: #666; }
+  .status-dot.running { background: #56b870; }
+  .status-dot.stopped { background: #d9534f; }
+  .status-dot.unknown { background: var(--text-faint); }
 
-  /* Run history */
-  .run-entry { padding: 10px 0; border-bottom: 1px solid #222; }
+  /* Run / move history feed */
+  .run-entry { padding: var(--s3) 0; border-bottom: 1px solid var(--border); }
   .run-entry:last-child { border-bottom: none; }
-  .run-header { display: flex; justify-content: space-between; align-items: center; }
-  .run-time { color: #888; font-size: 0.8rem; font-family: monospace; }
-  .run-anime { color: #fff; font-weight: 500; font-size: 0.95rem; }
-  .run-events { margin-top: 6px; padding-left: 12px; }
-  .run-event { font-size: 0.85rem; padding: 2px 0; }
-  .ev-download { color: #66bb6a; }
-  .ev-error { color: #ef5350; }
-  .ev-info { color: #888; }
-  .ev-sleep { color: #555; font-size: 0.8rem; }
-  .ev-moved { color: #66bb6a; }
-  .ev-wait { color: #ffb74d; }
-  .ev-skip { color: #888; }
-  .ev-cleanup { color: #78909c; }
+  .run-header { display: flex; justify-content: space-between; align-items: center; gap: var(--s2); }
+  .run-time { color: var(--text-faint); font-size: var(--fs-xs); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .run-anime { color: var(--text-heading); font-weight: 600; font-size: var(--fs-sm); }
+  .run-events { margin-top: var(--s2); display: flex; flex-direction: column; gap: 1px; }
+
+  /* one event line: clear label + message; downloads & errors dominate,
+     routine sleep/skip lines stay quiet so the feed reads calm */
+  .event { display: flex; gap: var(--s2); align-items: baseline; padding: 2px 0; font-size: var(--fs-xs); line-height: 1.45; }
+  .event-label { flex: 0 0 70px; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+  .event-msg { flex: 1; color: var(--text); word-break: break-word; }
+  .event--ok .event-label { color: var(--ok-text); }
+  .event--danger .event-label, .event--danger .event-msg { color: var(--danger-text); }
+  .event--warn .event-label { color: var(--warn-text); }
+  .event--warn .event-msg { color: var(--text-muted); }
+  .event--muted { opacity: 0.9; }
+  .event--muted .event-label { color: var(--text-faint); font-weight: 500; }
+  .event--muted .event-msg { color: var(--text-faint); }
 
   /* Episode management panel */
-  .ep-panel { margin-top: 12px; border-top: 1px solid #2a2a2a; padding-top: 8px; }
-  .ep-panel summary { font-size: 0.85rem; color: #888; }
-  .ep-panel summary:hover { color: #b388ff; }
-  .ep-panel[open] summary { margin-bottom: 8px; }
-  .ep-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-bottom: 1px solid #1a1a1a; }
+  .ep-panel { margin-top: var(--s3); border-top: 1px solid var(--border); padding-top: var(--s2); }
+  .ep-panel summary { font-size: var(--fs-xs); color: var(--text-muted); font-weight: 500; }
+  .ep-panel summary:hover { color: var(--accent); }
+  .ep-panel[open] summary { margin-bottom: var(--s2); }
+  .ep-row { display: flex; align-items: center; gap: var(--s2); padding: var(--s1) 0; border-bottom: 1px solid var(--border); }
   .ep-row:last-child { border-bottom: none; }
-  .ep-num { font-family: monospace; font-size: 0.85rem; min-width: 50px; color: #ccc; }
-  .badge-ok { background: #1b5e20; color: #a5d6a7; }
-  .badge-retry { background: #b71c1c; color: #ef9a9a; }
-  .btn-ghost { background: #333; color: #aaa; border: none; }
-  .btn-ghost:hover { background: #444; color: #fff; }
-  .ep-add-row { display: flex; gap: 8px; margin-top: 8px; padding-top: 8px; border-top: 1px solid #2a2a2a; align-items: center; }
-  .ep-add-row input[type=number] { width: 80px; padding: 4px 8px; border-radius: 4px; border: 1px solid #333; background: #222; color: #e0e0e0; font-size: 0.85rem; margin: 0; }
+  .ep-num { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: var(--fs-xs); min-width: 50px; color: var(--text-muted); }
+  .ep-add-row { display: flex; gap: var(--s2); margin-top: var(--s2); padding-top: var(--s2); border-top: 1px solid var(--border); align-items: center; }
+  .ep-add-row input[type=number] { width: 90px; padding: 6px 8px; border-radius: 4px; border: 1px solid var(--border-light); background: var(--surface-2); color: var(--text); font-size: var(--fs-xs); margin: 0; min-height: 32px; }
+
+  .folder-row { margin-top: var(--s1); font-size: var(--fs-xs); color: var(--text-muted); }
+  .folder-input { background: var(--surface-3); border: 1px solid var(--border-light); color: var(--text); padding: 5px 8px; border-radius: 4px; font-size: var(--fs-xs); width: 220px; margin: 0; }
 
   @media (max-width: 600px) {
-    .activity-grid { grid-template-columns: 1fr 1fr; }
+    .activity-grid { grid-template-columns: 1fr 1fr; gap: var(--s3); }
     .form-row { flex-wrap: wrap; }
     .form-row select { flex: 1 1 100%; }
+    .folder-input { width: 100%; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
   }
 </style>
 </head>
@@ -1058,7 +1127,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
         <div class="toggle" style="margin-top:12px;">
           <input type="checkbox" name="auto_select" id="auto_select" %%AUTO_CHECKED%%>
-          <label for="auto_select" style="color:#ccc;font-size:0.9rem;">Auto-select best matching release when adding</label>
+          <label for="auto_select" style="font-size:0.9rem;">Auto-select best matching release when adding</label>
         </div>
         <div style="margin-top:14px;">
           <button type="submit" class="btn btn-success">Save Preferences</button>
@@ -1077,7 +1146,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <h2>Add Anime</h2>
   <div class="card">
     <form method="POST" action="/add-url">
-      <label style="color:#888;font-size:0.85rem;">Paste anime-loads.org URL to see available releases:</label>
+      <label class="hint">Paste an anime-loads.org URL to see available releases:</label>
       <div class="form-row" style="margin-top:6px;">
         <input type="url" name="url" placeholder="https://www.anime-loads.org/media/..." required>
         <button type="submit" class="btn btn-primary">Fetch Releases</button>
@@ -1086,10 +1155,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
   <div class="card">
     <form method="POST" action="/search">
-      <label style="color:#888;font-size:0.85rem;">Or search by name:</label>
+      <label class="hint">Or search by name:</label>
       <div class="form-row" style="margin-top:6px;">
         <input type="text" name="q" placeholder="Search anime..." required>
-        <button type="submit" class="btn btn-primary">Search</button>
+        <button type="submit" class="btn btn-primary">Search anime</button>
       </div>
     </form>
   </div>
@@ -1148,13 +1217,41 @@ def render_activity(activity):
         if last_run.get("anime"):
             last_text += " &mdash; {}".format(escape(last_run["anime"]))
     elif not docker.available:
-        last_text = '<span style="color:#666">Docker socket unavailable</span>'
+        last_text = '<span class="faint">Docker socket unavailable</span>'
     else:
-        last_text = '<span style="color:#666">No runs yet</span>'
+        last_text = '<span class="faint">No runs yet</span>'
 
-    next_text = activity.get("next_run") or '<span style="color:#666">&mdash;</span>'
+    next_text = activity.get("next_run") or '<span class="faint">&mdash;</span>'
 
     return status_text, last_text, next_text
+
+
+# Presentation for a single feed event: (tone, label). Tone drives color/weight
+# so downloads and errors visually dominate while routine sleep/skip/cleanup
+# lines stay quiet. This is the one place feed events get their look — shared by
+# the bot run history and the file-mover history.
+_EVENT_PRESENTATION = {
+    "download": ("ok", "Downloaded"),
+    "batch": ("ok", "Batch"),
+    "moved": ("ok", "Moved"),
+    "complete": ("ok", "Complete"),
+    "error": ("danger", "Error"),
+    "throttle": ("warn", "Throttled"),
+    "wait": ("warn", "Waiting"),
+    "skip": ("muted", "Skipped"),
+    "sleep": ("muted", "Sleeping"),
+    "info": ("muted", "Info"),
+    "cleanup": ("muted", "Cleaned"),
+}
+
+
+def render_event(etype, msg):
+    """Render one feed event line: a legible tone label + the raw message."""
+    tone, label = _EVENT_PRESENTATION.get(etype, ("muted", "Info"))
+    return ('<div class="event event--{tone}">'
+            '<span class="event-label">{label}</span>'
+            '<span class="event-msg">{msg}</span></div>').format(
+        tone=tone, label=label, msg=escape(msg))
 
 
 def render_run_history(runs, max_runs=20):
@@ -1180,43 +1277,23 @@ def render_run_history(runs, max_runs=20):
             continue
 
         html += '<div class="run-entry">'
-        html += '<div class="run-header">'
-        if anime:
-            html += '<span class="run-anime">{}</span>'.format(escape(anime))
-        else:
-            html += '<span class="run-anime" style="color:#888">System</span>'
-        if time_str:
-            html += '<span class="run-time">{}</span>'.format(time_str)
-        html += "</div>"
+        # Only show a header when there's a real anime name or a run time. Routine
+        # standalone lines (a lone skip/throttle with no Pr\u00fcfe) drop the empty
+        # "System" label and stand alone as one calm muted line.
+        if anime or time_str:
+            html += '<div class="run-header">'
+            if anime:
+                html += '<span class="run-anime">{}</span>'.format(escape(anime))
+            else:
+                html += '<span class="run-anime faint">System</span>'
+            if time_str:
+                html += '<span class="run-time">{}</span>'.format(time_str)
+            html += "</div>"
 
         if events:
             html += '<div class="run-events">'
             for ev in events:
-                etype = ev.get("type", "info")
-                msg = escape(ev.get("msg", ""))
-                css = {
-                    "download": "ev-download",
-                    "error": "ev-error",
-                    "batch": "ev-download",
-                    "complete": "ev-moved",
-                    "throttle": "ev-wait",
-                    "skip": "ev-skip",
-                    "info": "ev-info",
-                    "sleep": "ev-sleep",
-                }.get(etype, "ev-info")
-                prefix = {
-                    "download": "+",
-                    "error": "!",
-                    "batch": "\u25a0",
-                    "complete": "\u2713",
-                    "throttle": "\u23f3",
-                    "skip": "\u2013",
-                    "info": "-",
-                    "sleep": "~",
-                }.get(etype, "-")
-                html += '<div class="run-event {}"><span style="opacity:0.5">{}</span> {}</div>'.format(
-                    css, prefix, msg
-                )
+                html += render_event(ev.get("type", "info"), ev.get("msg", ""))
             html += "</div>"
         html += "</div>"
 
@@ -1234,9 +1311,9 @@ def render_move_status():
         if _move_last_run:
             last_html = _move_last_run.strftime("%H:%M:%S")
         elif not os.path.isdir(DOWNLOAD_DIR):
-            last_html = '<span style="color:#666">Download dir not mounted</span>'
+            last_html = '<span class="faint">Download dir not mounted</span>'
         else:
-            last_html = '<span style="color:#666">Not yet</span>'
+            last_html = '<span class="faint">Not yet</span>'
 
     return status_html, last_html
 
@@ -1252,29 +1329,10 @@ def render_move_history(max_entries=30):
         return '<div class="empty">No move activity yet</div>'
 
     display = list(reversed(entries))[:max_entries]
-    css_map = {
-        "moved": "ev-moved",
-        "error": "ev-error",
-        "wait": "ev-wait",
-        "skip": "ev-skip",
-        "cleanup": "ev-cleanup",
-    }
-    prefix_map = {
-        "moved": "\u2192",
-        "error": "!",
-        "wait": "\u23f3",
-        "skip": "\u2013",
-        "cleanup": "\u2717",
-    }
-
-    html = ""
+    html = '<div class="run-events">'
     for ev in display:
-        etype = ev.get("type", "info")
-        msg = escape(ev.get("msg", ""))
-        css = css_map.get(etype, "ev-info")
-        prefix = prefix_map.get(etype, "-")
-        html += '<div class="run-event {}"><span style="opacity:0.5">{}</span> {}</div>'.format(
-            css, prefix, msg)
+        html += render_event(ev.get("type", "info"), ev.get("msg", ""))
+    html += "</div>"
     return html
 
 
@@ -1296,10 +1354,10 @@ def render_watchlist(anime_list, pending_list=None):
                 pref_badges += '<span class="badge badge-res">{}p</span> '.format(pref_res)
 
             html += """
-            <div class="card" style="border-color:#e65100;">
-              <div style="display:flex;justify-content:space-between;align-items:start;">
+            <div class="card card-accent">
+              <div style="display:flex;justify-content:space-between;align-items:start;gap:12px;">
                 <div>
-                  <div class="anime-name">{name} <span class="badge badge-auto">Resolving...</span></div>
+                  <div class="anime-name">{name} <span class="badge badge-accent">Resolving</span></div>
                   <div class="anime-url">{url}</div>
                   <div class="anime-meta">{pref_badges}</div>
                 </div>
@@ -1328,55 +1386,53 @@ def render_watchlist(anime_list, pending_list=None):
 
         missing_badge = ""
         if missing:
-            missing_badge = ' <span class="badge" style="background:#b71c1c;color:#ef9a9a;">{} retry</span>'.format(len(missing))
+            missing_badge = ' <span class="badge badge-danger">{} retry</span>'.format(len(missing))
 
-        # TVDB badges
+        # TVDB badges — neutral tone (informational, not state that needs the eye)
         tvdb_badges = ""
         if a.get("tvdb_id"):
             if a.get("tvdb_season"):
-                tvdb_badges += ' <span class="badge" style="background:#0d47a1;color:#90caf9;">S{:02d}</span>'.format(
+                tvdb_badges += ' <span class="badge badge-neutral">S{:02d}</span>'.format(
                     a["tvdb_season"])
             else:
-                tvdb_badges += ' <span class="badge" style="background:#0d47a1;color:#90caf9;">TVDB</span>'
+                tvdb_badges += ' <span class="badge badge-neutral">TVDB</span>'
             if a.get("episode_offset", 0) != 0:
-                tvdb_badges += ' <span class="badge" style="background:#4a148c;color:#ce93d8;">Offset +{}</span>'.format(
+                tvdb_badges += ' <span class="badge badge-neutral">Offset +{}</span>'.format(
                     a["episode_offset"])
             tvdb_badges += (' <form method="POST" action="/tvdb-unlink" style="margin:0;display:inline;">'
                             '<input type="hidden" name="index" value="{}">'
-                            '<button type="submit" class="btn btn-ghost btn-sm" style="font-size:0.7rem;" '
+                            '<button type="submit" class="btn btn-ghost btn-sm" '
                             'onclick="return confirm(\'Remove TVDB link?\')">Unlink TVDB</button>'
                             '</form>').format(i)
         elif tvdb.available:
             tvdb_badges += (' <form method="POST" action="/tvdb-link" style="margin:0;display:inline;">'
                             '<input type="hidden" name="index" value="{}">'
-                            '<button type="submit" class="btn btn-ghost btn-sm" style="font-size:0.7rem;">Link TVDB</button>'
+                            '<button type="submit" class="btn btn-ghost btn-sm">Link TVDB</button>'
                             '</form>').format(i)
 
-        # Completion / skip badges
+        # Completion / skip badges — color reserved for meaningful state
         status_badges = ""
         if a.get("complete"):
-            status_badges += ' <span class="badge" style="background:#2e7d32;color:#a5d6a7;">Complete</span>'
+            status_badges += ' <span class="badge badge-ok">Complete</span>'
             status_badges += (' <form method="POST" action="/mark-incomplete" style="margin:0;display:inline;">'
                               '<input type="hidden" name="index" value="{}">'
-                              '<button type="submit" class="btn btn-ghost btn-sm" style="font-size:0.7rem;">Mark Incomplete</button>'
+                              '<button type="submit" class="btn btn-ghost btn-sm">Mark incomplete</button>'
                               '</form>').format(i)
         elif a.get("skip_until"):
-            status_badges += ' <span class="badge" style="background:#e65100;color:#ffcc80;">Next: {}</span>'.format(
+            status_badges += ' <span class="badge badge-warn">Next: {}</span>'.format(
                 escape(str(a["skip_until"])))
         if a.get("al_status"):
-            status_badges += ' <span class="badge" style="background:#37474f;color:#b0bec5;">{}</span>'.format(
+            status_badges += ' <span class="badge badge-neutral">{}</span>'.format(
                 escape(a["al_status"]))
 
         # Folder name (editable)
         folder = a.get("customPackage", name)
         folder_html = (
-            '<div class="folder-row" style="margin-top:4px;font-size:0.85rem;color:#999;">'
+            '<div class="folder-row">'
             'Folder: <form method="POST" action="/update-folder" style="display:inline;margin:0;">'
             '<input type="hidden" name="index" value="{idx}">'
-            '<input type="text" name="folder" value="{folder}" '
-            'style="background:#1e1e1e;border:1px solid #333;color:#ccc;padding:2px 6px;'
-            'border-radius:4px;font-size:0.85rem;width:220px;">'
-            ' <button type="submit" class="btn btn-ghost btn-sm" style="font-size:0.7rem;">Save</button>'
+            '<input type="text" name="folder" value="{folder}" class="folder-input">'
+            ' <button type="submit" class="btn btn-ghost btn-sm">Save folder</button>'
             '</form></div>').format(idx=i, folder=escape(folder))
 
         # Build episode detail panel
@@ -1423,7 +1479,7 @@ def render_watchlist(anime_list, pending_list=None):
 
         html += """
         <div class="card">
-          <div style="display:flex;justify-content:space-between;align-items:start;">
+          <div style="display:flex;justify-content:space-between;align-items:start;gap:12px;">
             <div>
               <div class="anime-name">{name}</div>
               {url_html}
@@ -1455,7 +1511,7 @@ def render_search_results(results):
     for r in results:
         html += """
         <div class="card">
-          <div style="display:flex;justify-content:space-between;align-items:start;">
+          <div style="display:flex;justify-content:space-between;align-items:start;gap:12px;">
             <div>
               <div class="anime-name">{name}</div>
               <div class="anime-meta">{type} &middot; {episodes} episodes &middot; {genre}</div>
@@ -1463,7 +1519,7 @@ def render_search_results(results):
             </div>
             <form method="POST" action="/add-url" style="margin:0;">
               <input type="hidden" name="url" value="{url}">
-              <button type="submit" class="btn btn-primary btn-sm">Add</button>
+              <button type="submit" class="btn btn-primary btn-sm">Add to watchlist</button>
             </form>
           </div>
         </div>""".format(**{k: escape(str(v)) for k, v in r.items()})
@@ -1477,7 +1533,7 @@ def render_releases(anime_info, best_id=None):
     html = '<div class="section"><h2>Select Release for: {}</h2>'.format(escape(anime_info["name"]))
     html += """
     <div class="card" style="margin-bottom:16px;">
-      <label style="color:#888;font-size:0.85rem;">Folder name in /anime library:</label>
+      <label class="hint">Folder name in /anime library:</label>
       <input type="text" id="release-folder" value="{name}" style="margin-top:4px;margin-bottom:0;">
     </div>""".format(name=escape(anime_info["name"]))
 
@@ -1486,17 +1542,17 @@ def render_releases(anime_info, best_id=None):
         dubs = ", ".join(rel["dubs"]) if rel["dubs"] else "&mdash;"
         subs = ", ".join(rel["subs"]) if rel["subs"] else "&mdash;"
         is_best = rel["id"] == best_id
-        highlight = "border-color:#7c4dff;border-width:2px;" if is_best else ""
-        best_label = ' <span class="badge badge-auto">Best Match</span>' if is_best else ""
+        highlight = "card-selected" if is_best else ""
+        best_label = ' <span class="badge badge-accent">Best match</span>' if is_best else ""
 
         html += """
-        <div class="card" style="{highlight}">
+        <div class="card {highlight}">
           <div class="release-row">
             <span class="badge badge-res">{res}p</span>
-            <span class="badge badge-lang">Dub: {dubs}</span>
-            <span class="badge" style="background:#4a148c;color:#ce93d8;">Sub: {subs}</span>
+            <span class="badge badge-neutral">Dub: {dubs}</span>
+            <span class="badge badge-neutral">Sub: {subs}</span>
             <span class="badge badge-ep">{eps} eps</span>
-            <span style="color:#888;font-size:0.8rem;">{size}MB &middot; {group}</span>
+            <span class="hint">{size}MB &middot; {group}</span>
             {best_label}
             <form method="POST" action="/add-release" style="margin:0;margin-left:auto;"
                   onsubmit="this.querySelector('[name=custom_folder]').value=document.getElementById('release-folder').value;">
@@ -1549,9 +1605,9 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
 
     html = '<div class="section"><h2>TVDB Correlation: {}</h2>'.format(escape(anime_name))
     if is_movie:
-        html += '<p style="color:#888;font-size:0.85rem;">Detected as <strong>Anime Movie</strong> — searching TVDB movies. No season selection needed.</p>'
+        html += '<p class="hint">Detected as <strong>Anime Movie</strong> — searching TVDB movies. No season selection needed.</p>'
     else:
-        html += '<p style="color:#888;font-size:0.85rem;">Link this anime to a TVDB series and season so downloads are placed in the correct season folder.</p>'
+        html += '<p class="hint">Link this anime to a TVDB series and season so downloads are placed in the correct season folder.</p>'
 
     # Skip button — save without TVDB
     skip_label = (
@@ -1593,13 +1649,13 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
                 if len(overview) > 150:
                     overview = overview[:150] + "..."
                 is_selected = str(r["tvdb_id"]) == str(selected_tvdb_id)
-                border = "border-color:#7c4dff;border-width:2px;" if is_selected else ""
+                border = "card-selected" if is_selected else ""
                 html += """
-                <div class="card" style="{border}">
-                  <div style="display:flex;justify-content:space-between;align-items:start;">
+                <div class="card {border}">
+                  <div style="display:flex;justify-content:space-between;align-items:start;gap:12px;">
                     <div>
                       <div class="anime-name">{name}{year}</div>
-                      <div style="color:#888;font-size:0.8rem;margin-top:2px;">{overview}</div>
+                      <div class="hint" style="margin-top:2px;">{overview}</div>
                     </div>
                     <form method="POST" action="{action}" style="margin:0;">
                       {hidden}
@@ -1616,7 +1672,7 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
 
     # Season picker (shown after selecting a series — never for movies)
     if seasons is not None and not is_movie:
-        html += '<div class="card" style="border-color:#7c4dff;border-width:2px;margin-top:16px;">'
+        html += '<div class="card card-accent" style="margin-top:16px;">'
         html += '<h3 style="margin:0 0 8px;">Seasons for: {}</h3>'.format(escape(selected_tvdb_name))
 
         # Auto-suggest: pick the season whose ep count is closest to the release ep count
@@ -1631,8 +1687,8 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
 
         for s in seasons:
             is_suggested = s["season_number"] == best_season
-            suggest_label = ' <span class="badge badge-auto">Likely match ({} eps)</span>'.format(ep_count) if is_suggested else ""
-            highlight = "background:#1a1a2e;" if is_suggested else ""
+            suggest_label = ' <span class="badge badge-accent">Likely match ({} eps)</span>'.format(ep_count) if is_suggested else ""
+            highlight = "background:var(--accent-soft-bg);border-radius:6px;padding-left:8px;padding-right:8px;" if is_suggested else ""
             html += """
             <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;{highlight}">
               <span>
@@ -1656,20 +1712,20 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
         # Advanced: manual offset input
         html += """
         <details style="margin-top:12px;">
-          <summary style="color:#888;cursor:pointer;font-size:0.85rem;">Advanced: episode offset</summary>
+          <summary class="hint" style="cursor:pointer;">Advanced: episode offset</summary>
           <div style="margin-top:8px;">
-            <p style="color:#888;font-size:0.8rem;margin:0 0 8px;">
+            <p class="hint" style="margin:0 0 8px;">
               Set this if anime-loads numbers episodes from 1 but TVDB continues from a previous season
               (e.g., offset 12 means ep 1 becomes E13).
             </p>
             <form method="POST" action="{save_action}" style="display:flex;gap:8px;align-items:center;margin:0;">
               {hidden}
               <input type="hidden" name="tvdb_id" value="{tid}">
-              <label style="color:#ccc;">Season:</label>
+              <label>Season:</label>
               <input type="number" name="tvdb_season" min="1" value="{suggested}" style="width:60px;margin:0;" required>
-              <label style="color:#ccc;">Offset:</label>
+              <label>Offset:</label>
               <input type="number" name="episode_offset" value="0" style="width:60px;margin:0;">
-              <button type="submit" class="btn btn-primary btn-sm">Confirm</button>
+              <button type="submit" class="btn btn-primary btn-sm">Save season</button>
             </form>
           </div>
         </details>""".format(hidden=hidden, tid=selected_tvdb_id,

@@ -1222,44 +1222,50 @@ def printhelp():
     print("[remove]:  Lösche Anime aus deiner Liste")
 
 
-commandSet = False
-if(arglen >= 2):
-    for idx, arg in enumerate(sys.argv):
-        if(arg == "--configfile"):
-            try:
-                botfile = sys.argv[idx+1]
-                botfolder_arr = botfile.split("/")[:-1]
-                botfolder = ""
-                for p in botfolder_arr:
-                    botfolder += p
-                    botfolder += "/"
-                print("Config Datei: " + botfile)
-            except Exception as e:
-                botfile = "config/ani.json"
-                botfolder = "config/"
-                print("--configfile gegeben, aber kein Pfad (oder fehlerhafter) danach, setze Pfad auf ./config/ani.json")
-        if(arg == "start"):
-            commandSet = True
+# CLI dispatch. Guarded by __name__ == "__main__" so that `import anibot`
+# (e.g. from the test suite) does NOT launch the bot, while running the module
+# as a script — `python anibot.py [args]`, the Docker ENTRYPOINT/CMD — still
+# dispatches identically. The if-blocks below don't create a new scope, so the
+# module-level globals botfile/botfolder are reassigned exactly as before.
+if __name__ == "__main__":
+    commandSet = False
+    if(arglen >= 2):
+        for idx, arg in enumerate(sys.argv):
+            if(arg == "--configfile"):
+                try:
+                    botfile = sys.argv[idx+1]
+                    botfolder_arr = botfile.split("/")[:-1]
+                    botfolder = ""
+                    for p in botfolder_arr:
+                        botfolder += p
+                        botfolder += "/"
+                    print("Config Datei: " + botfile)
+                except Exception as e:
+                    botfile = "config/ani.json"
+                    botfolder = "config/"
+                    print("--configfile gegeben, aber kein Pfad (oder fehlerhafter) danach, setze Pfad auf ./config/ani.json")
+            if(arg == "start"):
+                commandSet = True
+                startbot()
+            elif(arg == "edit"):
+                commandSet = True
+                editconfig()
+                print("Einstellungen gespeichert")
+            elif(arg == "add"):
+                commandSet = True
+                addAnime()
+            elif(arg == "remove"):
+              commandSet = True
+              removeAnime()
+            elif("help" in arg):
+                printhelp()
+
+    else:
+        if(arglen == 1):
             startbot()
-        elif(arg == "edit"):
-            commandSet = True
-            editconfig()
-            print("Einstellungen gespeichert")
-        elif(arg == "add"):
-            commandSet = True
-            addAnime()
-        elif(arg == "remove"):
-          commandSet = True
-          removeAnime()
-        elif("help" in arg):
-            printhelp()
+        printhelp()
 
-else:
-    if(arglen == 1):
+    if(commandSet == False):
         startbot()
-    printhelp()
 
-if(commandSet == False):
-    startbot()
-
-#episodes = getEpisodes()
+    #episodes = getEpisodes()

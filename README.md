@@ -202,6 +202,22 @@ The watcher runs every 5 minutes. For each download directory:
 
 Set `DRY_RUN=1` in docker-compose to log actions without moving anything.
 
+## Testing
+
+A lightweight, hermetic test suite covers the pure-logic functions (release
+matching, language prefs, filename/season parsing, the early-release skip
+helper). It uses stdlib `unittest` only — no extra runtime deps, no network,
+Selenium, Docker, or filesystem dependence.
+
+```bash
+PYTHONPATH=bot python -m unittest discover tests
+```
+
+The tests import `web/app.py` and `bot/anibot.py` directly; both are
+import-safe (their server/CLI entry points are guarded by `__name__ ==
+"__main__"`), and the suite stubs the bot's optional heavy deps so they need
+not be installed.
+
 ## Bot Fork Details
 
 The original `pfuenzle/anime-loads` image (Dec 2021) no longer works because:

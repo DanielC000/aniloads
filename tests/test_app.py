@@ -274,5 +274,34 @@ class MovieTargetNameTest(unittest.TestCase):
         self.assertEqual(app._movie_target_name("", None), "Unknown")
 
 
+class RenderReleasesEscapingTest(unittest.TestCase):
+    def _info(self, dubs, subs):
+        return {
+            "name": "Test & <Anime>",
+            "url": "http://x",
+            "media_type": "series",
+            "releases": [{
+                "id": "r1", "resolution": 1080, "episodes": 12,
+                "size_mb": 700, "group": "G&P", "dubs": dubs, "subs": subs,
+            }],
+        }
+
+    def test_empty_subs_render_single_em_dash_entity(self):
+        out = app.render_releases(self._info(["English"], []), "r1")
+        # Single entity → renders as an em-dash, not the literal "&mdash;".
+        self.assertIn("Sub: &mdash;", out)
+        self.assertNotIn("&amp;mdash;", out)
+
+    def test_empty_dubs_render_single_em_dash_entity(self):
+        out = app.render_releases(self._info([], ["English"]), "r1")
+        self.assertIn("Dub: &mdash;", out)
+        self.assertNotIn("&amp;mdash;", out)
+
+    def test_real_languages_are_html_escaped(self):
+        out = app.render_releases(self._info(["Jap<x>"], ["Eng&Co"]), "r1")
+        self.assertIn("Dub: Jap&lt;x&gt;", out)
+        self.assertIn("Sub: Eng&amp;Co", out)
+
+
 if __name__ == "__main__":
     unittest.main()

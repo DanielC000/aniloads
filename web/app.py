@@ -1574,8 +1574,8 @@ def render_releases(anime_info, best_id=None):
 
     media_type = anime_info.get("media_type", "series") or "series"
     for rel in anime_info["releases"]:
-        dubs = ", ".join(rel["dubs"]) if rel["dubs"] else "&mdash;"
-        subs = ", ".join(rel["subs"]) if rel["subs"] else "&mdash;"
+        dubs = escape(", ".join(rel["dubs"])) if rel["dubs"] else "&mdash;"
+        subs = escape(", ".join(rel["subs"])) if rel["subs"] else "&mdash;"
         is_best = rel["id"] == best_id
         highlight = "card-selected" if is_best else ""
         best_label = ' <span class="badge badge-accent">Best match</span>' if is_best else ""
@@ -1600,7 +1600,7 @@ def render_releases(anime_info, best_id=None):
             </form>
           </div>
         </div>""".format(
-            res=rel["resolution"], dubs=dubs, subs=escape(subs), eps=rel["episodes"],
+            res=rel["resolution"], dubs=dubs, subs=subs, eps=rel["episodes"],
             size=rel["size_mb"], group=escape(rel["group"]), url=escape(anime_info["url"]),
             name=escape(anime_info["name"]), rid=rel["id"], highlight=highlight,
             best_label=best_label, mt=escape(media_type),

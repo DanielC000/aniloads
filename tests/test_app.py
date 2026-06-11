@@ -303,5 +303,19 @@ class RenderReleasesEscapingTest(unittest.TestCase):
         self.assertIn("Sub: Eng&amp;Co", out)
 
 
+class RenderWatchlistPendingTest(unittest.TestCase):
+    def test_no_match_pending_renders_explanatory_line(self):
+        out = app.render_watchlist(
+            [], [{"name": "Foo", "url": "http://x", "no_match": True}])
+        self.assertIn("No release matches your language preference", out)
+        self.assertIn("badge-warn", out)
+        self.assertNotIn("Resolving", out)
+
+    def test_normal_pending_renders_resolving(self):
+        out = app.render_watchlist([], [{"name": "Bar", "url": "http://y"}])
+        self.assertIn("Resolving", out)
+        self.assertNotIn("No release matches", out)
+
+
 if __name__ == "__main__":
     unittest.main()

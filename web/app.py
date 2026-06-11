@@ -1385,20 +1385,32 @@ def render_watchlist(anime_list, pending_list=None):
             if pref_res:
                 pref_badges += '<span class="badge badge-res">{}p</span> '.format(pref_res)
 
+            if a.get("no_match"):
+                status_badge = '<span class="badge badge-warn">No match</span>'
+                no_match_line = (
+                    '<div class="anime-meta muted">No release matches your '
+                    'language preference &mdash; adjust Preferences, or remove.</div>'
+                )
+            else:
+                status_badge = '<span class="badge badge-accent">Resolving</span>'
+                no_match_line = ""
+
             html += """
             <div class="card card-accent">
               <div style="display:flex;justify-content:space-between;align-items:start;gap:12px;">
                 <div>
-                  <div class="anime-name">{name} <span class="badge badge-accent">Resolving</span></div>
+                  <div class="anime-name">{name} {status_badge}</div>
                   <div class="anime-url">{url}</div>
                   <div class="anime-meta">{pref_badges}</div>
+                  {no_match_line}
                 </div>
                 <form method="POST" action="/remove-pending" style="margin:0;">
                   <input type="hidden" name="index" value="{idx}">
                   <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Remove {name}?')">Remove</button>
                 </form>
               </div>
-            </div>""".format(name=escape(name), url=escape(url), pref_badges=pref_badges, idx=i)
+            </div>""".format(name=escape(name), url=escape(url), pref_badges=pref_badges,
+                             status_badge=status_badge, no_match_line=no_match_line, idx=i)
 
     for i, a in enumerate(anime_list):
         name = a.get("name", "Unknown")
@@ -2292,6 +2304,7 @@ def resolve_pending():
 
             prefs = load_prefs()
             resolved = []
+            changed = False
 
             for i, entry in enumerate(pending):
                 url = entry.get("url", "")
@@ -2329,6 +2342,12 @@ def resolve_pending():
                         _log.info("[resolver] Resolved %s -> release %d (%sp, %s)",
                             info["name"], best["id"], best["resolution"],
                             ", ".join(best.get("dubs", [])))
+                    elif not entry.get("no_match"):
+                        # Releases exist but none match the strict language prefs.
+                        # Surface this so the entry doesn't sit unresolved forever.
+                        entry["no_match"] = True
+                        changed = True
+                        _log.info("[resolver] No release matches prefs for %s", info["name"])
                 except Exception as e:
                     _log.error("[resolver] Error resolving %s: %s", url, e)
 
@@ -2340,6 +2359,10 @@ def resolve_pending():
                 data["pending"] = pending
                 save_ani(data)
                 _log.info("[resolver] Moved %d entries to anime list", len(resolved))
+            elif changed:
+                # No entries resolved, but a no_match flag was set — persist it.
+                data["pending"] = pending
+                save_ani(data)
 
         except Exception as e:
             _log.error("[resolver] Error: %s", e)

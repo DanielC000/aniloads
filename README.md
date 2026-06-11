@@ -115,6 +115,7 @@ The bot and web UI share `ani.json`. Anime entries:
 | `episode_offset` | int? | Added to episode numbers when moving files (default 0) |
 | `complete` | bool? | Set automatically when series is finished and all episodes downloaded. Bot skips this entry. |
 | `skip_until` | string? | ISO date (e.g. `"2026-04-22"`). Bot skips checking until this date — set from TVDB next-episode airdate. |
+| `skip_real_airdate` | bool? | Whether `skip_until` is a real TVDB-predicted airdate (`true`) vs a synthetic throttle date (`false`). Only real airdates get early-release scraping (`EARLY_SCRAPE_DAYS` window); synthetic dates are honored strictly. |
 | `tvdb_series_status` | string? | Cached TVDB series status (`"Ended"`, `"Continuing"`, etc.) |
 | `al_status` | string? | Cached anime-loads.org status (`"Abgeschlossen"`, `"Laufend"`, etc.) |
 | `al_max_episodes` | int? | Cached max episode count from anime-loads.org |
@@ -160,7 +161,9 @@ launching a browser. Each cycle, for every entry:
 1. **Already complete?** — entries with `complete: true` and no missing episodes are
    skipped entirely (no Selenium, no HTTP)
 2. **Next episode not aired?** — if `skip_until` is set and in the future, the entry
-   is deferred until that date
+   is deferred until that date. For a real TVDB airdate (`skip_real_airdate: true`) the
+   bot scrapes from `EARLY_SCRAPE_DAYS` (default 1) before the date, to catch episodes
+   anime-loads.org publishes early; synthetic throttle dates are honored strictly.
 3. **TVDB status check** (lightweight HTTP, no Selenium) — if the entry has a `tvdb_id`:
    - Series status is `"Ended"` and all episodes downloaded → mark `complete`, skip
    - Series status is `"Continuing"` → fetch next episode airdate, set `skip_until`

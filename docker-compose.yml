@@ -58,6 +58,7 @@ services:
       - CNL_RETRY_DELAY_MAX=${CNL_RETRY_DELAY_MAX:-10}
       - JD_HTTP_TIMEOUT=${JD_HTTP_TIMEOUT:-30}
       - TVDB_HTTP_TIMEOUT=${TVDB_HTTP_TIMEOUT:-10}
+      - EARLY_SCRAPE_DAYS=${EARLY_SCRAPE_DAYS:-1}
     volumes:
       - "${ANIME_CONFIG_DIR:?set in .env (see .env.example)}:/config"
     networks:

@@ -10,6 +10,13 @@ LOG_DIR = os.environ.get("LOG_DIR", "/config/logs")
 LOG_FILE = os.path.join(LOG_DIR, "anibot.log")
 LOGLEVEL = getattr(logging, os.environ.get("LOGLEVEL", "INFO").upper(), logging.INFO)
 
+# Days before a skip_until date to start scraping anyway. The bot defers
+# scraping a "Continuing" series until skip_until (the TVDB-predicted airdate),
+# but anime-loads.org sometimes publishes an episode early. Once today is within
+# this many days of skip_until, the bot scrapes anyway to catch the early
+# release. 0 disables (strict skip_until honoring). See should_scrape_despite_skip().
+EARLY_SCRAPE_DAYS = int(os.environ.get("EARLY_SCRAPE_DAYS", "1"))
+
 _stdout_handler = logging.StreamHandler(sys.stdout)
 _stdout_handler.setFormatter(logging.Formatter("%(message)s"))
 _handlers = [_stdout_handler]
@@ -81,6 +88,29 @@ def printException(e):
     exc_type, exc_obj, exc_tb = sys.exc_info()
     fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
     _log.error("Error: %s %s %s", exc_type, fname, exc_tb.tb_lineno)
+
+def should_scrape_despite_skip(skip_until_str, today, window_days):
+    """Decide whether to scrape now even though a skip_until date is set.
+
+    The bot writes skip_until = <TVDB-predicted airdate> for a "Continuing"
+    series and skips scraping until then. But anime-loads.org sometimes
+    publishes an episode before its TVDB airdate, which the strict skip would
+    miss. So once `today` is within `window_days` of skip_until — i.e. it's the
+    airdate-eve or later — scrape anyway to catch an early release, while still
+    skipping when skip_until is well in the future (preserving rate-limit
+    protection).
+
+    Returns True (scrape) when today >= skip_until - window_days, when there is
+    no skip_until, or when skip_until is unparseable (a bad date must not
+    silently suppress scraping). Returns False (honor the skip) otherwise.
+    """
+    if not skip_until_str:
+        return True
+    try:
+        skip_date = date.fromisoformat(skip_until_str)
+    except (ValueError, TypeError):
+        return True
+    return today >= skip_date - timedelta(days=window_days)
 
 def _boot_backoff(attempt, cap=300):
     """Capped exponential backoff (seconds) for in-process boot retries.
@@ -850,20 +880,30 @@ def startbot():
                     save_ani()
                     continue
 
-                # Step 3: Waiting for next episode airdate (skip_until)
+                # Step 3: Waiting for next episode airdate (skip_until).
+                # Only a REAL TVDB-predicted airdate (skip_real_airdate) gets the
+                # early-scrape window — scrape on the eve to catch an episode
+                # anime-loads.org published before its airdate. Synthetic throttle
+                # dates (no-airdate default, THROTTLE step) regenerate daily, so
+                # early-scraping them would recur into perpetual every-cycle
+                # scraping; those are honored strictly. Missing marker (legacy
+                # entry) → treat as not-real until the next Step 4 pass re-marks it.
                 skip_until = animeentry.get('skip_until', '')
                 if skip_until:
-                    try:
-                        skip_date = date.fromisoformat(skip_until)
-                        if date.today() < skip_date:
-                            if len(missingEpisodes) == 0:
-                                _log.info("[SKIP] " + name + " — next episode airs " + skip_until)
-                                continue
-                            else:
-                                _log.info("[RETRY] " + name + " — next episode airs " + skip_until
-                                          + " but " + str(len(missingEpisodes)) + " missing episodes to retry")
-                    except ValueError:
-                        pass
+                    if animeentry.get('skip_real_airdate'):
+                        honor_skip = not should_scrape_despite_skip(skip_until, date.today(), EARLY_SCRAPE_DAYS)
+                    else:
+                        try:
+                            honor_skip = date.today() < date.fromisoformat(skip_until)
+                        except (ValueError, TypeError):
+                            honor_skip = False
+                    if honor_skip:
+                        if len(missingEpisodes) == 0:
+                            _log.info("[SKIP] " + name + " — next episode airs " + skip_until)
+                            continue
+                        else:
+                            _log.info("[RETRY] " + name + " — next episode airs " + skip_until
+                                      + " but " + str(len(missingEpisodes)) + " missing episodes to retry")
 
                 # Step 4: TVDB-based checks (lightweight HTTP, no Selenium)
                 # Movies are not series — skip TVDB series status logic.
@@ -894,9 +934,17 @@ def startbot():
                                 try:
                                     air_date_obj = date.fromisoformat(airdate)
                                     if air_date_obj > date.today():
+                                        # Cache the airdate for the skip_until badge / next cycle,
+                                        # but scrape anyway once within EARLY_SCRAPE_DAYS of it to
+                                        # catch an episode published before its TVDB airdate. Mark
+                                        # this as a real airdate so Step 3 applies the early-scrape.
                                         animeentry['skip_until'] = airdate
+                                        animeentry['skip_real_airdate'] = True
                                         save_ani()
-                                        if len(missingEpisodes) == 0:
+                                        if should_scrape_despite_skip(airdate, date.today(), EARLY_SCRAPE_DAYS):
+                                            _log.info("[EARLY] " + name + " — next episode airs " + airdate
+                                                      + ", scraping within " + str(EARLY_SCRAPE_DAYS) + "d for early release")
+                                        elif len(missingEpisodes) == 0:
                                             _log.info("[SKIP] " + name + " — next episode airs " + airdate)
                                             continue
                                         else:
@@ -905,9 +953,13 @@ def startbot():
                                 except ValueError:
                                     pass
                             else:
-                                # No known airdate — skip for 1 day to avoid pointless scraping
+                                # No known airdate — synthetic throttle date (regenerates daily),
+                                # so it is honored strictly (skip_real_airdate=False); the early-scrape
+                                # window applies only to real predicted airdates. Skip 1 day to avoid
+                                # pointless scraping while rechecking TVDB once per day.
                                 default_skip = (date.today() + timedelta(days=1)).isoformat()
                                 animeentry['skip_until'] = default_skip
+                                animeentry['skip_real_airdate'] = False
                                 save_ani()
                                 if len(missingEpisodes) == 0:
                                     _log.info("[SKIP] " + name + " — no airdate known, re-check " + default_skip)
@@ -973,6 +1025,8 @@ def startbot():
                     _log.info("[THROTTLE] " + name + " — complete but release has "
                           + str(curEpisodes) + "/" + str(fresh_al_max) + " eps, re-check " + throttle_date)
                     animeentry['skip_until'] = throttle_date
+                    # Synthetic throttle date — honored strictly, not early-scraped.
+                    animeentry['skip_real_airdate'] = False
                     save_ani()
                 # Cache media type + naming metadata (used by mover to route movies
                 # to a separate output folder with Plex "Title (Year)" convention).

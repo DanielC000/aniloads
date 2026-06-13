@@ -1398,7 +1398,7 @@ function expandEps(btn) {
   var group = btn.parentNode.nextElementSibling;
   if (!group) return;
   if (!btn.dataset.built) {
-    var idx = btn.dataset.index, eps = parseInt(btn.dataset.eps, 10) || 0;
+    var key = btn.dataset.key, eps = parseInt(btn.dataset.eps, 10) || 0;
     var miss = {};
     try {
       JSON.parse(btn.dataset.missing || '[]').forEach(function(e) { miss[e] = 1; });
@@ -1409,7 +1409,7 @@ function expandEps(btn) {
       rows += '<div class="ep-row"><span class="ep-num">Ep ' + n + '</span> '
             + '<span class="badge badge-ok">OK</span> '
             + '<form method="POST" action="/ep-add" style="margin:0;">'
-            + '<input type="hidden" name="index" value="' + idx + '">'
+            + '<input type="hidden" name="key" value="' + key + '">'
             + '<input type="hidden" name="ep" value="' + n + '">'
             + '<button type="submit" class="btn btn-ghost btn-sm">Retry</button></form></div>';
     }
@@ -1608,6 +1608,26 @@ def confirm_attr(message):
     return escape("return confirm({})".format(json.dumps(message)), quote=True)
 
 
+def find_entry_by_url(entries, url):
+    """Locate a watchlist entry by its (unique) URL.
+
+    Returns ``(index, entry)`` for the first match, or ``(-1, None)`` if no
+    entry has that URL (including when ``url`` is empty).
+
+    Mutations key off URL rather than array index: the ``resolve_pending``
+    background thread pops resolved entries concurrently, so an index captured
+    at page-render time can point at a different entry by the time the form is
+    submitted (TOCTOU). URLs are unique — ``/add-url`` dedups by URL across both
+    the anime and pending lists — so matching on URL hits the intended entry.
+    """
+    if not url:
+        return -1, None
+    for i, entry in enumerate(entries):
+        if entry.get("url") == url:
+            return i, entry
+    return -1, None
+
+
 def render_watchlist(anime_list, pending_list=None):
     if not anime_list and not pending_list:
         return '<div class="empty">No anime in watchlist. Add some above!</div>'
@@ -1649,17 +1669,20 @@ def render_watchlist(anime_list, pending_list=None):
                   {no_match_line}
                 </div>
                 <form method="POST" action="/remove-pending" style="margin:0;">
-                  <input type="hidden" name="index" value="{idx}">
+                  <input type="hidden" name="key" value="{key}">
                   <button type="submit" class="btn btn-danger btn-sm" onclick="{remove_confirm}">Remove</button>
                 </form>
               </div>
             </div>""".format(name=escape(name), url=escape(url), pref_badges=pref_badges,
-                             status_badge=status_badge, no_match_line=no_match_line, idx=i,
+                             status_badge=status_badge, no_match_line=no_match_line, key=escape(url),
                              remove_confirm=remove_confirm)
 
     for i, a in enumerate(anime_list):
         name = a.get("name", "Unknown")
         url = a.get("url", "")
+        # Mutations target this entry by its unique URL (see find_entry_by_url),
+        # not by array index — the resolver shifts indices concurrently.
+        key = escape(url)
         eps = a.get("episodes", a.get("episodes_downloaded", 0))
         missing = a.get("missing", [])
         remove_confirm = confirm_attr("Remove {}?".format(name))
@@ -1699,24 +1722,24 @@ def render_watchlist(anime_list, pending_list=None):
                 tvdb_badges += ' <span class="badge badge-neutral">Offset +{}</span>'.format(
                     a["episode_offset"])
             tvdb_badges += (' <form method="POST" action="/tvdb-unlink" style="margin:0;display:inline;">'
-                            '<input type="hidden" name="index" value="{}">'
+                            '<input type="hidden" name="key" value="{}">'
                             '<button type="submit" class="btn btn-ghost btn-sm" '
                             'onclick="return confirm(\'Remove TVDB link?\')">Unlink TVDB</button>'
-                            '</form>').format(i)
+                            '</form>').format(key)
         elif tvdb.available:
             tvdb_badges += (' <form method="POST" action="/tvdb-link" style="margin:0;display:inline;">'
-                            '<input type="hidden" name="index" value="{}">'
+                            '<input type="hidden" name="key" value="{}">'
                             '<button type="submit" class="btn btn-ghost btn-sm">Link TVDB</button>'
-                            '</form>').format(i)
+                            '</form>').format(key)
 
         # Completion / skip badges — color reserved for meaningful state
         status_badges = ""
         if a.get("complete"):
             status_badges += ' <span class="badge badge-ok">Complete</span>'
             status_badges += (' <form method="POST" action="/mark-incomplete" style="margin:0;display:inline;">'
-                              '<input type="hidden" name="index" value="{}">'
+                              '<input type="hidden" name="key" value="{}">'
                               '<button type="submit" class="btn btn-ghost btn-sm">Mark incomplete</button>'
-                              '</form>').format(i)
+                              '</form>').format(key)
         elif a.get("skip_until"):
             status_badges += ' <span class="badge badge-warn">Next: {}</span>'.format(
                 escape(str(a["skip_until"])))
@@ -1729,10 +1752,10 @@ def render_watchlist(anime_list, pending_list=None):
         folder_html = (
             '<div class="folder-row">'
             'Folder: <form method="POST" action="/update-folder" style="display:inline;margin:0;">'
-            '<input type="hidden" name="index" value="{idx}">'
+            '<input type="hidden" name="key" value="{key}">'
             '<input type="text" name="folder" value="{folder}" class="folder-input">'
             ' <button type="submit" class="btn btn-ghost btn-sm">Save folder</button>'
-            '</form></div>').format(idx=i, folder=escape(folder))
+            '</form></div>').format(key=key, folder=escape(folder))
 
         # Build episode detail panel
         eps_count = int(eps) if isinstance(eps, (int, float)) else 0
@@ -1749,9 +1772,9 @@ def render_watchlist(anime_list, pending_list=None):
         for ep_num in range(1, eps_count + 1):
             if ep_num in missing_set:
                 action = ('<form method="POST" action="/ep-remove" style="margin:0;">'
-                          '<input type="hidden" name="index" value="{}"><input type="hidden" name="ep" value="{}">'
+                          '<input type="hidden" name="key" value="{}"><input type="hidden" name="ep" value="{}">'
                           '<button type="submit" class="btn btn-ghost btn-sm">Skip</button>'
-                          '</form>').format(i, ep_num)
+                          '</form>').format(key, ep_num)
                 ep_rows += ('<div class="ep-row"><span class="ep-num">Ep {}</span> '
                             '<span class="badge badge-retry">Retrying</span> {}</div>').format(ep_num, action)
             else:
@@ -1764,28 +1787,28 @@ def render_watchlist(anime_list, pending_list=None):
                             ' <span class="badge badge-retry">Retrying</span>'
                             ' <span class="badge badge-auto">Queued</span>'
                             ' <form method="POST" action="/ep-remove" style="margin:0;">'
-                            '<input type="hidden" name="index" value="{}"><input type="hidden" name="ep" value="{}">'
+                            '<input type="hidden" name="key" value="{}"><input type="hidden" name="ep" value="{}">'
                             '<button type="submit" class="btn btn-ghost btn-sm">Skip</button>'
-                            '</form></div>').format(ep_num, i, ep_num)
+                            '</form></div>').format(ep_num, key, ep_num)
 
         ok_toggle = ""
         if ok_count:
             missing_in_range = json.dumps(sorted(m for m in missing_set if 1 <= m <= eps_count))
             ok_toggle = (
                 '<div class="ep-ok-toggle">'
-                '<button type="button" class="ep-expand-btn" data-index="{i}" '
+                '<button type="button" class="ep-expand-btn" data-key="{key}" '
                 'data-eps="{eps}" data-count="{n}" data-missing=\'{miss}\' '
                 'onclick="expandEps(this)">Show {n} OK episode{s}</button>'
                 '</div><div class="ep-ok-group"></div>'
-            ).format(i=i, eps=eps_count, n=ok_count, miss=missing_in_range,
+            ).format(key=key, eps=eps_count, n=ok_count, miss=missing_in_range,
                      s="" if ok_count == 1 else "s")
 
         ep_add_form = ('<div class="ep-add-row">'
                        '<form method="POST" action="/ep-add" style="margin:0;display:flex;gap:8px;align-items:center;">'
-                       '<input type="hidden" name="index" value="{}">'
+                       '<input type="hidden" name="key" value="{}">'
                        '<input type="number" name="ep" min="1" placeholder="Ep #" required>'
                        '<button type="submit" class="btn btn-primary btn-sm">Add to retry</button>'
-                       '</form></div>').format(i)
+                       '</form></div>').format(key)
 
         ep_panel = ('<details class="ep-panel"><summary>Episodes ({} total{})</summary>'
                     '{}{}{}</details>').format(eps_count, retry_label, ep_rows, ok_toggle, ep_add_form)
@@ -1803,7 +1826,7 @@ def render_watchlist(anime_list, pending_list=None):
               {folder_html}
             </div>
             <form method="POST" action="/remove" style="margin:0;">
-              <input type="hidden" name="index" value="{idx}">
+              <input type="hidden" name="key" value="{key}">
               <button type="submit" class="btn btn-danger btn-sm" onclick="{remove_confirm}">Remove</button>
             </form>
           </div>
@@ -1812,7 +1835,7 @@ def render_watchlist(anime_list, pending_list=None):
             name=escape(name), url_html=url_html, eps=escape(str(eps)),
             type_badge=type_badge, missing_badge=missing_badge, pref_badges=pref_badges,
             tvdb_badges=tvdb_badges, status_badges=status_badges,
-            folder_html=folder_html, idx=i, ep_panel=ep_panel,
+            folder_html=folder_html, key=key, ep_panel=ep_panel,
             remove_confirm=remove_confirm,
         )
     return html
@@ -1890,19 +1913,21 @@ def render_releases(anime_info, best_id=None):
 
 def render_tvdb_step(anime_name, url, release_id, custom_folder,
                      search_results=None, seasons=None, selected_tvdb_id="",
-                     selected_tvdb_name="", ep_count=0, edit_index=None,
+                     selected_tvdb_name="", ep_count=0, edit_key=None,
                      media_type="series"):
     """Render the TVDB correlation page shown between release selection and saving.
 
-    When edit_index is set, this is editing an existing entry — forms POST to
-    /tvdb-save instead of /add-release.
+    When edit_key is set (the existing entry's URL), this is editing an existing
+    entry — forms POST to /tvdb-save instead of /add-release, carrying the URL as
+    the stable ``key`` so the save resolves the right entry even if the resolver
+    shifted indices in the meantime.
 
     When media_type == "movie", the UI searches TVDB's movie catalogue and
     drops the season picker (movies have no seasons). Clicking "Link" on a
     result saves the tvdb_id and returns to the watchlist.
     """
     is_movie = (media_type == "movie")
-    save_action = "/tvdb-save" if edit_index is not None else "/add-release"
+    save_action = "/tvdb-save" if edit_key is not None else "/add-release"
 
     # Hidden fields carried through every form on this page
     hidden = (
@@ -1914,8 +1939,8 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
     ).format(url=escape(url), name=escape(anime_name),
              rid=escape(str(release_id)), folder=escape(custom_folder),
              mt=escape(media_type))
-    if edit_index is not None:
-        hidden += '<input type="hidden" name="index" value="{}">'.format(edit_index)
+    if edit_key is not None:
+        hidden += '<input type="hidden" name="key" value="{}">'.format(escape(edit_key))
 
     html = '<div class="section"><h2>TVDB Correlation: {}</h2>'.format(escape(anime_name))
     if is_movie:
@@ -1926,7 +1951,7 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
     # Skip button — save without TVDB
     skip_label = (
         "save without TVDB link" if is_movie
-        else ("save without season mapping" if edit_index is None else "cancel")
+        else ("save without season mapping" if edit_key is None else "cancel")
     )
     html += """
     <form method="POST" action="{action}" style="margin-bottom:16px;">
@@ -2331,14 +2356,13 @@ class Handler(BaseHTTPRequestHandler):
             custom_folder = params.get("custom_folder", "").strip()
             query = params.get("query", "").strip() or name
             media_type = params.get("media_type", "series")
-            edit_idx = params.get("index")
-            edit_idx = int(edit_idx) if edit_idx is not None else None
+            edit_key = params.get("key")
 
             content_type = "movie" if media_type == "movie" else "series"
             results = tvdb.search(query, content_type=content_type) if tvdb.available else []
             search_html = render_tvdb_step(
                 name, url, release_id, custom_folder,
-                search_results=results, edit_index=edit_idx,
+                search_results=results, edit_key=edit_key,
                 media_type=media_type)
             self._respond(200, render_page(search_html=search_html))
 
@@ -2350,8 +2374,7 @@ class Handler(BaseHTTPRequestHandler):
             tvdb_id = params.get("tvdb_id", "")
             tvdb_name = params.get("tvdb_name", "")
             media_type = params.get("media_type", "series")
-            edit_idx = params.get("index")
-            edit_idx = int(edit_idx) if edit_idx is not None else None
+            edit_key = params.get("key")
 
             # Fetch seasons for the selected series
             seasons = tvdb.get_seasons(tvdb_id) if tvdb.available and tvdb_id else []
@@ -2375,11 +2398,12 @@ class Handler(BaseHTTPRequestHandler):
             # Editing an existing entry has no release_id, so fall back to the
             # entry's stored episode count — otherwise the "Likely match" season
             # suggestion never appears on the Link-TVDB-from-watchlist path (UI-3).
-            if not ep_count and edit_idx is not None:
+            if not ep_count and edit_key is not None:
                 try:
                     watchlist = load_ani().get("anime", [])
-                    if 0 <= edit_idx < len(watchlist):
-                        ep_count = int(watchlist[edit_idx].get("episodes", 0) or 0)
+                    _, w_entry = find_entry_by_url(watchlist, edit_key)
+                    if w_entry is not None:
+                        ep_count = int(w_entry.get("episodes", 0) or 0)
                 except (ValueError, TypeError):
                     pass
 
@@ -2387,7 +2411,7 @@ class Handler(BaseHTTPRequestHandler):
                 name, url, release_id, custom_folder,
                 search_results=results, seasons=seasons,
                 selected_tvdb_id=tvdb_id, selected_tvdb_name=tvdb_name or name,
-                ep_count=ep_count, edit_index=edit_idx,
+                ep_count=ep_count, edit_key=edit_key,
                 media_type=media_type)
             self._respond(200, render_page(search_html=search_html))
 
@@ -2409,37 +2433,39 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, render_page(search_html=search_html))
 
         elif parsed.path == "/remove-pending":
-            idx = int(params.get("index", -1))
+            entry_url = params.get("key", "")
             data = load_ani()
             pending = data.get("pending", [])
-            if 0 <= idx < len(pending):
-                removed = pending.pop(idx)
+            idx, removed = find_entry_by_url(pending, entry_url)
+            if removed is not None:
+                pending.pop(idx)
                 data["pending"] = pending
                 save_ani(data)
                 _log.info("[watchlist] Removed pending: %s", removed.get("name") or removed.get("url", "?"))
                 self._redirect_msg("Removed: {}".format(removed.get("name", "?")))
             else:
-                self._redirect_msg("Error: Invalid index")
+                self._redirect_msg("Error: entry not found")
 
         elif parsed.path == "/remove":
-            idx = int(params.get("index", -1))
+            entry_url = params.get("key", "")
             data = load_ani()
             anime_list = data.get("anime", [])
-            if 0 <= idx < len(anime_list):
-                removed = anime_list.pop(idx)
+            idx, removed = find_entry_by_url(anime_list, entry_url)
+            if removed is not None:
+                anime_list.pop(idx)
                 save_ani(data)
                 _log.info("[watchlist] Removed anime: %s", removed.get("name", "?"))
                 self._redirect_msg("Removed: {}".format(removed.get("name", "?")))
             else:
-                self._redirect_msg("Error: Invalid index")
+                self._redirect_msg("Error: entry not found")
 
         elif parsed.path == "/ep-add":
-            idx = int(params.get("index", -1))
+            entry_url = params.get("key", "")
             ep = int(params.get("ep", -1))
             data = load_ani()
             anime_list = data.get("anime", [])
-            if 0 <= idx < len(anime_list) and ep > 0:
-                entry = anime_list[idx]
+            _, entry = find_entry_by_url(anime_list, entry_url)
+            if entry is not None and ep > 0:
                 missing = entry.get("missing", [])
                 if ep not in missing:
                     missing.append(ep)
@@ -2450,15 +2476,15 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self._redirect_msg("Episode {} already in retry queue".format(ep))
             else:
-                self._redirect_msg("Error: Invalid index or episode")
+                self._redirect_msg("Error: entry not found or invalid episode")
 
         elif parsed.path == "/ep-remove":
-            idx = int(params.get("index", -1))
+            entry_url = params.get("key", "")
             ep = int(params.get("ep", -1))
             data = load_ani()
             anime_list = data.get("anime", [])
-            if 0 <= idx < len(anime_list) and ep > 0:
-                entry = anime_list[idx]
+            _, entry = find_entry_by_url(anime_list, entry_url)
+            if entry is not None and ep > 0:
                 missing = entry.get("missing", [])
                 if ep in missing:
                     missing.remove(ep)
@@ -2468,14 +2494,14 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self._redirect_msg("Episode {} not in retry queue".format(ep))
             else:
-                self._redirect_msg("Error: Invalid index or episode")
+                self._redirect_msg("Error: entry not found or invalid episode")
 
         elif parsed.path == "/tvdb-link":
-            idx = int(params.get("index", -1))
+            entry_url = params.get("key", "")
             data = load_ani()
             anime_list = data.get("anime", [])
-            if 0 <= idx < len(anime_list) and tvdb.available:
-                entry = anime_list[idx]
+            _, entry = find_entry_by_url(anime_list, entry_url)
+            if entry is not None and tvdb.available:
                 name = entry.get("name", "Unknown")
                 url = entry.get("url", "")
                 media_type = entry.get("media_type", "series")
@@ -2483,29 +2509,29 @@ class Handler(BaseHTTPRequestHandler):
                 results = tvdb.search(name, content_type=content_type)
                 search_html = render_tvdb_step(
                     name, url, "", "",
-                    search_results=results, edit_index=idx,
+                    search_results=results, edit_key=url,
                     media_type=media_type)
                 self._respond(200, render_page(search_html=search_html))
             else:
-                self._redirect_msg("Error: Invalid index or TVDB unavailable")
+                self._redirect_msg("Error: entry not found or TVDB unavailable")
 
         elif parsed.path == "/tvdb-save":
-            idx = int(params.get("index", -1))
+            entry_url = params.get("key", "")
             data = load_ani()
             anime_list = data.get("anime", [])
+            _, entry = find_entry_by_url(anime_list, entry_url)
 
             if "tvdb_skip" in params:
                 # Cancelling a TVDB edit makes no changes — say so, otherwise the
                 # bare redirect home looks like the click did nothing (UI-5).
-                if 0 <= idx < len(anime_list):
+                if entry is not None:
                     self._redirect_msg("Cancelled — {} unchanged".format(
-                        anime_list[idx].get("name", "?")))
+                        entry.get("name", "?")))
                 else:
                     self._redirect_msg("Cancelled")
                 return
 
-            if 0 <= idx < len(anime_list):
-                entry = anime_list[idx]
+            if entry is not None:
                 tvdb_id = params.get("tvdb_id", "")
                 tvdb_season = params.get("tvdb_season", "")
                 episode_offset = params.get("episode_offset", "")
@@ -2535,47 +2561,47 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect_msg("TVDB linked: {}{}".format(
                     entry.get("name", "?"), season_str))
             else:
-                self._redirect_msg("Error: Invalid index")
+                self._redirect_msg("Error: entry not found")
 
         elif parsed.path == "/tvdb-unlink":
-            idx = int(params.get("index", -1))
+            entry_url = params.get("key", "")
             data = load_ani()
             anime_list = data.get("anime", [])
-            if 0 <= idx < len(anime_list):
-                entry = anime_list[idx]
-                for key in ("tvdb_id", "tvdb_season", "episode_offset"):
-                    entry.pop(key, None)
+            _, entry = find_entry_by_url(anime_list, entry_url)
+            if entry is not None:
+                for field in ("tvdb_id", "tvdb_season", "episode_offset"):
+                    entry.pop(field, None)
                 save_ani(data)
                 self._redirect_msg("TVDB unlinked: {}".format(entry.get("name", "?")))
             else:
-                self._redirect_msg("Error: Invalid index")
+                self._redirect_msg("Error: entry not found")
 
         elif parsed.path == "/update-folder":
-            idx = int(params.get("index", -1))
+            entry_url = params.get("key", "")
             folder = params.get("folder", "").strip()
             data = load_ani()
             anime_list = data.get("anime", [])
-            if 0 <= idx < len(anime_list) and folder:
-                entry = anime_list[idx]
+            _, entry = find_entry_by_url(anime_list, entry_url)
+            if entry is not None and folder:
                 entry["customPackage"] = folder
                 save_ani(data)
                 self._redirect_msg("Folder updated: {} -> {}".format(
                     entry.get("name", "?"), folder))
             else:
-                self._redirect_msg("Error: Invalid index or empty folder")
+                self._redirect_msg("Error: entry not found or empty folder")
 
         elif parsed.path == "/mark-incomplete":
-            idx = int(params.get("index", -1))
+            entry_url = params.get("key", "")
             data = load_ani()
             anime_list = data.get("anime", [])
-            if 0 <= idx < len(anime_list):
-                entry = anime_list[idx]
-                for key in ("complete", "skip_until"):
-                    entry.pop(key, None)
+            _, entry = find_entry_by_url(anime_list, entry_url)
+            if entry is not None:
+                for field in ("complete", "skip_until"):
+                    entry.pop(field, None)
                 save_ani(data)
                 self._redirect_msg("Marked incomplete: {}".format(entry.get("name", "?")))
             else:
-                self._redirect_msg("Error: Invalid index")
+                self._redirect_msg("Error: entry not found")
 
         else:
             self._redirect("/")

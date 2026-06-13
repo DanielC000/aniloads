@@ -678,5 +678,83 @@ class ParseBotLogsStandaloneTest(unittest.TestCase):
         self.assertEqual(runs[1]["events"], [])
 
 
+class WatchlistMutationKeyByUrlTest(unittest.TestCase):
+    """UI-1: watchlist mutations must resolve their target by stable URL, not by
+    array index. The ``resolve_pending`` thread pops/appends entries concurrently,
+    so an index captured at page-render time can point at a *different* entry by
+    the time the form is submitted (TOCTOU) — a Remove could delete the wrong
+    anime. Keying off the unique URL removes the hazard."""
+
+    def setUp(self):
+        fd, self._path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self._orig_ani = app.ANI_JSON
+        app.ANI_JSON = self._path
+
+    def tearDown(self):
+        app.ANI_JSON = self._orig_ani
+        try:
+            os.remove(self._path)
+        except OSError:
+            pass
+
+    def _post(self, path, params):
+        captured = {}
+        handler = app.Handler.__new__(app.Handler)
+        handler.path = path
+        handler._read_post = lambda: params
+        handler._redirect_msg = lambda msg: captured.__setitem__("msg", msg)
+        handler._redirect = lambda url: captured.__setitem__("url", url)
+        handler._respond = lambda code, html: captured.__setitem__("html", html)
+        handler.do_POST()
+        return captured
+
+    def test_remove_hits_correct_entry_after_index_shift(self):
+        a = {"name": "A", "url": "http://x/a"}
+        b = {"name": "B", "url": "http://x/b"}
+        c = {"name": "C", "url": "http://x/c"}
+        # Page rendered while the list was [A, B, C]: B sat at array index 1.
+        app.save_ani({"anime": [a, b, c]})
+        b_key = b["url"]
+        # Then A resolves/leaves concurrently and the list shifts to [B, C].
+        # An old index-1 form would now wrongly target C.
+        app.save_ani({"anime": [b, c]})
+        result = self._post("/remove", {"key": b_key})
+        names = [e["name"] for e in app.load_ani()["anime"]]
+        # B is removed (correct) — NOT C (what index 1 would have hit).
+        self.assertEqual(names, ["C"])
+        self.assertIn("Removed: B", result["msg"])
+
+    def test_remove_pending_keyed_by_url(self):
+        p1 = {"name": "P1", "url": "http://x/p1", "status": "pending"}
+        p2 = {"name": "P2", "url": "http://x/p2", "status": "pending"}
+        app.save_ani({"pending": [p1, p2]})
+        self._post("/remove-pending", {"key": "http://x/p2"})
+        names = [e["name"] for e in app.load_ani()["pending"]]
+        self.assertEqual(names, ["P1"])
+
+    def test_ep_add_targets_entry_by_url(self):
+        a = {"name": "A", "url": "http://x/a", "episodes": 12, "missing": []}
+        b = {"name": "B", "url": "http://x/b", "episodes": 12, "missing": []}
+        app.save_ani({"anime": [a, b]})
+        self._post("/ep-add", {"key": "http://x/b", "ep": "5"})
+        by_name = {e["name"]: e for e in app.load_ani()["anime"]}
+        self.assertEqual(by_name["B"]["missing"], [5])
+        self.assertEqual(by_name["A"]["missing"], [])  # A untouched
+
+    def test_unknown_url_reports_not_found(self):
+        app.save_ani({"anime": [{"name": "A", "url": "http://x/a"}]})
+        result = self._post("/remove", {"key": "http://x/gone"})
+        self.assertEqual(len(app.load_ani()["anime"]), 1)  # nothing removed
+        self.assertTrue(result["msg"].startswith("Error"))
+
+    def test_find_entry_by_url_empty_key_does_not_match_urlless_entry(self):
+        entries = [{"name": "A", "url": ""}, {"name": "B", "url": "http://x/b"}]
+        # An empty/missing key must not silently match a URL-less entry.
+        self.assertEqual(app.find_entry_by_url(entries, ""), (-1, None))
+        self.assertEqual(app.find_entry_by_url(entries, "http://x/b"),
+                         (1, entries[1]))
+
+
 if __name__ == "__main__":
     unittest.main()

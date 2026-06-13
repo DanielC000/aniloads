@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 
 import support
 
@@ -315,6 +316,137 @@ class RenderWatchlistPendingTest(unittest.TestCase):
         out = app.render_watchlist([], [{"name": "Bar", "url": "http://y"}])
         self.assertIn("Resolving", out)
         self.assertNotIn("No release matches", out)
+
+
+def _iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class HumanizeEtaTest(unittest.TestCase):
+    """The run-state ETA helper must mirror the log-tail next-run wording."""
+
+    def _eta(self, future_seconds, delay=600):
+        now = datetime(2026, 6, 13, 19, 0, 0)
+        target = now + timedelta(seconds=future_seconds)
+        return app._humanize_eta(target, now, delay)
+
+    def test_future_minutes(self):
+        self.assertEqual(self._eta(300), "~5 min")
+
+    def test_under_one_minute(self):
+        self.assertEqual(self._eta(30), "<1 min")
+
+    def test_imminent_when_within_one_interval(self):
+        self.assertEqual(self._eta(-60, delay=600), "any moment")
+
+    def test_overdue_minutes(self):
+        self.assertEqual(self._eta(-3600, delay=600), "overdue ~60 min")
+
+    def test_overdue_hours(self):
+        self.assertEqual(self._eta(-3 * 3600, delay=600), "overdue ~3h")
+
+    def test_overdue_days(self):
+        self.assertEqual(self._eta(-2 * 86400, delay=600), "overdue ~2d")
+
+
+class FormatRunStateDisplayTest(unittest.TestCase):
+    def test_next_run_from_state(self):
+        # Anchor 5.5 min ahead so integer-minute flooring lands on "~5 min"
+        # regardless of the few ms of wall-clock drift before the helper reads now.
+        next_ts = _iso(datetime.utcnow() + timedelta(seconds=330))
+        out = app.format_next_run_display({"next_run_ts": next_ts, "timedelay": 600})
+        self.assertEqual(out, "~5 min")
+
+    def test_next_run_missing_ts_is_blank(self):
+        self.assertEqual(app.format_next_run_display({"timedelay": 600}), "")
+        self.assertEqual(app.format_next_run_display({"next_run_ts": ""}), "")
+
+    def test_last_run_time_and_summary(self):
+        out = app.format_last_run_display({
+            "finished_ts": "2026-06-13T19:20:05Z",
+            "counts": {"entries": 8, "checked": 5, "downloaded": 2},
+        })
+        self.assertIn("19:20:05", out)
+        self.assertIn("checked 5/8", out)
+        self.assertIn("2 downloaded", out)
+        self.assertIn("&mdash;", out)
+
+    def test_last_run_no_downloads_omits_downloaded(self):
+        out = app.format_last_run_display({
+            "finished_ts": "2026-06-13T19:20:05Z",
+            "counts": {"entries": 3, "checked": 0, "downloaded": 0},
+        })
+        self.assertIn("checked 0/3", out)
+        self.assertNotIn("downloaded", out)
+
+    def test_last_run_blank_when_unparseable(self):
+        self.assertEqual(app.format_last_run_display({"finished_ts": None, "counts": {}}), "")
+
+
+class GetActivityRunStateTest(unittest.TestCase):
+    """get_activity must prefer the persisted run-state over the log tail for
+    last_run/next_run, and survive a missing record."""
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self._orig = app.RUN_STATE_FILE
+        app.RUN_STATE_FILE = self.path
+
+    def tearDown(self):
+        app.RUN_STATE_FILE = self._orig
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
+    def _write_state(self, obj):
+        with open(self.path, "w") as f:
+            json.dump(obj, f)
+
+    def test_missing_record_returns_defaults(self):
+        os.remove(self.path)
+        self.assertEqual(app.load_run_state(), {})
+        act = app.get_activity()
+        # No run-state → no run-state display keys; log-tail fallback stands.
+        self.assertNotIn("last_run_display", act)
+        self.assertNotIn("run_state", act)
+
+    def test_corrupt_record_returns_defaults(self):
+        with open(self.path, "w") as f:
+            f.write("{nope")
+        self.assertEqual(app.load_run_state(), {})
+
+    def test_run_state_drives_last_and_next_run(self):
+        next_ts = _iso(datetime.utcnow() + timedelta(seconds=330))
+        self._write_state({
+            "schema": 1,
+            "last_run": {
+                "finished_ts": "2026-06-13T19:20:05Z",
+                "next_run_ts": next_ts,
+                "timedelay": 600,
+                "counts": {"entries": 8, "checked": 5, "downloaded": 2},
+            },
+            "runs": [],
+        })
+        act = app.get_activity()
+        self.assertIn("checked 5/8", act["last_run_display"])
+        self.assertEqual(act["next_run"], "~5 min")
+        self.assertIn("run_state", act)
+
+    def test_render_activity_uses_run_state_display(self):
+        act = {
+            "status": {"running": True},
+            "runs": [],
+            "last_run": None,
+            "last_run_display": "19:20:05 &mdash; checked 5/8",
+            "next_run": "~5 min",
+        }
+        _status, last_html, next_html = app.render_activity(act)
+        self.assertEqual(last_html, "19:20:05 &mdash; checked 5/8")
+        self.assertEqual(next_html, "~5 min")
+        # Must NOT fall through to the "No runs yet" log-tail empty state.
+        self.assertNotIn("No runs yet", last_html)
 
 
 if __name__ == "__main__":

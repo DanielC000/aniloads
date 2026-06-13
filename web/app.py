@@ -49,6 +49,7 @@ if _file_log_error:
 CONFIG_DIR = os.environ.get("CONFIG_DIR", "/config")
 ANI_JSON = os.path.join(CONFIG_DIR, "ani.json")
 PREFS_FILE = os.path.join(CONFIG_DIR, "web-prefs.json")
+RUN_STATE_FILE = os.path.join(CONFIG_DIR, "run_state.json")
 PORT = int(os.environ.get("PORT", "8080"))
 BOT_CONTAINER = os.environ.get("BOT_CONTAINER", "anime-loads")
 DOCKER_SOCK = "/var/run/docker.sock"
@@ -299,6 +300,95 @@ def parse_bot_logs(raw_lines):
     return runs
 
 
+def load_run_state():
+    """Read the bot's persisted run-state record (written each cycle by
+    bot/anibot.py next to ani.json). Returns {} when absent or unreadable, so
+    callers fall back to log-tail parsing.
+
+    This is the authoritative source for last_run / next_run timing — immune to
+    the 500-line log-tail rollover that drops the German run markers under
+    verbose logging and made the dashboard show "No runs yet" / "—" while the
+    bot was running."""
+    try:
+        with open(RUN_STATE_FILE, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _humanize_eta(next_time, now, delay):
+    """Render a next-run ETA string from a target datetime. Mirrors the wording
+    of the log-tail next-run math below (kept separate so that delicate,
+    TZ-correct block stays untouched). Both datetimes are UTC-naive; `delay` is
+    the sleep interval in seconds, used to tell "imminent" from "overdue"."""
+    if next_time > now:
+        diff = next_time - now
+        mins = int(diff.total_seconds() // 60)
+        return "~{} min".format(mins) if mins > 0 else "<1 min"
+    overdue = now - next_time
+    if overdue.total_seconds() <= delay:
+        return "any moment"
+    over_min = int(overdue.total_seconds() // 60)
+    if over_min >= 1440:
+        return "overdue ~{}d".format(over_min // 1440)
+    if over_min >= 120:
+        return "overdue ~{}h".format(over_min // 60)
+    return "overdue ~{} min".format(over_min)
+
+
+def _parse_state_ts(ts):
+    """Parse a run-state UTC timestamp ("YYYY-MM-DDTHH:MM:SSZ") to a naive
+    datetime, or None if missing/garbage."""
+    if not isinstance(ts, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts.rstrip("Z").split(".")[0])
+    except (ValueError, TypeError):
+        return None
+
+
+def format_next_run_display(state_last):
+    """Next-run ETA string from the persisted run-state record, or "" if it
+    cannot be derived."""
+    next_time = _parse_state_ts(state_last.get("next_run_ts"))
+    if next_time is None:
+        return ""
+    try:
+        delay = int(state_last.get("timedelay") or 0)
+    except (ValueError, TypeError):
+        delay = 0
+    return _humanize_eta(next_time, datetime.utcnow(), delay)
+
+
+def format_last_run_display(state_last):
+    """Last-run line from the persisted run-state record: the cycle's UTC finish
+    time plus a brief count summary (e.g. "19:20:05 &mdash; checked 5/8, 2
+    downloaded"). Returns "" when nothing renderable is present, so the caller
+    falls back to the log-tail display."""
+    fin = _parse_state_ts(state_last.get("finished_ts"))
+    hhmmss = fin.strftime("%H:%M:%S") if fin else ""
+
+    counts = state_last.get("counts") or {}
+    entries = counts.get("entries")
+    checked = counts.get("checked")
+    downloaded = counts.get("downloaded")
+    parts = []
+    if checked is not None and entries is not None:
+        parts.append("checked {}/{}".format(checked, entries))
+    elif checked is not None:
+        parts.append("checked {}".format(checked))
+    if downloaded:
+        parts.append("{} downloaded".format(downloaded))
+    summary = ", ".join(parts)
+
+    if hhmmss and summary:
+        return "{} &mdash; {}".format(hhmmss, escape(summary))
+    if hhmmss:
+        return hhmmss
+    return escape(summary) if summary else ""
+
+
 def get_activity():
     """Get current bot activity summary."""
     status = docker.get_status()
@@ -354,12 +444,30 @@ def get_activity():
                     except Exception:
                         pass
 
-    return {
+    result = {
         "status": status,
         "runs": runs,
         "last_run": last_run,
         "next_run": next_run_estimate,
     }
+
+    # The persisted run-state record (when present) is authoritative for
+    # last_run / next_run — it survives the log-tail rollover that the block
+    # above is vulnerable to. The log-parsed `runs` still drive the event feed
+    # below as a fallback. `run_state` is also surfaced so a sibling run-history
+    # UI can render one summary per run from it.
+    run_state = load_run_state()
+    state_last = run_state.get("last_run") if isinstance(run_state, dict) else None
+    if isinstance(state_last, dict):
+        last_run_display = format_last_run_display(state_last)
+        next_run_display = format_next_run_display(state_last)
+        if last_run_display:
+            result["last_run_display"] = last_run_display
+        if next_run_display:
+            result["next_run"] = next_run_display
+        result["run_state"] = run_state
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1240,8 +1348,13 @@ def render_activity(activity):
         dot_class, "Running" if bot_running else "Stopped"
     )
 
+    # Prefer the persisted run-state line (immune to log-tail rollover); fall
+    # back to the log-parsed last run, then to the empty/unavailable states.
+    last_run_display = activity.get("last_run_display")
     last_run = activity.get("last_run")
-    if last_run and last_run.get("time"):
+    if last_run_display:
+        last_text = last_run_display
+    elif last_run and last_run.get("time"):
         last_text = last_run["time"]
         if last_run.get("anime"):
             last_text += " &mdash; {}".format(escape(last_run["anime"]))

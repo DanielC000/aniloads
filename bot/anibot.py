@@ -125,6 +125,73 @@ def _boot_backoff(attempt, cap=300):
     Sequence: 5, 10, 20, 40, 80, 160, 300, 300, ... seconds (capped)."""
     return min(cap, 5 * (2 ** min(attempt, 6)))
 
+# Persisted run-state record. The dashboard derives last_run / next_run from
+# this file instead of scraping the rolling container-log tail (the German run
+# markers "Prüfe …"/"Schlafe N Sekunden" roll off the 500-line window under
+# verbose logging, which made the UI show "No runs yet" / "—" while the bot was
+# running fine). Written next to ani.json so the bot and the dashboard share one
+# config dir. The `runs` history is bounded and holds one summary per cycle, so
+# a future run-history UI can render one summary per run from it.
+RUN_STATE_FILE = "run_state.json"
+RUN_STATE_HISTORY_MAX = 50
+
+def _utcnow_iso():
+    """UTC timestamp as RFC3339-ish ISO8601 with a trailing Z. Matches the
+    dashboard's UTC clock (datetime.utcnow) so its next-run math stays correct."""
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _run_state_path():
+    """Path to run_state.json, alongside the watchlist (ani.json). Derived from
+    botfile so a --configfile override keeps the record next to the config."""
+    return os.path.join(os.path.dirname(botfile) or ".", RUN_STATE_FILE)
+
+def write_run_state(started_ts, finished_ts, timedelay, counts):
+    """Persist one per-cycle run-state record and append it to a bounded history.
+
+    Best-effort: a write failure must never break the bot loop, so all errors
+    are swallowed. Written atomically (tmp + os.replace) so the dashboard never
+    reads a half-written file. `counts` is a free-form dict (entries/checked/
+    downloaded today) — kept open so a future run-summary UI can grow it without
+    a schema bump."""
+    try:
+        next_run_ts = ""
+        if isinstance(timedelay, int) and timedelay > 0:
+            try:
+                fin = datetime.strptime(finished_ts, "%Y-%m-%dT%H:%M:%SZ")
+                next_run_ts = (fin + timedelta(seconds=timedelay)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except (ValueError, TypeError):
+                next_run_ts = ""
+        record = {
+            "started_ts": started_ts,
+            "finished_ts": finished_ts,
+            "timedelay": timedelay,
+            "next_run_ts": next_run_ts,
+            "counts": counts,
+        }
+        path = _run_state_path()
+        try:
+            with open(path, "r") as f:
+                prev = json.load(f)
+            runs = prev.get("runs")
+            if not isinstance(runs, list):
+                runs = []
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            runs = []
+        runs.append(record)
+        if len(runs) > RUN_STATE_HISTORY_MAX:
+            runs = runs[-RUN_STATE_HISTORY_MAX:]
+        state = {"schema": 1, "last_run": record, "runs": runs}
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        # Run-state bookkeeping is never allowed to take down the bot loop.
+        pass
+
 def loadconfig():
     try:
         os.makedirs(os.path.dirname(botfolder), exist_ok=True)
@@ -812,11 +879,15 @@ def startbot():
         jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport, al_user, al_pass = loadconfig()
 
     while(True):
+        # Per-cycle run-state bookkeeping (persisted for the dashboard's
+        # last_run/next_run, independent of the rolling log tail).
+        run_started = _utcnow_iso()
+        run_counts = {"entries": 0, "checked": 0, "downloaded": 0}
         os.makedirs(os.path.dirname(botfolder), exist_ok=True)
         f = open(botfile, "r")
         data = json.load(f)
         f.close()
-      
+
         anidata = ""
         try:
             anidata = data['anime']
@@ -829,6 +900,7 @@ def startbot():
             # dashboard are picked up without a manual container restart.
             recheck = timedelay if isinstance(timedelay, int) and timedelay > 0 else 600
             _log.info("Keine Anime in der Liste — erneute Pruefung in " + str(recheck) + " Sekunden")
+            write_run_state(run_started, _utcnow_iso(), recheck, run_counts)
             time.sleep(recheck)
             continue
 
@@ -840,6 +912,7 @@ def startbot():
             jfile.close()
 
         if(anidata != ""):
+            run_counts["entries"] = len(anidata)
             for idx, animeentry in enumerate(anidata):
                 name = animeentry['name']
                 url = animeentry['url']
@@ -979,6 +1052,7 @@ def startbot():
                     continue
 
                 now = datetime.now()
+                run_counts["checked"] += 1
                 _log.info("[" + now.strftime("%H:%M:%S") + "] Prüfe " + name + " auf updates")
                 # updateInfo already called by getAnime — skip redundant call
                 curEpisodes = release.getEpisodeCount()               #Anzahl der Episoden aktuell online
@@ -1059,6 +1133,7 @@ def startbot():
                                 wanted_episodes=set(all_wanted))
                             if batch_result["success"]:
                                 batch_sent = set(batch_result["episodes_sent"])
+                                run_counts["downloaded"] += len(batch_sent)
                                 log("[BATCH] " + str(len(batch_sent)) + " Episoden von " + name + " zu JDownloader hinzugefügt", pb)
                                 # Record actual available max from CNL data (authoritative; DOM may over-report)
                                 batch_max = batch_result.get("available_max")
@@ -1118,6 +1193,7 @@ def startbot():
                         printException(e)
                         dl_ret = False
                     if(dl_ret == True):
+                        run_counts["downloaded"] += 1
                         log("[DOWNLOAD] Episode " + str(ep) + " von " + name + " wurde zu JDownloader hinzugefügt", pb)
                         if is_missing:
                             if ep in missingEpisodes:
@@ -1169,6 +1245,7 @@ def startbot():
                     _log.info("[COMPLETE] " + name + " — anime-loads status: " + anime.status)
                     animeentry['complete'] = True
                     save_ani()
+            write_run_state(run_started, _utcnow_iso(), timedelay, run_counts)
             _log.info("Schlafe " + str(timedelay) + " Sekunden")
             time.sleep(timedelay)
 

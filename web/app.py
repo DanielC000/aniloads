@@ -1069,7 +1069,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     --text: #e4e7ee;
     --text-heading: #f3f5fa;
     --text-muted: #9aa3b2;
-    --text-faint: #717a8b;
+    --text-faint: #828ca0;  /* AA 4.5:1: 5.19 on surface, 5.67 on bg, 4.70 on surface-2 */
 
     /* one disciplined accent (muted indigo) — links / interactive only */
     --accent: #7985e0;
@@ -1086,7 +1086,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     --danger-btn: #b3433f;  --danger-btn-hover: #c24f4a;
     --success-btn: #3f7d4a; --success-btn-hover: #4a8c55;
-    --warning-btn: #b06438; --warning-btn-hover: #c0703f; /* desaturated caution tone */
+    --warning-btn: #a85d33; --warning-btn-hover: #ac5f35; /* desaturated caution tone — AA 4.5:1 white (4.91 base / 4.73 hover) */
 
     /* 4pt spacing scale */
     --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px; --s7: 48px;
@@ -1199,6 +1199,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .ep-panel[open] summary { margin-bottom: var(--s2); }
   .ep-row { display: flex; align-items: center; gap: var(--s2); padding: var(--s1) 0; border-bottom: 1px solid var(--border); }
   .ep-row:last-child { border-bottom: none; }
+  /* OK episodes collapse behind this toggle; rows are built on demand in JS */
+  .ep-ok-toggle { padding: var(--s1) 0; }
+  .ep-expand-btn { background: none; border: none; cursor: pointer; color: var(--accent); font-size: var(--fs-xs); font-family: inherit; padding: var(--s1) 0; }
+  .ep-expand-btn:hover { color: var(--accent-hover); }
+  .ep-ok-group { display: none; }
+  .ep-ok-group.ep-ok-open { display: block; }
   .ep-num { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: var(--fs-xs); min-width: 50px; color: var(--text-muted); }
   .ep-add-row { display: flex; gap: var(--s2); margin-top: var(--s2); padding-top: var(--s2); border-top: 1px solid var(--border); align-items: center; }
   .ep-add-row input[type=number] { width: 90px; padding: 6px 8px; border-radius: 4px; border: 1px solid var(--border-light); background: var(--surface-2); color: var(--text); font-size: var(--fs-xs); margin: 0; min-height: 32px; }
@@ -1385,6 +1391,35 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
   setInterval(refresh, 10000);
 })();
+
+// Build the OK-episode rows on demand the first time the toggle is opened, then
+// just show/hide them. Keeps long-series watchlist cards light on first paint.
+function expandEps(btn) {
+  var group = btn.parentNode.nextElementSibling;
+  if (!group) return;
+  if (!btn.dataset.built) {
+    var idx = btn.dataset.index, eps = parseInt(btn.dataset.eps, 10) || 0;
+    var miss = {};
+    try {
+      JSON.parse(btn.dataset.missing || '[]').forEach(function(e) { miss[e] = 1; });
+    } catch (e) {}
+    var rows = '';
+    for (var n = 1; n <= eps; n++) {
+      if (miss[n]) continue;
+      rows += '<div class="ep-row"><span class="ep-num">Ep ' + n + '</span> '
+            + '<span class="badge badge-ok">OK</span> '
+            + '<form method="POST" action="/ep-add" style="margin:0;">'
+            + '<input type="hidden" name="index" value="' + idx + '">'
+            + '<input type="hidden" name="ep" value="' + n + '">'
+            + '<button type="submit" class="btn btn-ghost btn-sm">Retry</button></form></div>';
+    }
+    group.innerHTML = rows;
+    btn.dataset.built = '1';
+  }
+  var open = group.classList.toggle('ep-ok-open');
+  var count = btn.dataset.count;
+  btn.textContent = (open ? 'Hide ' : 'Show ') + count + ' OK episode' + (count === '1' ? '' : 's');
+}
 </script>
 </body>
 </html>"""
@@ -1646,6 +1681,12 @@ def render_watchlist(anime_list, pending_list=None):
         if missing:
             missing_badge = ' <span class="badge badge-danger">{} retry</span>'.format(len(missing))
 
+        # Movie entries route to MOVIE_MEDIA_DIR, not AnimeName/SXX/ — a neutral
+        # badge makes that routing visible at a glance (UI-6).
+        type_badge = ""
+        if a.get("media_type") == "movie":
+            type_badge = ' <span class="badge badge-neutral">Movie</span>'
+
         # TVDB badges — neutral tone (informational, not state that needs the eye)
         tvdb_badges = ""
         if a.get("tvdb_id"):
@@ -1698,21 +1739,23 @@ def render_watchlist(anime_list, pending_list=None):
         missing_set = set(missing)
         retry_label = ", {} retrying".format(len(missing)) if missing else ""
 
+        # Retrying episodes are always rendered. OK episodes are collapsed
+        # behind an "expand" toggle and built on demand in JS, so a 1000+ episode
+        # series emits only its retrying rows up front instead of 1000+ DOM rows
+        # (UI-2). Nothing is lost: any OK episode can still be re-queued via the
+        # Add-to-retry box below.
         ep_rows = ""
+        ok_count = 0
         for ep_num in range(1, eps_count + 1):
             if ep_num in missing_set:
-                badge = '<span class="badge badge-retry">Retrying</span>'
                 action = ('<form method="POST" action="/ep-remove" style="margin:0;">'
                           '<input type="hidden" name="index" value="{}"><input type="hidden" name="ep" value="{}">'
                           '<button type="submit" class="btn btn-ghost btn-sm">Skip</button>'
                           '</form>').format(i, ep_num)
+                ep_rows += ('<div class="ep-row"><span class="ep-num">Ep {}</span> '
+                            '<span class="badge badge-retry">Retrying</span> {}</div>').format(ep_num, action)
             else:
-                badge = '<span class="badge badge-ok">OK</span>'
-                action = ('<form method="POST" action="/ep-add" style="margin:0;">'
-                          '<input type="hidden" name="index" value="{}"><input type="hidden" name="ep" value="{}">'
-                          '<button type="submit" class="btn btn-ghost btn-sm">Retry</button>'
-                          '</form>').format(i, ep_num)
-            ep_rows += '<div class="ep-row"><span class="ep-num">Ep {}</span> {} {}</div>'.format(ep_num, badge, action)
+                ok_count += 1
 
         # Show missing episodes beyond the current count (manually added)
         for ep_num in sorted(missing):
@@ -1725,6 +1768,18 @@ def render_watchlist(anime_list, pending_list=None):
                             '<button type="submit" class="btn btn-ghost btn-sm">Skip</button>'
                             '</form></div>').format(ep_num, i, ep_num)
 
+        ok_toggle = ""
+        if ok_count:
+            missing_in_range = json.dumps(sorted(m for m in missing_set if 1 <= m <= eps_count))
+            ok_toggle = (
+                '<div class="ep-ok-toggle">'
+                '<button type="button" class="ep-expand-btn" data-index="{i}" '
+                'data-eps="{eps}" data-count="{n}" data-missing=\'{miss}\' '
+                'onclick="expandEps(this)">Show {n} OK episode{s}</button>'
+                '</div><div class="ep-ok-group"></div>'
+            ).format(i=i, eps=eps_count, n=ok_count, miss=missing_in_range,
+                     s="" if ok_count == 1 else "s")
+
         ep_add_form = ('<div class="ep-add-row">'
                        '<form method="POST" action="/ep-add" style="margin:0;display:flex;gap:8px;align-items:center;">'
                        '<input type="hidden" name="index" value="{}">'
@@ -1733,7 +1788,7 @@ def render_watchlist(anime_list, pending_list=None):
                        '</form></div>').format(i)
 
         ep_panel = ('<details class="ep-panel"><summary>Episodes ({} total{})</summary>'
-                    '{}{}</details>').format(eps_count, retry_label, ep_rows, ep_add_form)
+                    '{}{}{}</details>').format(eps_count, retry_label, ep_rows, ok_toggle, ep_add_form)
 
         html += """
         <div class="card">
@@ -1742,7 +1797,7 @@ def render_watchlist(anime_list, pending_list=None):
               <div class="anime-name">{name}</div>
               {url_html}
               <div class="anime-meta">
-                <span class="badge badge-ep">{eps} eps</span>{missing_badge}
+                <span class="badge badge-ep">{eps} eps</span>{type_badge}{missing_badge}
                 {pref_badges}{tvdb_badges}{status_badges}
               </div>
               {folder_html}
@@ -1755,7 +1810,7 @@ def render_watchlist(anime_list, pending_list=None):
           {ep_panel}
         </div>""".format(
             name=escape(name), url_html=url_html, eps=escape(str(eps)),
-            missing_badge=missing_badge, pref_badges=pref_badges,
+            type_badge=type_badge, missing_badge=missing_badge, pref_badges=pref_badges,
             tvdb_badges=tvdb_badges, status_badges=status_badges,
             folder_html=folder_html, idx=i, ep_panel=ep_panel,
             remove_confirm=remove_confirm,
@@ -2317,6 +2372,17 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
+            # Editing an existing entry has no release_id, so fall back to the
+            # entry's stored episode count — otherwise the "Likely match" season
+            # suggestion never appears on the Link-TVDB-from-watchlist path (UI-3).
+            if not ep_count and edit_idx is not None:
+                try:
+                    watchlist = load_ani().get("anime", [])
+                    if 0 <= edit_idx < len(watchlist):
+                        ep_count = int(watchlist[edit_idx].get("episodes", 0) or 0)
+                except (ValueError, TypeError):
+                    pass
+
             search_html = render_tvdb_step(
                 name, url, release_id, custom_folder,
                 search_results=results, seasons=seasons,
@@ -2429,7 +2495,13 @@ class Handler(BaseHTTPRequestHandler):
             anime_list = data.get("anime", [])
 
             if "tvdb_skip" in params:
-                self._redirect("/")
+                # Cancelling a TVDB edit makes no changes — say so, otherwise the
+                # bare redirect home looks like the click did nothing (UI-5).
+                if 0 <= idx < len(anime_list):
+                    self._redirect_msg("Cancelled — {} unchanged".format(
+                        anime_list[idx].get("name", "?")))
+                else:
+                    self._redirect_msg("Cancelled")
                 return
 
             if 0 <= idx < len(anime_list):

@@ -320,6 +320,38 @@ class RenderWatchlistPendingTest(unittest.TestCase):
         self.assertNotIn("No release matches", out)
 
 
+class RenderWatchlistMovieBadgeTest(unittest.TestCase):
+    """Movie entries get a neutral 'Movie' badge so routing is visible (UI-6)."""
+
+    def test_movie_entry_shows_badge(self):
+        out = app.render_watchlist([{"name": "Akira", "media_type": "movie", "episodes": 1}])
+        self.assertIn(">Movie</span>", out)
+
+    def test_series_entry_has_no_movie_badge(self):
+        out = app.render_watchlist([{"name": "Bleach", "media_type": "series", "episodes": 12}])
+        self.assertNotIn(">Movie</span>", out)
+
+
+class RenderWatchlistEpisodeCollapseTest(unittest.TestCase):
+    """OK episodes collapse behind a toggle; retrying rows render up front (UI-2)."""
+
+    def test_long_series_does_not_emit_all_ok_rows(self):
+        out = app.render_watchlist([{"name": "Long", "episodes": 500, "missing": [7]}])
+        # The lazy toggle reports the OK count instead of rendering 499 rows.
+        self.assertIn("Show 499 OK episodes", out)
+        self.assertIn("expandEps", out)
+        # The OK rows are NOT in the server-rendered HTML (built in JS on demand).
+        self.assertNotIn("Ep 250", out)
+        # Retrying episodes are always rendered up front.
+        self.assertIn("Ep 7", out)
+        self.assertIn("badge-retry", out)
+
+    def test_all_ok_series_has_no_retry_rows_but_has_toggle(self):
+        out = app.render_watchlist([{"name": "Clean", "episodes": 3, "missing": []}])
+        self.assertIn("Show 3 OK episodes", out)
+        self.assertNotIn("badge-retry", out)
+
+
 def _iso(dt):
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 

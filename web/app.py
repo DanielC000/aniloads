@@ -389,6 +389,57 @@ def format_last_run_display(state_last):
     return escape(summary) if summary else ""
 
 
+def build_run_summary(record):
+    """Build one concise summary line for a single persisted run-state record.
+
+    Sourced from the run-state counts (log-independent, like the rest of the
+    run_state design) rather than the rolling log tail, so the run-history feed
+    shows exactly one calm line per cycle instead of every parsed log event.
+
+    Returns plain text like "19:40 — checked 12/12 · 2 downloaded · 1 error".
+    Zero-noise segments (no downloads, no errors) are omitted, but downloads and
+    errors are always surfaced when present. A cycle that did nothing renders as
+    just its time. Returns "" when nothing is renderable (garbage record / no
+    time and no counts) so the caller can skip it."""
+    if not isinstance(record, dict):
+        return ""
+    fin = _parse_state_ts(record.get("finished_ts"))
+    hhmm = fin.strftime("%H:%M") if fin else ""
+
+    counts = record.get("counts") or {}
+    entries = counts.get("entries")
+    checked = counts.get("checked")
+    downloaded = counts.get("downloaded")
+    errors = counts.get("errors")
+
+    parts = []
+    if entries:
+        parts.append("checked {}/{}".format(checked or 0, entries))
+    elif checked:
+        parts.append("checked {}".format(checked))
+    if downloaded:
+        parts.append("{} downloaded".format(downloaded))
+    if errors:
+        parts.append("{} {}".format(errors, "error" if errors == 1 else "errors"))
+
+    body = " · ".join(parts)
+    if hhmm and body:
+        return "{} — {}".format(hhmm, body)
+    return hhmm or body
+
+
+def _run_summary_tone(record):
+    """Pick the feed tone for a run summary: errors dominate (danger), then
+    downloads (ok), else routine (muted) — so a noisy run stands out and a quiet
+    cycle stays dim."""
+    counts = record.get("counts") or {} if isinstance(record, dict) else {}
+    if counts.get("errors"):
+        return "danger"
+    if counts.get("downloaded"):
+        return "ok"
+    return "muted"
+
+
 def get_activity():
     """Get current bot activity summary."""
     status = docker.get_status()
@@ -1396,8 +1447,36 @@ def render_event(etype, msg):
         tone=tone, label=label, msg=escape(msg))
 
 
-def render_run_history(runs, max_runs=20):
-    """Render the run history feed."""
+def render_run_state_history(state_runs, max_runs=20):
+    """Render the run-history feed as ONE concise summary line per cycle, sourced
+    from the bot's persisted run-state records. Newest first. Routine cycles
+    render as a single calm muted line; downloads and errors are surfaced and
+    tone-highlighted. Returns "" when nothing is renderable, so the caller can
+    fall back to the log-parsed event feed."""
+    display = list(reversed(state_runs))[:max_runs]
+    html = ""
+    for record in display:
+        summary = build_run_summary(record)
+        if not summary:
+            continue
+        html += ('<div class="run-entry"><div class="event event--{tone}">'
+                 '<span class="event-msg">{msg}</span></div></div>').format(
+            tone=_run_summary_tone(record), msg=escape(summary))
+    return html
+
+
+def render_run_history(runs, state_runs=None, max_runs=20):
+    """Render the run history feed.
+
+    Prefers the bot's persisted run-state records (`state_runs`) — one concise
+    summary line per cycle, independent of the rolling log tail. Falls back to
+    the log-parsed event feed (`runs`) when no run-state records exist, so the
+    no-record case (older bot, fresh deploy) does not regress."""
+    if state_runs:
+        state_html = render_run_state_history(state_runs, max_runs=max_runs)
+        if state_html:
+            return state_html
+
     if not runs:
         if not docker.available:
             return '<div class="empty">Docker socket not mounted — cannot read bot logs</div>'
@@ -1906,7 +1985,8 @@ def render_page(status="", search_html="", prefs_open=False):
 
     activity = get_activity()
     bot_status_html, last_run_html, next_run_html = render_activity(activity)
-    history_html = render_run_history(activity["runs"])
+    history_html = render_run_history(
+        activity["runs"], activity.get("run_state", {}).get("runs"))
 
     move_status_html, move_last_html = render_move_status()
     move_history_html = render_move_history()
@@ -1986,7 +2066,8 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/status":
             activity = get_activity()
             bot_status_html, last_run_html, next_run_html = render_activity(activity)
-            history_html = render_run_history(activity["runs"])
+            history_html = render_run_history(
+                activity["runs"], activity.get("run_state", {}).get("runs"))
             move_status_html, move_last_html = render_move_status()
             move_history_html = render_move_history()
             payload = json.dumps({

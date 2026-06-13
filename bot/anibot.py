@@ -882,7 +882,7 @@ def startbot():
         # Per-cycle run-state bookkeeping (persisted for the dashboard's
         # last_run/next_run, independent of the rolling log tail).
         run_started = _utcnow_iso()
-        run_counts = {"entries": 0, "checked": 0, "downloaded": 0}
+        run_counts = {"entries": 0, "checked": 0, "downloaded": 0, "errors": 0}
         os.makedirs(os.path.dirname(botfolder), exist_ok=True)
         f = open(botfile, "r")
         data = json.load(f)
@@ -1120,6 +1120,7 @@ def startbot():
                 if len(all_wanted) > 1:
                     # Multi-episode: CNL only, no per-episode fallback
                     if not al.username or al.username == "anonymous":
+                        run_counts["errors"] += 1
                         log("[ERROR] " + name + ": Login erforderlich für Batch-CNL (" + str(len(all_wanted)) + " Episoden) — überspringe", pb)
                     else:
                         try:
@@ -1161,6 +1162,7 @@ def startbot():
                                                  batch_result["episodes_not_found"])
                             else:
                                 reason = batch_result.get("reason", "unbekannt")
+                                run_counts["errors"] += 1
                                 log("[ERROR] Batch-CNL fehlgeschlagen für " + name + ": " + reason + " — überspringe", pb)
                                 # CNL response may carry available_max even on failure (e.g. wanted eps
                                 # weren't in the grouped result). Persist it so the cap is fresh and
@@ -1172,6 +1174,7 @@ def startbot():
                                     save_ani()
                         except Exception as e:
                             printException(e)
+                            run_counts["errors"] += 1
                             log("[ERROR] Batch-CNL fehlgeschlagen für " + name + ": " + str(e) + " — überspringe", pb)
 
                 elif len(all_wanted) == 1:
@@ -1221,8 +1224,10 @@ def startbot():
                             animeentry['episodes'] = new_max
                         save_ani()
                     elif isinstance(dl_ret, Exception):
+                        run_counts["errors"] += 1
                         log("[ERROR] Episode " + str(ep) + " von " + name + ": " + str(dl_ret), pb)
                     else:
+                        run_counts["errors"] += 1
                         log("[ERROR] Episode " + str(ep) + " von " + name + ": JDownloader nicht erreichbar?", pb)
                         # Transient failure: don't mutate state — next run will retry naturally
 

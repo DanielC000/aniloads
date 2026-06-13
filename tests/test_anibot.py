@@ -102,6 +102,15 @@ class WriteRunStateTest(unittest.TestCase):
         self.assertEqual(state["runs"][-1]["counts"]["checked"],
                          anibot.RUN_STATE_HISTORY_MAX + 9)
 
+    def test_counts_carry_errors_free_form(self):
+        # The per-cycle errors tally rides along in the free-form counts dict
+        # (no schema bump) so the dashboard can surface "N errors" per run.
+        anibot.write_run_state(
+            "2026-06-13T19:18:00Z", "2026-06-13T19:20:00Z", 600,
+            {"entries": 8, "checked": 5, "downloaded": 2, "errors": 1},
+        )
+        self.assertEqual(self._read()["last_run"]["counts"]["errors"], 1)
+
     def test_no_next_run_ts_when_timedelay_invalid(self):
         anibot.write_run_state("2026-06-13T19:00:00Z", "2026-06-13T19:01:00Z", 0, {})
         self.assertEqual(self._read()["last_run"]["next_run_ts"], "")

@@ -449,5 +449,87 @@ class GetActivityRunStateTest(unittest.TestCase):
         self.assertNotIn("No runs yet", last_html)
 
 
+class BuildRunSummaryTest(unittest.TestCase):
+    """One concise summary line per cycle, sourced from run-state counts."""
+
+    def _rec(self, **counts):
+        return {"finished_ts": "2026-06-13T19:40:00Z", "counts": counts}
+
+    def test_full_line_with_downloads_and_errors(self):
+        out = app.build_run_summary(self._rec(entries=12, checked=12, downloaded=2, errors=1))
+        self.assertEqual(out, "19:40 — checked 12/12 · 2 downloaded · 1 error")
+
+    def test_errors_pluralize(self):
+        out = app.build_run_summary(self._rec(entries=5, checked=5, errors=3))
+        self.assertIn("3 errors", out)
+
+    def test_zero_noise_segments_omitted(self):
+        # No downloads, no errors → just time + checked, nothing else.
+        out = app.build_run_summary(self._rec(entries=12, checked=12, downloaded=0, errors=0))
+        self.assertEqual(out, "19:40 — checked 12/12")
+        self.assertNotIn("downloaded", out)
+        self.assertNotIn("error", out)
+
+    def test_downloads_always_surface(self):
+        out = app.build_run_summary(self._rec(entries=4, checked=4, downloaded=1))
+        self.assertIn("1 downloaded", out)
+
+    def test_idle_cycle_is_just_time(self):
+        # A cycle with nothing checked (all skipped / no entries) → just the time.
+        self.assertEqual(app.build_run_summary(self._rec()), "19:40")
+        self.assertEqual(app.build_run_summary(self._rec(entries=0, checked=0)), "19:40")
+
+    def test_checked_without_entries(self):
+        out = app.build_run_summary(self._rec(checked=3))
+        self.assertEqual(out, "19:40 — checked 3")
+
+    def test_garbage_record_is_blank(self):
+        self.assertEqual(app.build_run_summary(None), "")
+        self.assertEqual(app.build_run_summary({"finished_ts": None, "counts": {}}), "")
+
+
+class RunSummaryToneTest(unittest.TestCase):
+    def test_errors_dominate(self):
+        self.assertEqual(app._run_summary_tone({"counts": {"downloaded": 2, "errors": 1}}), "danger")
+
+    def test_downloads_are_ok(self):
+        self.assertEqual(app._run_summary_tone({"counts": {"downloaded": 2}}), "ok")
+
+    def test_routine_is_muted(self):
+        self.assertEqual(app._run_summary_tone({"counts": {"checked": 5}}), "muted")
+        self.assertEqual(app._run_summary_tone({}), "muted")
+
+
+class RenderRunHistoryTest(unittest.TestCase):
+    """The feed prefers run-state summaries (one line per run, newest first) and
+    falls back to the log-parsed event feed when no records exist."""
+
+    def test_prefers_state_runs_one_line_each_newest_first(self):
+        state_runs = [
+            {"finished_ts": "2026-06-13T19:30:00Z", "counts": {"entries": 12, "checked": 12, "downloaded": 0, "errors": 0}},
+            {"finished_ts": "2026-06-13T19:40:00Z", "counts": {"entries": 12, "checked": 12, "downloaded": 2, "errors": 1}},
+        ]
+        # A log-parsed run that must NOT appear when state runs are present.
+        log_runs = [{"time": "19:40", "anime": "FromLog", "events": [{"type": "download", "msg": "x"}]}]
+        html = app.render_run_history(log_runs, state_runs)
+        self.assertIn("checked 12/12 · 2 downloaded · 1 error", html)
+        self.assertNotIn("FromLog", html)
+        # Newest (19:40) rendered before older (19:30).
+        self.assertLess(html.index("19:40"), html.index("19:30"))
+        # The noisy run carries the danger tone.
+        self.assertIn("event--danger", html)
+
+    def test_falls_back_to_log_feed_when_no_state_runs(self):
+        log_runs = [{"time": "19:40", "anime": "FromLog", "events": [{"type": "download", "msg": "x"}]}]
+        html = app.render_run_history(log_runs, None)
+        self.assertIn("FromLog", html)
+
+    def test_falls_back_when_state_runs_all_blank(self):
+        # Records that render to nothing must not swallow the log fallback.
+        log_runs = [{"time": "19:40", "anime": "FromLog", "events": [{"type": "download", "msg": "x"}]}]
+        html = app.render_run_history(log_runs, [{"finished_ts": None, "counts": {}}])
+        self.assertIn("FromLog", html)
+
+
 if __name__ == "__main__":
     unittest.main()

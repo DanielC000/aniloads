@@ -16,7 +16,7 @@ import struct
 import sys
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from html import escape
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote, urlencode
@@ -219,6 +219,39 @@ def parse_bot_logs(raw_lines):
             }
             continue
 
+        # Standalone events ([SKIP]/[COMPLETE]/[THROTTLE]) can appear between
+        # cycles with no active run. Handle them before the no-run guard below so
+        # they always create their own entry — these never attach to current_run,
+        # so hoisting them keeps active-run behavior identical while no longer
+        # dropping them when current_run is None.
+        if content.startswith("[SKIP]"):
+            skip_msg = content[len("[SKIP]"):].strip()
+            runs.append({
+                "time": "",
+                "docker_ts": docker_ts,
+                "anime": "",
+                "events": [{"type": "skip", "msg": skip_msg}],
+            })
+            continue
+        elif content.startswith("[COMPLETE]"):
+            complete_msg = content[len("[COMPLETE]"):].strip()
+            runs.append({
+                "time": "",
+                "docker_ts": docker_ts,
+                "anime": "",
+                "events": [{"type": "complete", "msg": complete_msg}],
+            })
+            continue
+        elif content.startswith("[THROTTLE]"):
+            throttle_msg = content[len("[THROTTLE]"):].strip()
+            runs.append({
+                "time": "",
+                "docker_ts": docker_ts,
+                "anime": "",
+                "events": [{"type": "throttle", "msg": throttle_msg}],
+            })
+            continue
+
         if not current_run:
             # Check for "Erfolgreich eingeloggt" or startup messages
             if "eingeloggt" in content.lower() or "Erfolgreich" in content:
@@ -238,35 +271,6 @@ def parse_bot_logs(raw_lines):
             etype, msg = "error", content[len("[ERROR]"):].strip()
         elif content.startswith("[BATCH]"):
             etype, msg = "batch", content[len("[BATCH]"):].strip()
-        elif content.startswith("[SKIP]"):
-            # SKIP lines appear before a run starts (no Prüfe), create a standalone entry
-            skip_msg = content[len("[SKIP]"):].strip()
-            runs.append({
-                "time": "",
-                "docker_ts": docker_ts,
-                "anime": "",
-                "events": [{"type": "skip", "msg": skip_msg}],
-            })
-            continue
-        elif content.startswith("[COMPLETE]"):
-            # COMPLETE lines appear before a run starts, like SKIP
-            complete_msg = content[len("[COMPLETE]"):].strip()
-            runs.append({
-                "time": "",
-                "docker_ts": docker_ts,
-                "anime": "",
-                "events": [{"type": "complete", "msg": complete_msg}],
-            })
-            continue
-        elif content.startswith("[THROTTLE]"):
-            throttle_msg = content[len("[THROTTLE]"):].strip()
-            runs.append({
-                "time": "",
-                "docker_ts": docker_ts,
-                "anime": "",
-                "events": [{"type": "throttle", "msg": throttle_msg}],
-            })
-            continue
         elif content.startswith("[INFO]"):
             etype, msg = "info", content[len("[INFO]"):].strip()
         elif content.startswith("Schlafe"):
@@ -358,7 +362,7 @@ def format_next_run_display(state_last):
         delay = int(state_last.get("timedelay") or 0)
     except (ValueError, TypeError):
         delay = 0
-    return _humanize_eta(next_time, datetime.utcnow(), delay)
+    return _humanize_eta(next_time, datetime.now(timezone.utc).replace(tzinfo=None), delay)
 
 
 def format_last_run_display(state_last):
@@ -472,7 +476,7 @@ def get_activity():
                         ts = ts_src.rstrip("Z").split(".")[0]
                         last_time = datetime.fromisoformat(ts)
                         next_time = last_time + timedelta(seconds=delay)
-                        now = datetime.utcnow()
+                        now = datetime.now(timezone.utc).replace(tzinfo=None)
                         if next_time > now:
                             diff = next_time - now
                             mins = int(diff.total_seconds() // 60)
@@ -2596,11 +2600,11 @@ def move_completed_worker():
             _move_running = True
             events = run_move_cycle()
             with _move_lock:
-                ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+                ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
                 for ev in events:
                     ev["time"] = ts
                     _move_history.append(ev)
-                _move_last_run = datetime.utcnow()
+                _move_last_run = datetime.now(timezone.utc)
             _move_running = False
 
             if events:

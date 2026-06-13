@@ -609,5 +609,42 @@ class RedirectMsgEncodingTest(unittest.TestCase):
         self.assertTrue(qs["msg"][0].startswith("Error"))
 
 
+class ParseBotLogsStandaloneTest(unittest.TestCase):
+    """Standalone [SKIP]/[THROTTLE]/[COMPLETE] lines arriving with no active run
+    (between cycles) must still produce their own entry. Previously the
+    `if not current_run: continue` guard short-circuited before the standalone
+    handlers, so these were silently dropped whenever no run was in progress."""
+
+    def test_skip_without_active_run_creates_entry(self):
+        runs = app.parse_bot_logs(["[SKIP] Naruto already up to date"])
+        self.assertEqual(len(runs), 1)
+        ev = runs[0]["events"][0]
+        self.assertEqual(ev["type"], "skip")
+        self.assertEqual(ev["msg"], "Naruto already up to date")
+
+    def test_throttle_without_active_run_creates_entry(self):
+        runs = app.parse_bot_logs(["[THROTTLE] Rate limited, backing off"])
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["events"][0]["type"], "throttle")
+
+    def test_complete_without_active_run_creates_entry(self):
+        runs = app.parse_bot_logs(["[COMPLETE] All caught up"])
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["events"][0]["type"], "complete")
+
+    def test_standalone_event_during_active_run_stays_separate(self):
+        # A [SKIP] mid-run gets its own entry and does NOT attach to the active
+        # run — unchanged from the original behavior.
+        runs = app.parse_bot_logs([
+            "[12:00:00] Prüfe Naruto auf updates",
+            "[SKIP] Bleach already up to date",
+        ])
+        self.assertEqual(len(runs), 2)
+        # Standalone skip entry is appended first; the active run flushes at end.
+        self.assertEqual(runs[0]["events"][0]["type"], "skip")
+        self.assertEqual(runs[1]["anime"], "Naruto")
+        self.assertEqual(runs[1]["events"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,10 +3,12 @@
 import html
 import json
 import os
+import shutil
 import tempfile
+import time
 import unittest
-from datetime import datetime, timedelta
-from urllib.parse import urlparse, parse_qs
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse, parse_qs, quote
 
 import support
 
@@ -387,7 +389,7 @@ class FormatRunStateDisplayTest(unittest.TestCase):
     def test_next_run_from_state(self):
         # Anchor 5.5 min ahead so integer-minute flooring lands on "~5 min"
         # regardless of the few ms of wall-clock drift before the helper reads now.
-        next_ts = _iso(datetime.utcnow() + timedelta(seconds=330))
+        next_ts = _iso(datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=330))
         out = app.format_next_run_display({"next_run_ts": next_ts, "timedelay": 600})
         self.assertEqual(out, "~5 min")
 
@@ -452,7 +454,7 @@ class GetActivityRunStateTest(unittest.TestCase):
         self.assertEqual(app.load_run_state(), {})
 
     def test_run_state_drives_last_and_next_run(self):
-        next_ts = _iso(datetime.utcnow() + timedelta(seconds=330))
+        next_ts = _iso(datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=330))
         self._write_state({
             "schema": 1,
             "last_run": {
@@ -754,6 +756,548 @@ class WatchlistMutationKeyByUrlTest(unittest.TestCase):
         self.assertEqual(app.find_entry_by_url(entries, ""), (-1, None))
         self.assertEqual(app.find_entry_by_url(entries, "http://x/b"),
                          (1, entries[1]))
+
+
+class ParseBotLogsBranchesTest(unittest.TestCase):
+    """Coverage for parse_bot_logs branches beyond the BUG-3 standalone cases:
+    docker-ts stripping, in-run event classification, the glued anime-name-prefix
+    strip, sleep-flush, login info between runs, and raw-line skipping."""
+
+    def test_strips_docker_timestamp_prefix(self):
+        runs = app.parse_bot_logs([
+            "2026-06-13T19:00:00.123456789Z [12:00:00] Prüfe Naruto auf updates",
+        ])
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["anime"], "Naruto")
+        self.assertEqual(runs[0]["time"], "12:00:00")
+        self.assertTrue(runs[0]["docker_ts"].startswith("2026-06-13T19:00:00"))
+
+    def test_in_run_events_are_classified(self):
+        runs = app.parse_bot_logs([
+            "[12:00:00] Prüfe Naruto auf updates",
+            "[DOWNLOAD] Episode 5 grabbed",
+            "[BATCH] queued 3",
+            "[INFO] note",
+            "[ERROR] boom",
+        ])
+        self.assertEqual(len(runs), 1)
+        types = [e["type"] for e in runs[0]["events"]]
+        self.assertEqual(types, ["download", "batch", "info", "error"])
+        self.assertEqual(runs[0]["events"][0]["msg"], "Episode 5 grabbed")
+
+    def test_glued_anime_name_prefix_is_stripped_and_capitalized(self):
+        # The bot sometimes glues the anime name to the status text. The name
+        # prefix is stripped and the remainder re-capitalized.
+        runs = app.parse_bot_logs([
+            "[12:00:00] Prüfe Dorohedoro: Staffel 2 auf updates",
+            "[INFO] Dorohedoro: Staffel 2 hat fehlende Episoden",
+        ])
+        self.assertEqual(runs[0]["events"][0]["msg"], "Hat fehlende Episoden")
+
+    def test_prefix_strip_leaving_empty_msg_is_safe(self):
+        # msg identical to the anime name → stripped to empty, no capitalize crash.
+        runs = app.parse_bot_logs([
+            "[12:00:00] Prüfe Naruto auf updates",
+            "[INFO] Naruto",
+        ])
+        self.assertEqual(runs[0]["events"][0]["msg"], "")
+
+    def test_sleep_line_flushes_run_and_records_sleep_event(self):
+        runs = app.parse_bot_logs([
+            "2026-06-13T19:00:00Z [12:00:00] Prüfe Naruto auf updates",
+            "2026-06-13T19:00:05Z Schlafe 600 Sekunden",
+        ])
+        self.assertEqual(len(runs), 1)
+        ev = runs[0]["events"][-1]
+        self.assertEqual(ev["type"], "sleep")
+        self.assertEqual(ev["docker_ts"], "2026-06-13T19:00:05Z")
+
+    def test_login_info_between_runs_creates_entry(self):
+        runs = app.parse_bot_logs(["Erfolgreich eingeloggt als user"])
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["events"][0]["type"], "info")
+
+    def test_raw_lines_without_marker_are_skipped(self):
+        runs = app.parse_bot_logs([
+            "[12:00:00] Prüfe Naruto auf updates",
+            "some raw api dump {json: true}",
+        ])
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["events"], [])
+
+    def test_new_run_flushes_previous(self):
+        runs = app.parse_bot_logs([
+            "[12:00:00] Prüfe A auf updates",
+            "[12:01:00] Prüfe B auf updates",
+        ])
+        self.assertEqual([r["anime"] for r in runs], ["A", "B"])
+
+
+class GetActivityNextRunOverdueTest(unittest.TestCase):
+    """get_activity's log-tail next-run math (the fallback used when no run-state
+    record exists): future estimate plus the imminent/overdue branches. The
+    docker status/logs are stubbed and run-state is pointed at a missing file so
+    the log-tail path is exercised end-to-end."""
+
+    def setUp(self):
+        self._orig_status = app.docker.get_status
+        self._orig_logs = app.docker.get_logs
+        app.docker.get_status = lambda *a, **k: {"running": True}
+        self._orig_rs = app.RUN_STATE_FILE
+        app.RUN_STATE_FILE = os.path.join(tempfile.gettempdir(), "aniloads-no-run-state.json")
+        try:
+            os.remove(app.RUN_STATE_FILE)
+        except OSError:
+            pass
+
+    def tearDown(self):
+        app.docker.get_status = self._orig_status
+        app.docker.get_logs = self._orig_logs
+        app.RUN_STATE_FILE = self._orig_rs
+
+    def _next_run(self, ago_seconds, delay=600):
+        """Drive get_activity with a synthetic sleep line whose next-run lands
+        `ago_seconds` in the past (negative = future)."""
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        last_time = now - timedelta(seconds=ago_seconds) - timedelta(seconds=delay)
+        ts = last_time.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+        app.docker.get_logs = lambda *a, **k: [
+            "{} [12:00:00] Prüfe Naruto auf updates".format(ts),
+            "{} Schlafe {} Sekunden".format(ts, delay),
+        ]
+        return app.get_activity()["next_run"]
+
+    def test_future_estimate(self):
+        self.assertEqual(self._next_run(-330), "~5 min")
+
+    def test_under_one_minute(self):
+        self.assertEqual(self._next_run(-30), "<1 min")
+
+    def test_any_moment_within_one_interval(self):
+        self.assertEqual(self._next_run(300, delay=600), "any moment")
+
+    def test_overdue_minutes(self):
+        self.assertEqual(self._next_run(3600, delay=600), "overdue ~60 min")
+
+    def test_overdue_hours(self):
+        self.assertEqual(self._next_run(3 * 3600, delay=600), "overdue ~3h")
+
+    def test_overdue_days(self):
+        self.assertEqual(self._next_run(2 * 86400, delay=600), "overdue ~2d")
+
+    def test_no_sleep_line_leaves_estimate_blank(self):
+        app.docker.get_logs = lambda *a, **k: ["[12:00:00] Prüfe Naruto auf updates"]
+        self.assertEqual(app.get_activity()["next_run"], "")
+
+
+class RenderRunHistoryLogFeedTest(unittest.TestCase):
+    """The log-parsed fallback feed (no run-state records): [COMPLETE]
+    suppression, empty-run skipping, and headerless standalone lines. Also the
+    state-feed one-line-per-run shape."""
+
+    def test_complete_events_suppressed_in_log_feed(self):
+        runs = [{"time": "19:40", "anime": "Naruto", "events": [
+            {"type": "download", "msg": "ep5"},
+            {"type": "complete", "msg": "all caught up"},
+        ]}]
+        html_out = app.render_run_history(runs, None)
+        self.assertIn("ep5", html_out)
+        self.assertNotIn("all caught up", html_out)
+        self.assertNotIn("Complete", html_out)
+
+    def test_run_reduced_to_only_complete_is_dropped(self):
+        # A headerless run whose only event is [COMPLETE] renders nothing.
+        runs = [{"time": "", "anime": "", "events": [{"type": "complete", "msg": "x"}]}]
+        self.assertEqual(app.render_run_history(runs, None), "")
+
+    def test_standalone_skip_renders_without_header(self):
+        runs = [{"time": "", "anime": "", "events": [{"type": "skip", "msg": "up to date"}]}]
+        html_out = app.render_run_history(runs, None)
+        self.assertIn("up to date", html_out)
+        self.assertNotIn("run-header", html_out)
+
+    def test_anime_run_renders_header_and_time(self):
+        runs = [{"time": "19:40", "anime": "Naruto & Co", "events": [{"type": "download", "msg": "ep5"}]}]
+        html_out = app.render_run_history(runs, None)
+        self.assertIn("run-header", html_out)
+        self.assertIn("Naruto &amp; Co", html_out)  # header is escaped
+        self.assertIn("19:40", html_out)
+
+    def test_state_feed_is_one_line_per_run(self):
+        state_runs = [
+            {"finished_ts": "2026-06-13T19:30:00Z", "counts": {"entries": 3, "checked": 3}},
+            {"finished_ts": "2026-06-13T19:40:00Z", "counts": {"entries": 3, "checked": 3, "downloaded": 1}},
+        ]
+        html_out = app.render_run_history([], state_runs)
+        self.assertEqual(html_out.count("run-entry"), 2)
+
+
+class RenderActivityFallbackTest(unittest.TestCase):
+    """render_activity branches the run-state test does not reach: the log-parsed
+    last-run line, the status dot, the next-run dash fallback, and the
+    docker-unavailable / no-runs empty states."""
+
+    def test_log_parsed_last_run_with_anime_and_dash_next(self):
+        act = {"status": {"running": True},
+               "last_run": {"time": "19:40", "anime": "Naruto & Co"},
+               "next_run": ""}
+        status_html, last_html, next_html = app.render_activity(act)
+        self.assertIn("Running", status_html)
+        self.assertIn("status-dot running", status_html)
+        self.assertIn("19:40", last_html)
+        self.assertIn("Naruto &amp; Co", last_html)  # escaped
+        self.assertIn("&mdash;", next_html)  # empty next_run → dash fallback
+
+    def test_stopped_status_and_explicit_next(self):
+        act = {"status": {"running": False}, "last_run": None, "next_run": "~5 min"}
+        status_html, _last, next_html = app.render_activity(act)
+        self.assertIn("Stopped", status_html)
+        self.assertIn("status-dot stopped", status_html)
+        self.assertEqual(next_html, "~5 min")
+
+    def test_no_runs_yet_when_docker_available(self):
+        orig = app.docker.available
+        app.docker.available = True
+        try:
+            _s, last_html, _n = app.render_activity(
+                {"status": {}, "last_run": None, "next_run": ""})
+            self.assertIn("No runs yet", last_html)
+        finally:
+            app.docker.available = orig
+
+    def test_docker_unavailable_message(self):
+        orig = app.docker.available
+        app.docker.available = False
+        try:
+            _s, last_html, _n = app.render_activity(
+                {"status": {}, "last_run": None, "next_run": ""})
+            self.assertIn("Docker socket unavailable", last_html)
+        finally:
+            app.docker.available = orig
+
+
+class RenderMoveStatusTest(unittest.TestCase):
+    """render_move_status: running vs idle dot, last-run time, and the
+    dir-not-mounted / not-yet empty states."""
+
+    def setUp(self):
+        self._orig_running = app._move_running
+        self._orig_last = app._move_last_run
+        self._orig_dl = app.DOWNLOAD_DIR
+
+    def tearDown(self):
+        app._move_running = self._orig_running
+        app._move_last_run = self._orig_last
+        app.DOWNLOAD_DIR = self._orig_dl
+
+    def test_running_state(self):
+        app._move_running = True
+        status_html, _last = app.render_move_status()
+        self.assertIn("Running", status_html)
+        self.assertIn("status-dot running", status_html)
+
+    def test_idle_with_last_run_time(self):
+        app._move_running = False
+        app._move_last_run = datetime(2026, 6, 13, 19, 20, 5)
+        status_html, last_html = app.render_move_status()
+        self.assertIn("Idle", status_html)
+        self.assertEqual(last_html, "19:20:05")
+
+    def test_download_dir_not_mounted(self):
+        app._move_running = False
+        app._move_last_run = None
+        app.DOWNLOAD_DIR = os.path.join(tempfile.gettempdir(), "aniloads-no-such-dl")
+        _s, last_html = app.render_move_status()
+        self.assertIn("Download dir not mounted", last_html)
+
+    def test_not_yet_when_dir_present(self):
+        app._move_running = False
+        app._move_last_run = None
+        d = tempfile.mkdtemp(prefix="aniloads-dl-")
+        app.DOWNLOAD_DIR = d
+        try:
+            _s, last_html = app.render_move_status()
+            self.assertIn("Not yet", last_html)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class RenderMoveHistoryTest(unittest.TestCase):
+    """render_move_history: empty states (dir present / not mounted) and the
+    newest-first escaped event feed."""
+
+    def setUp(self):
+        self._orig_hist = list(app._move_history)
+        self._orig_dl = app.DOWNLOAD_DIR
+        app._move_history.clear()
+
+    def tearDown(self):
+        app._move_history.clear()
+        app._move_history.extend(self._orig_hist)
+        app.DOWNLOAD_DIR = self._orig_dl
+
+    def test_empty_with_dir_present(self):
+        d = tempfile.mkdtemp(prefix="aniloads-dl-")
+        app.DOWNLOAD_DIR = d
+        try:
+            self.assertIn("No move activity yet", app.render_move_history())
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_empty_without_dir(self):
+        app.DOWNLOAD_DIR = os.path.join(tempfile.gettempdir(), "aniloads-no-such-dl-2")
+        self.assertIn("Download directory not mounted", app.render_move_history())
+
+    def test_renders_events_newest_first_and_escapes(self):
+        app._move_history.append({"type": "moved", "msg": "A & B → X"})
+        app._move_history.append({"type": "error", "msg": "boom"})
+        html_out = app.render_move_history()
+        # newest first → the error (appended last) renders before the move.
+        self.assertLess(html_out.index("boom"), html_out.index("A &amp; B"))
+        self.assertIn("event--danger", html_out)
+        self.assertIn("event--ok", html_out)
+
+
+class RunMoveCycleTest(unittest.TestCase):
+    """run_move_cycle: movie vs series routing, tvdb_season override,
+    episode_offset rename, archive cleanup, and the safety/skip branches.
+    Exercises real filesystem fixtures in a sandbox; touches no Docker/network."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-move-")
+        self.download = os.path.join(self.tmp, "downloads")
+        self.media = os.path.join(self.tmp, "media")
+        self.movies = os.path.join(self.tmp, "movies")
+        for d in (self.download, self.media, self.movies):
+            os.makedirs(d)
+        self.ani_path = os.path.join(self.tmp, "ani.json")
+
+        self._orig = {k: getattr(app, k) for k in
+                      ("DOWNLOAD_DIR", "MEDIA_DIR", "MOVIE_MEDIA_DIR",
+                       "MIN_AGE_MINUTES", "ANI_JSON")}
+        app.DOWNLOAD_DIR = self.download
+        app.MEDIA_DIR = self.media
+        app.MOVIE_MEDIA_DIR = self.movies
+        app.MIN_AGE_MINUTES = 5
+        app.ANI_JSON = self.ani_path
+        self._write_ani([])
+
+    def tearDown(self):
+        for k, v in self._orig.items():
+            setattr(app, k, v)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_ani(self, anime):
+        with open(self.ani_path, "w", encoding="utf-8") as f:
+            json.dump({"anime": anime}, f)
+
+    def _make_dl(self, dirname, files, old=True):
+        """Create a download subdir with the given files, back-dated by default
+        so the MIN_AGE 'still being modified' guard does not trip."""
+        d = os.path.join(self.download, dirname)
+        os.makedirs(d, exist_ok=True)
+        for name in files:
+            p = os.path.join(d, name)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("x")
+            if old:
+                past = time.time() - 3600
+                os.utime(p, (past, past))
+        return d
+
+    def _types(self, events):
+        return [e["type"] for e in events]
+
+    def test_missing_download_dir_returns_empty(self):
+        app.DOWNLOAD_DIR = os.path.join(self.tmp, "does-not-exist")
+        self.assertEqual(app.run_move_cycle(), [])
+
+    def test_series_routes_into_anime_season_folder(self):
+        self._write_ani([{"name": "Naruto", "media_type": "series"}])
+        self._make_dl("Naruto.S01", ["Naruto.S01E05.mkv"])
+        events = app.run_move_cycle()
+        self.assertIn("moved", self._types(events))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.media, "Naruto", "S01", "Naruto.S01E05.mkv")))
+        # emptied source download dir is pruned
+        self.assertFalse(os.path.isdir(os.path.join(self.download, "Naruto.S01")))
+
+    def test_tvdb_season_override_changes_season_dir(self):
+        self._write_ani([{"name": "Bleach", "media_type": "series", "tvdb_season": 2}])
+        self._make_dl("Bleach.S01", ["Bleach.S01E05.mkv"])
+        app.run_move_cycle()
+        # filename keeps its S01 token; only the season folder is overridden to S02.
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.media, "Bleach", "S02", "Bleach.S01E05.mkv")))
+
+    def test_episode_offset_renames_episode_in_filename(self):
+        self._write_ani([{"name": "Bleach", "media_type": "series", "episode_offset": 12}])
+        self._make_dl("Bleach.S01", ["Bleach.S01E05.mkv"])
+        app.run_move_cycle()
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.media, "Bleach", "S01", "Bleach.S01E17.mkv")))
+
+    def test_movie_single_file_renamed_to_folder(self):
+        self._write_ani([{"name": "Akira", "media_type": "movie", "year": 1988}])
+        self._make_dl("Akira.1988.1080p", ["Akira.1988.1080p.mkv"])
+        events = app.run_move_cycle()
+        self.assertIn("moved", self._types(events))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.movies, "Akira (1988)", "Akira (1988).mkv")))
+
+    def test_movie_multiple_videos_keep_original_names(self):
+        self._write_ani([{"name": "Akira", "media_type": "movie", "year": 1988}])
+        self._make_dl("Akira.1988", ["Akira.1988.mkv", "Akira.extras.mkv"])
+        app.run_move_cycle()
+        folder = os.path.join(self.movies, "Akira (1988)")
+        self.assertTrue(os.path.isfile(os.path.join(folder, "Akira.1988.mkv")))
+        self.assertTrue(os.path.isfile(os.path.join(folder, "Akira.extras.mkv")))
+
+    def test_archives_removed_alongside_extracted_video(self):
+        self._write_ani([{"name": "Naruto", "media_type": "series"}])
+        self._make_dl("Naruto.S01", ["Naruto.S01E05.mkv", "part1.rar", "part2.r00"])
+        events = app.run_move_cycle()
+        self.assertIn("cleanup", self._types(events))
+        self.assertIn("moved", self._types(events))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.media, "Naruto", "S01", "Naruto.S01E05.mkv")))
+
+    def test_archives_present_no_video_waits(self):
+        self._write_ani([{"name": "Naruto", "media_type": "series"}])
+        self._make_dl("Naruto.S01", ["part1.rar"])
+        events = app.run_move_cycle()
+        self.assertEqual(self._types(events), ["wait"])
+        self.assertIn("archives present", events[0]["msg"])
+        # nothing moved; the archive is left in place for the next cycle.
+        self.assertTrue(os.path.isfile(os.path.join(self.download, "Naruto.S01", "part1.rar")))
+
+    def test_recently_modified_files_wait(self):
+        self._write_ani([{"name": "Naruto", "media_type": "series"}])
+        self._make_dl("Naruto.S01", ["Naruto.S01E05.mkv"], old=False)
+        events = app.run_move_cycle()
+        self.assertEqual(self._types(events), ["wait"])
+        self.assertIn("still being modified", events[0]["msg"])
+
+    def test_partial_downloads_wait(self):
+        self._write_ani([{"name": "Naruto", "media_type": "series"}])
+        self._make_dl("Naruto.S01", ["Naruto.S01E05.mkv", "Naruto.S01E06.mkv.part"])
+        events = app.run_move_cycle()
+        self.assertEqual(self._types(events), ["wait"])
+        self.assertIn("incomplete downloads", events[0]["msg"])
+
+    def test_existing_target_is_skipped_not_overwritten(self):
+        self._write_ani([{"name": "Naruto", "media_type": "series"}])
+        dest_dir = os.path.join(self.media, "Naruto", "S01")
+        os.makedirs(dest_dir)
+        with open(os.path.join(dest_dir, "Naruto.S01E05.mkv"), "w") as f:
+            f.write("existing")
+        self._make_dl("Naruto.S01", ["Naruto.S01E05.mkv"])
+        events = app.run_move_cycle()
+        self.assertIn("skip", self._types(events))
+        with open(os.path.join(dest_dir, "Naruto.S01E05.mkv")) as f:
+            self.assertEqual(f.read(), "existing")
+
+    def test_unparseable_series_filename_errors(self):
+        self._write_ani([{"name": "Akira", "media_type": "series"}])
+        self._make_dl("Akira", ["Akira.Movie.1080p.mkv"])
+        events = app.run_move_cycle()
+        self.assertIn("error", self._types(events))
+        err = [e for e in events if e["type"] == "error"][0]
+        self.assertIn("Cannot parse", err["msg"])
+
+    def test_leftover_nonvideo_files_removed_and_empty_dir_pruned(self):
+        self._write_ani([{"name": "Naruto", "media_type": "series"}])
+        self._make_dl("Naruto.S01", ["Naruto.S01E05.mkv", "Naruto.nfo", "poster.jpg"])
+        app.run_move_cycle()
+        self.assertFalse(os.path.isdir(os.path.join(self.download, "Naruto.S01")))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.media, "Naruto", "S01", "Naruto.S01E05.mkv")))
+
+
+class HandlerPostRoutingTest(unittest.TestCase):
+    """Light do_POST integration coverage for the non-network routes, using the
+    same __new__/stub harness as WatchlistMutationKeyByUrlTest."""
+
+    def setUp(self):
+        fd, self._prefs = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self._orig_prefs = app.PREFS_FILE
+        app.PREFS_FILE = self._prefs
+
+    def tearDown(self):
+        app.PREFS_FILE = self._orig_prefs
+        try:
+            os.remove(self._prefs)
+        except OSError:
+            pass
+        app._move_trigger.clear()
+
+    def _post(self, path, params):
+        captured = {}
+        h = app.Handler.__new__(app.Handler)
+        h.path = path
+        h._read_post = lambda: params
+        h._redirect_msg = lambda msg: captured.__setitem__("msg", msg)
+        h._redirect = lambda url: captured.__setitem__("url", url)
+        h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
+        h.do_POST()
+        return captured
+
+    def test_save_prefs_persists_and_redirects(self):
+        result = self._post("/save-prefs", {
+            "audio_language": "japanese", "sub_language": "english",
+            "min_resolution": "720", "auto_select": "on"})
+        self.assertEqual(result["msg"], "Preferences saved")
+        prefs = app.load_prefs()
+        self.assertEqual(prefs["audio_language"], "japanese")
+        self.assertEqual(prefs["min_resolution"], 720)
+        self.assertTrue(prefs["auto_select"])
+
+    def test_save_prefs_auto_select_unchecked_defaults_false(self):
+        self._post("/save-prefs", {"min_resolution": "1080"})
+        self.assertFalse(app.load_prefs()["auto_select"])
+
+    def test_move_now_sets_trigger(self):
+        app._move_trigger.clear()
+        result = self._post("/move-now", {})
+        self.assertTrue(app._move_trigger.is_set())
+        self.assertEqual(result["msg"], "Move cycle triggered")
+
+    def test_add_url_rejects_non_site_url(self):
+        result = self._post("/add-url", {"url": "http://evil.example/x"})
+        self.assertTrue(result["msg"].startswith("Error: Invalid URL"))
+
+    def test_search_empty_query_errors(self):
+        result = self._post("/search", {"q": "  "})
+        self.assertTrue(result["msg"].startswith("Error: Empty search"))
+
+
+class HandlerGetMsgBannerTest(unittest.TestCase):
+    """do_GET's status-banner branch keys the banner CSS class off whether the
+    msg starts with 'Error'. render_page is stubbed so no full page is built."""
+
+    def _get(self, path):
+        captured = {}
+        h = app.Handler.__new__(app.Handler)
+        h.path = path
+        h._respond = lambda code, html_body: captured.__setitem__("resp", (code, html_body))
+        orig = app.render_page
+        app.render_page = lambda **kw: kw.get("status", "")
+        try:
+            h.do_GET()
+        finally:
+            app.render_page = orig
+        return captured["resp"]
+
+    def test_ok_msg_uses_ok_class(self):
+        code, html_out = self._get("/?msg=" + quote("Removed: X"))
+        self.assertEqual(code, 200)
+        self.assertIn("status-ok", html_out)
+        self.assertIn("Removed: X", html_out)
+
+    def test_error_msg_uses_err_class(self):
+        _code, html_out = self._get("/?msg=" + quote("Error: nope"))
+        self.assertIn("status-err", html_out)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,12 @@
 """Tests for the pure-logic functions in web/app.py."""
 
+import html
 import json
 import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta
+from urllib.parse import urlparse, parse_qs
 
 import support
 
@@ -529,6 +531,82 @@ class RenderRunHistoryTest(unittest.TestCase):
         log_runs = [{"time": "19:40", "anime": "FromLog", "events": [{"type": "download", "msg": "x"}]}]
         html = app.render_run_history(log_runs, [{"finished_ts": None, "counts": {}}])
         self.assertIn("FromLog", html)
+
+
+class ConfirmAttrTest(unittest.TestCase):
+    """BUG-1: the inline Remove ``confirm()`` must survive names with
+    apostrophes (also quotes / &). Previously the name was only HTML-escaped, so
+    a raw ``'`` inside ``confirm('Remove ...')`` aborted the inline JS and Remove
+    submitted with NO confirmation."""
+
+    def _decode_arg(self, attr):
+        # The attribute lives inside onclick="..." — it must carry no bare double
+        # quote that would close the attribute early.
+        self.assertNotIn('"', attr)
+        js = html.unescape(attr)
+        self.assertTrue(js.startswith("return confirm(") and js.endswith(")"))
+        # The argument is a valid JS/JSON string literal.
+        return json.loads(js[len("return confirm("):-1])
+
+    def test_apostrophe_name_is_well_formed(self):
+        msg = "Remove Frieren: Beyond Journey's End?"
+        self.assertEqual(self._decode_arg(app.confirm_attr(msg)), msg)
+
+    def test_double_quote_name_is_well_formed(self):
+        msg = 'Remove Re:"Zero" Starting Life?'
+        self.assertEqual(self._decode_arg(app.confirm_attr(msg)), msg)
+
+    def test_ampersand_name_is_well_formed(self):
+        msg = "Remove Fate & Stay?"
+        self.assertEqual(self._decode_arg(app.confirm_attr(msg)), msg)
+
+    def test_render_watchlist_apostrophe_button_is_safe(self):
+        out = app.render_watchlist(
+            [{"name": "Frieren: Beyond Journey's End", "url": "http://x"}])
+        # The onclick now uses the entity-encoded confirm string …
+        self.assertIn('onclick="return confirm(', out)
+        # … and never the old single-quoted form a `'` would break.
+        self.assertNotIn("confirm('Remove", out)
+
+    def test_render_watchlist_pending_apostrophe_button_is_safe(self):
+        out = app.render_watchlist(
+            [], [{"name": "Frieren: Beyond Journey's End", "url": "http://x"}])
+        self.assertIn('onclick="return confirm(', out)
+        self.assertNotIn("confirm('Remove", out)
+
+
+class RedirectMsgEncodingTest(unittest.TestCase):
+    """BUG-2: status messages must be URL-encoded so a name containing
+    ``& = # %`` survives the redirect round-trip. A raw ``/?msg=...`` was
+    truncated at the first ``&`` (parse_qs splits the query on it)."""
+
+    def _captured_url(self, msg):
+        captured = {}
+        handler = app.Handler.__new__(app.Handler)
+        # Stub the low-level redirect so no socket is touched.
+        handler._redirect = lambda url: captured.__setitem__("url", url)
+        handler._redirect_msg(msg)
+        return captured["url"]
+
+    def test_ampersand_name_survives_roundtrip(self):
+        msg = "Removed: Fate/stay night & Heaven's Feel"
+        url = self._captured_url(msg)
+        # The raw "& Heaven..." must NOT sit unencoded in the query.
+        self.assertNotIn("& Heaven", url)
+        # parse_qs (the GET side) decodes it back to the exact original.
+        qs = parse_qs(urlparse(url).query)
+        self.assertEqual(qs["msg"][0], msg)
+
+    def test_special_chars_survive_roundtrip(self):
+        msg = "Folder updated: A=B -> C#1 100% done"
+        qs = parse_qs(urlparse(self._captured_url(msg)).query)
+        self.assertEqual(qs["msg"][0], msg)
+
+    def test_error_prefix_preserved_for_banner_class(self):
+        # The GET side keys the error styling off msg.startswith("Error"), so the
+        # prefix must survive the encode round-trip.
+        qs = parse_qs(urlparse(self._captured_url("Error: Invalid index")).query)
+        self.assertTrue(qs["msg"][0].startswith("Error"))
 
 
 if __name__ == "__main__":

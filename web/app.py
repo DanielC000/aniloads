@@ -1557,6 +1557,18 @@ def render_move_history(max_entries=30):
     return html
 
 
+def confirm_attr(message):
+    """Build a safe ``onclick="return confirm(...)"`` attribute value.
+
+    ``json.dumps`` produces a valid JS string literal (escaping quotes,
+    backslashes, etc.), and ``escape(..., quote=True)`` then makes it safe inside
+    the double-quoted HTML attribute. Without this, a name containing an
+    apostrophe (e.g. "Frieren: Beyond Journey's End") was only HTML-escaped, so
+    the inline ``confirm('Remove Journey&#x27;s End?')`` failed to compile and
+    Remove submitted with no confirmation."""
+    return escape("return confirm({})".format(json.dumps(message)), quote=True)
+
+
 def render_watchlist(anime_list, pending_list=None):
     if not anime_list and not pending_list:
         return '<div class="empty">No anime in watchlist. Add some above!</div>'
@@ -1566,16 +1578,17 @@ def render_watchlist(anime_list, pending_list=None):
         for i, a in enumerate(pending_list):
             name = a.get("name", "Unknown")
             url = a.get("url", "")
+            remove_confirm = confirm_attr("Remove {}?".format(name))
             pref_audio = a.get("pref_audio_language", a.get("pref_language", ""))
             pref_sub = a.get("pref_sub_language", "")
             pref_res = a.get("pref_resolution", "")
             pref_badges = ""
             if pref_audio:
-                pref_badges += '<span class="badge badge-lang">Dub: {}</span> '.format(pref_audio.title())
+                pref_badges += '<span class="badge badge-lang">Dub: {}</span> '.format(escape(pref_audio.title()))
             if pref_sub:
-                pref_badges += '<span class="badge badge-sub">Sub: {}</span> '.format(pref_sub.title())
+                pref_badges += '<span class="badge badge-sub">Sub: {}</span> '.format(escape(pref_sub.title()))
             if pref_res:
-                pref_badges += '<span class="badge badge-res">{}p</span> '.format(pref_res)
+                pref_badges += '<span class="badge badge-res">{}p</span> '.format(escape(str(pref_res)))
 
             if a.get("no_match"):
                 status_badge = '<span class="badge badge-warn">No match</span>'
@@ -1598,17 +1611,19 @@ def render_watchlist(anime_list, pending_list=None):
                 </div>
                 <form method="POST" action="/remove-pending" style="margin:0;">
                   <input type="hidden" name="index" value="{idx}">
-                  <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Remove {name}?')">Remove</button>
+                  <button type="submit" class="btn btn-danger btn-sm" onclick="{remove_confirm}">Remove</button>
                 </form>
               </div>
             </div>""".format(name=escape(name), url=escape(url), pref_badges=pref_badges,
-                             status_badge=status_badge, no_match_line=no_match_line, idx=i)
+                             status_badge=status_badge, no_match_line=no_match_line, idx=i,
+                             remove_confirm=remove_confirm)
 
     for i, a in enumerate(anime_list):
         name = a.get("name", "Unknown")
         url = a.get("url", "")
         eps = a.get("episodes", a.get("episodes_downloaded", 0))
         missing = a.get("missing", [])
+        remove_confirm = confirm_attr("Remove {}?".format(name))
 
         url_html = '<div class="anime-url">{}</div>'.format(escape(url)) if url else ""
 
@@ -1617,11 +1632,11 @@ def render_watchlist(anime_list, pending_list=None):
         pref_res = a.get("pref_resolution", "")
         pref_badges = ""
         if pref_audio:
-            pref_badges += '<span class="badge badge-lang">Dub: {}</span> '.format(pref_audio.title())
+            pref_badges += '<span class="badge badge-lang">Dub: {}</span> '.format(escape(pref_audio.title()))
         if pref_sub:
-            pref_badges += '<span class="badge badge-sub">Sub: {}</span> '.format(pref_sub.title())
+            pref_badges += '<span class="badge badge-sub">Sub: {}</span> '.format(escape(pref_sub.title()))
         if pref_res:
-            pref_badges += '<span class="badge badge-res">{}p</span> '.format(pref_res)
+            pref_badges += '<span class="badge badge-res">{}p</span> '.format(escape(str(pref_res)))
 
         missing_badge = ""
         if missing:
@@ -1730,15 +1745,16 @@ def render_watchlist(anime_list, pending_list=None):
             </div>
             <form method="POST" action="/remove" style="margin:0;">
               <input type="hidden" name="index" value="{idx}">
-              <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Remove {name}?')">Remove</button>
+              <button type="submit" class="btn btn-danger btn-sm" onclick="{remove_confirm}">Remove</button>
             </form>
           </div>
           {ep_panel}
         </div>""".format(
-            name=escape(name), url_html=url_html, eps=eps,
+            name=escape(name), url_html=url_html, eps=escape(str(eps)),
             missing_badge=missing_badge, pref_badges=pref_badges,
             tvdb_badges=tvdb_badges, status_badges=status_badges,
             folder_html=folder_html, idx=i, ep_panel=ep_panel,
+            remove_confirm=remove_confirm,
         )
     return html
 
@@ -2050,6 +2066,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Location", url)
         self.end_headers()
 
+    def _redirect_msg(self, msg):
+        """Redirect home with a status banner message, URL-encoded so a name
+        containing ``& = # %`` survives intact — parse_qs decodes it on the GET
+        side. A raw ``/?msg=...`` truncated everything after the first ``&``."""
+        self._redirect("/?" + urlencode({"msg": msg}))
+
     def _read_post(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode("utf-8")
@@ -2104,15 +2126,15 @@ class Handler(BaseHTTPRequestHandler):
             ok, msg = docker.restart_container()
             if ok:
                 _log.info("[bot] Restart requested via dashboard")
-                self._redirect("/?msg=Bot restarting, new run will begin shortly")
+                self._redirect_msg("Bot restarting, new run will begin shortly")
             else:
                 _log.warning("[bot] Restart failed: %s", msg)
-                self._redirect("/?msg=Error: {}".format(msg))
+                self._redirect_msg("Error: {}".format(msg))
 
         elif parsed.path == "/move-now":
             _log.info("[mover] Move Now triggered via dashboard")
             _move_trigger.set()
-            self._redirect("/?msg=Move cycle triggered")
+            self._redirect_msg("Move cycle triggered")
 
         elif parsed.path == "/save-prefs":
             prefs = {
@@ -2122,19 +2144,19 @@ class Handler(BaseHTTPRequestHandler):
                 "auto_select": "auto_select" in params,
             }
             save_prefs(prefs)
-            self._redirect("/?msg=Preferences saved")
+            self._redirect_msg("Preferences saved")
 
         elif parsed.path == "/add-url":
             url = params.get("url", "").strip()
             if not url or "anime-loads.org" not in url:
-                self._redirect("/?msg=Error: Invalid URL")
+                self._redirect_msg("Error: Invalid URL")
                 return
 
             data = load_ani()
             all_entries = data.get("anime", []) + data.get("pending", [])
             for a in all_entries:
                 if a.get("url") == url:
-                    self._redirect("/?msg=Already in watchlist")
+                    self._redirect_msg("Already in watchlist")
                     return
 
             # Fetch releases from site so user can see what's available
@@ -2148,7 +2170,7 @@ class Handler(BaseHTTPRequestHandler):
                 save_ani(data)
                 msg = "Could not fetch releases{}, added to pending queue".format(
                     ": " + err if err else "")
-                self._redirect("/?msg={}".format(msg))
+                self._redirect_msg(msg)
                 return
 
             # Show release selection page
@@ -2167,7 +2189,7 @@ class Handler(BaseHTTPRequestHandler):
             data = load_ani()
             for a in data.get("anime", []):
                 if a.get("url") == url:
-                    self._redirect("/?msg=Already in watchlist")
+                    self._redirect_msg("Already in watchlist")
                     return
 
             # If TVDB is available and user hasn't been through the TVDB step yet,
@@ -2240,7 +2262,7 @@ class Handler(BaseHTTPRequestHandler):
                 season_info = ", season {}".format(entry["tvdb_season"])
             _log.info("[watchlist] Added: %s (folder=%s, tvdb_id=%s%s)",
                       name, folder_name, entry.get("tvdb_id", "-"), season_info)
-            self._redirect("/?msg=Added: {} (folder: {}{})".format(
+            self._redirect_msg("Added: {} (folder: {}{})".format(
                 name, folder_name, season_info))
 
         elif parsed.path == "/tvdb-search":
@@ -2302,7 +2324,7 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/search":
             query = params.get("q", "").strip()
             if not query:
-                self._redirect("/?msg=Error: Empty search")
+                self._redirect_msg("Error: Empty search")
                 return
 
             results, err = search_anime(query)
@@ -2325,9 +2347,9 @@ class Handler(BaseHTTPRequestHandler):
                 data["pending"] = pending
                 save_ani(data)
                 _log.info("[watchlist] Removed pending: %s", removed.get("name") or removed.get("url", "?"))
-                self._redirect("/?msg=Removed: {}".format(removed.get("name", "?")))
+                self._redirect_msg("Removed: {}".format(removed.get("name", "?")))
             else:
-                self._redirect("/?msg=Error: Invalid index")
+                self._redirect_msg("Error: Invalid index")
 
         elif parsed.path == "/remove":
             idx = int(params.get("index", -1))
@@ -2337,9 +2359,9 @@ class Handler(BaseHTTPRequestHandler):
                 removed = anime_list.pop(idx)
                 save_ani(data)
                 _log.info("[watchlist] Removed anime: %s", removed.get("name", "?"))
-                self._redirect("/?msg=Removed: {}".format(removed.get("name", "?")))
+                self._redirect_msg("Removed: {}".format(removed.get("name", "?")))
             else:
-                self._redirect("/?msg=Error: Invalid index")
+                self._redirect_msg("Error: Invalid index")
 
         elif parsed.path == "/ep-add":
             idx = int(params.get("index", -1))
@@ -2354,11 +2376,11 @@ class Handler(BaseHTTPRequestHandler):
                     missing.sort()
                     entry["missing"] = missing
                     save_ani(data)
-                    self._redirect("/?msg=Added episode {} to retry queue for {}".format(ep, entry.get("name", "?")))
+                    self._redirect_msg("Added episode {} to retry queue for {}".format(ep, entry.get("name", "?")))
                 else:
-                    self._redirect("/?msg=Episode {} already in retry queue".format(ep))
+                    self._redirect_msg("Episode {} already in retry queue".format(ep))
             else:
-                self._redirect("/?msg=Error: Invalid index or episode")
+                self._redirect_msg("Error: Invalid index or episode")
 
         elif parsed.path == "/ep-remove":
             idx = int(params.get("index", -1))
@@ -2372,11 +2394,11 @@ class Handler(BaseHTTPRequestHandler):
                     missing.remove(ep)
                     entry["missing"] = missing
                     save_ani(data)
-                    self._redirect("/?msg=Removed episode {} from retry queue for {}".format(ep, entry.get("name", "?")))
+                    self._redirect_msg("Removed episode {} from retry queue for {}".format(ep, entry.get("name", "?")))
                 else:
-                    self._redirect("/?msg=Episode {} not in retry queue".format(ep))
+                    self._redirect_msg("Episode {} not in retry queue".format(ep))
             else:
-                self._redirect("/?msg=Error: Invalid index or episode")
+                self._redirect_msg("Error: Invalid index or episode")
 
         elif parsed.path == "/tvdb-link":
             idx = int(params.get("index", -1))
@@ -2395,7 +2417,7 @@ class Handler(BaseHTTPRequestHandler):
                     media_type=media_type)
                 self._respond(200, render_page(search_html=search_html))
             else:
-                self._redirect("/?msg=Error: Invalid index or TVDB unavailable")
+                self._redirect_msg("Error: Invalid index or TVDB unavailable")
 
         elif parsed.path == "/tvdb-save":
             idx = int(params.get("index", -1))
@@ -2434,10 +2456,10 @@ class Handler(BaseHTTPRequestHandler):
 
                 save_ani(data)
                 season_str = " S{:02d}".format(entry.get("tvdb_season", 0)) if entry.get("tvdb_season") else ""
-                self._redirect("/?msg=TVDB linked: {}{}".format(
+                self._redirect_msg("TVDB linked: {}{}".format(
                     entry.get("name", "?"), season_str))
             else:
-                self._redirect("/?msg=Error: Invalid index")
+                self._redirect_msg("Error: Invalid index")
 
         elif parsed.path == "/tvdb-unlink":
             idx = int(params.get("index", -1))
@@ -2448,9 +2470,9 @@ class Handler(BaseHTTPRequestHandler):
                 for key in ("tvdb_id", "tvdb_season", "episode_offset"):
                     entry.pop(key, None)
                 save_ani(data)
-                self._redirect("/?msg=TVDB unlinked: {}".format(entry.get("name", "?")))
+                self._redirect_msg("TVDB unlinked: {}".format(entry.get("name", "?")))
             else:
-                self._redirect("/?msg=Error: Invalid index")
+                self._redirect_msg("Error: Invalid index")
 
         elif parsed.path == "/update-folder":
             idx = int(params.get("index", -1))
@@ -2461,10 +2483,10 @@ class Handler(BaseHTTPRequestHandler):
                 entry = anime_list[idx]
                 entry["customPackage"] = folder
                 save_ani(data)
-                self._redirect("/?msg=Folder updated: {} -> {}".format(
+                self._redirect_msg("Folder updated: {} -> {}".format(
                     entry.get("name", "?"), folder))
             else:
-                self._redirect("/?msg=Error: Invalid index or empty folder")
+                self._redirect_msg("Error: Invalid index or empty folder")
 
         elif parsed.path == "/mark-incomplete":
             idx = int(params.get("index", -1))
@@ -2475,9 +2497,9 @@ class Handler(BaseHTTPRequestHandler):
                 for key in ("complete", "skip_until"):
                     entry.pop(key, None)
                 save_ani(data)
-                self._redirect("/?msg=Marked incomplete: {}".format(entry.get("name", "?")))
+                self._redirect_msg("Marked incomplete: {}".format(entry.get("name", "?")))
             else:
-                self._redirect("/?msg=Error: Invalid index")
+                self._redirect_msg("Error: Invalid index")
 
         else:
             self._redirect("/")

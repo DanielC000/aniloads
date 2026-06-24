@@ -760,6 +760,49 @@ def addAnime():
             print("\n\n\n")
 
 
+def handle_failed_batch(batch_result, all_wanted, animeentry, run_counts,
+                        today_iso, name, push, log_fn=log):
+    """Apply the outcome of a failed ``downloadBatchCNL`` to bot state.
+
+    Distinguishes two cases that ``downloadBatchCNL`` cannot tell apart on its
+    own:
+
+    * **All-phantom** — the batch failed *only* because every wanted episode
+      lies beyond the actually-available max (``available_max``). The site DOM
+      over-reported the episode count, so none of the wanted episodes exist in
+      any release. This is the benign UNAVAILABLE case (the same reality the
+      single-ep path handles): logged at INFO, NOT counted as an error.
+    * **Genuine failure** — no ``available_max`` in the response (e.g. a
+      MyJD/JD error or the ``except`` path's caller), or a *partial* phantom
+      where some wanted episodes are still in range. Logged as ``[ERROR]`` and
+      counted in ``run_counts["errors"]``.
+
+    Either way, if the CNL response carried an ``available_max`` the cap is
+    refreshed on ``animeentry`` (``al_available_max`` + ``al_available_max_set_at``)
+    so the daily revalidation keeps working and genuinely-new episodes recover.
+
+    Returns ``True`` when the cap was refreshed (caller should ``save_ani()``),
+    ``False`` otherwise. Mutates ``animeentry`` and ``run_counts`` in place;
+    performs no I/O of its own, which keeps it unit-testable.
+    """
+    reason = batch_result.get("reason", "unbekannt")
+    batch_max = batch_result.get("available_max")
+    all_phantom = (batch_max is not None and
+                   all(ep > batch_max for ep in all_wanted))
+    if all_phantom:
+        log_fn("[UNAVAILABLE] " + name + ": keine Downloadlinks für gewünschte "
+               "Episoden — verfügbar bis Episode " + str(batch_max)
+               + ", markiere als nicht verfügbar", push)
+    else:
+        run_counts["errors"] += 1
+        log_fn("[ERROR] Batch-CNL fehlgeschlagen für " + name + ": " + reason + " — überspringe", push)
+    if batch_max is not None:
+        animeentry['al_available_max'] = batch_max
+        animeentry['al_available_max_set_at'] = today_iso
+        return True
+    return False
+
+
 def startbot():
 
     jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport, al_user, al_pass = loadconfig()
@@ -1161,16 +1204,11 @@ def startbot():
                                     _log.warning("[BATCH] Episoden nicht im Batch gefunden: %s — werden beim nächsten Lauf erneut versucht",
                                                  batch_result["episodes_not_found"])
                             else:
-                                reason = batch_result.get("reason", "unbekannt")
-                                run_counts["errors"] += 1
-                                log("[ERROR] Batch-CNL fehlgeschlagen für " + name + ": " + reason + " — überspringe", pb)
-                                # CNL response may carry available_max even on failure (e.g. wanted eps
-                                # weren't in the grouped result). Persist it so the cap is fresh and
-                                # the daily revalidation works.
-                                batch_max = batch_result.get("available_max")
-                                if batch_max is not None:
-                                    animeentry['al_available_max'] = batch_max
-                                    animeentry['al_available_max_set_at'] = today_iso
+                                # Decide error-vs-benign and refresh the cap in one place
+                                # (see handle_failed_batch). save_ani() stays here so the
+                                # helper remains pure/testable.
+                                if handle_failed_batch(batch_result, all_wanted, animeentry,
+                                                       run_counts, today_iso, name, pb):
                                     save_ani()
                         except Exception as e:
                             printException(e)

@@ -124,5 +124,87 @@ class WriteRunStateTest(unittest.TestCase):
         self.assertEqual(state["last_run"]["counts"]["checked"], 3)
 
 
+class HandleFailedBatchTest(unittest.TestCase):
+    """A failed downloadBatchCNL must distinguish the benign all-phantom case
+    (the site DOM over-reported the episode count, so every wanted episode is
+    beyond the real available max) from a genuine failure. The phantom case is
+    logged at INFO and is NOT counted as an error; genuine failures still log
+    [ERROR] and bump run_counts["errors"]. Either way the available_max cap is
+    refreshed when the CNL response carried one."""
+
+    TODAY = "2026-06-24"
+
+    def setUp(self):
+        self.logs = []
+
+    def _log(self, message, _push):
+        self.logs.append(message)
+
+    def _call(self, batch_result, all_wanted, animeentry=None, run_counts=None):
+        animeentry = {} if animeentry is None else animeentry
+        run_counts = {"errors": 0} if run_counts is None else run_counts
+        saved = anibot.handle_failed_batch(
+            batch_result, all_wanted, animeentry, run_counts,
+            self.TODAY, "Gantz", push=None, log_fn=self._log)
+        return saved, animeentry, run_counts
+
+    def test_all_phantom_is_benign_not_an_error(self):
+        # Gantz: DOM reports 27, real max is 13; bot wanted eps 14-27 — all
+        # phantom. Must NOT count as an error, must re-cap, must log UNAVAILABLE.
+        batch_result = {
+            "success": False,
+            "reason": "Keine gewünschten Episoden im Batch gefunden",
+            "episodes_sent": [],
+            "episodes_not_found": list(range(14, 28)),
+            "available_max": 13,
+        }
+        saved, entry, counts = self._call(batch_result, list(range(14, 28)))
+        # (a) errors NOT incremented
+        self.assertEqual(counts["errors"], 0)
+        # (b) cap set to 13 with today's stamp; caller told to persist
+        self.assertTrue(saved)
+        self.assertEqual(entry["al_available_max"], 13)
+        self.assertEqual(entry["al_available_max_set_at"], self.TODAY)
+        # (c) the log is the unavailable/info message, not [ERROR]
+        self.assertEqual(len(self.logs), 1)
+        self.assertIn("[UNAVAILABLE]", self.logs[0])
+        self.assertNotIn("[ERROR]", self.logs[0])
+
+    def test_genuine_failure_without_available_max_still_errors(self):
+        # No available_max (e.g. MyJD/JD error) → genuine failure: [ERROR] +
+        # error tally, and nothing to persist.
+        batch_result = {
+            "success": False,
+            "reason": "JDownloader nicht erreichbar",
+            "episodes_sent": [],
+            "episodes_not_found": [],
+            "available_max": None,
+        }
+        saved, entry, counts = self._call(batch_result, [3, 4, 5])
+        self.assertEqual(counts["errors"], 1)
+        self.assertFalse(saved)
+        self.assertNotIn("al_available_max", entry)
+        self.assertEqual(len(self.logs), 1)
+        self.assertIn("[ERROR]", self.logs[0])
+
+    def test_partial_phantom_still_errors_but_recaps(self):
+        # Some wanted eps are still in range (<= available_max): a genuine
+        # failure (an in-range ep should have downloaded). Logs [ERROR] and
+        # increments errors, but still refreshes the cap from the response.
+        batch_result = {
+            "success": False,
+            "reason": "Keine gewünschten Episoden im Batch gefunden",
+            "episodes_sent": [],
+            "episodes_not_found": [8, 9],
+            "available_max": 8,
+        }
+        saved, entry, counts = self._call(batch_result, [8, 9])
+        self.assertEqual(counts["errors"], 1)
+        self.assertTrue(saved)
+        self.assertEqual(entry["al_available_max"], 8)
+        self.assertEqual(entry["al_available_max_set_at"], self.TODAY)
+        self.assertIn("[ERROR]", self.logs[0])
+
+
 if __name__ == "__main__":
     unittest.main()

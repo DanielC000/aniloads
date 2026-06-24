@@ -15,30 +15,28 @@ Automated anime downloading from [anime-loads.org](https://www.anime-loads.org/)
 ┌─────────────┐     ┌┴────────────┐     ┌─┴────────────┐     ┌──────────────┐
 │  anime-web  │────>│   ani.json  │<────│  anime-loads  │────>│  jdownloader │
 │   :8085     │     │ (watchlist) │     │    (bot)      │     │   :5800      │
-└─────────────┘     └─────────────┘     └───────────────┘     └──────────────┘
-                          │                                          │
-                          │ tvdb_season                        ┌─────v────────┐
-                          │ episode_offset                     │  /downloads  │
-                          │ complete, skip_until               │   /anime     │
-                          │                                    └─────┬────────┘
-                          │              ┌──────────────┐            │
-                          └─────────────>│move-completed│<───────────┘
-                                         │  (watcher)   │
-                                         └──────┬───────┘
-                                         ┌──────v───────┐
-                                         │ /media/anime │
-                                         │   (Plex)     │
-                                         └──────────────┘
+│ +file mover │     └─────────────┘     └───────────────┘     └──────┬───────┘
+└──────┬──────┘                                                      │
+       │ reads completed downloads,                          ┌───────v──────┐
+       │ applies tvdb_season/offset,  <──────────────────────┤  downloads/  │
+       │ moves into media library                            │    anime     │
+       v                                                      └──────────────┘
+┌──────────────┐
+│ media/anime  │
+│  (library)   │
+└──────────────┘
 ```
+
+The file mover is a background thread inside the `anime-web` service, not a
+separate container.
 
 ## Services
 
 | Service | Container | Port | Description |
 |---------|-----------|------|-------------|
-| **anime-web** | `anime-web` | 8085 | Dashboard — watchlist management, bot activity, run history |
+| **anime-web** | `anime-web` | 8085 | Dashboard — watchlist management, bot activity, run history. Also runs the file mover (background thread) that organises finished downloads into `AnimeName/SXX/` folders. |
 | **anime-loads** | `anime-loads` | — | Bot that monitors watchlist, scrapes anime-loads.org, pushes links to JDownloader |
 | **jdownloader** | `jdownloader` | 5800 | Download manager with web UI (VNC) |
-| **move-completed** | `anime-move-completed` | — | Organises finished downloads into Plex-style `AnimeName/SXX/` folders |
 
 ## Setup
 
@@ -46,19 +44,37 @@ Automated anime downloading from [anime-loads.org](https://www.anime-loads.org/)
 
 ```bash
 cp .env.example .env
-# Edit .env and add your TVDB API key (optional, enables season correlation)
+# Edit .env — fill the required host paths, network name, and user/group IDs
+# (compose fails fast if any are unset). The TVDB API key is optional.
 ```
+
+`.env.example` documents every variable. The required block (`ANIME_*` host
+paths, `ANIME_NETWORK`, `PUID`/`PGID`, `DOCKER_GID`) has no defaults, so an unset
+value stops the deploy loudly rather than guessing.
 
 The TVDB API key is free — get one at https://thetvdb.com/dashboard/account/apikey.
 If omitted, the stack works without TVDB features.
 
 ### 2. Deploy
 
+The containers join an existing **external** Docker network whose name you set as
+`ANIME_NETWORK` in `.env`. Create it once if it doesn't already exist:
+
 ```bash
-./deploy.sh
+docker network create anime-net   # name must match ANIME_NETWORK in .env
 ```
 
-This copies all source files to the server, builds the bot Docker image from `bot/`, and starts the stack. On first deploy, `.env` is auto-created from `.env.example` if it doesn't exist on the server.
+Then build and start the stack from the repo root:
+
+```bash
+docker compose up -d --build
+```
+
+This builds the bot image from `bot/` and starts all three services. Re-run the
+same command after pulling changes to rebuild and restart.
+
+> Homelab/submodule deployments may wrap this in their own tooling; the command
+> above is the self-contained path from a fresh clone.
 
 ### 3. JDownloader Initial Setup
 
@@ -72,7 +88,8 @@ The ExternInterface settings are required for the anime-loads bot container to r
 
 ### 4. Anime-Loads Bot Config
 
-The bot config lives at `/mnt/Media/Configs/anime-loads/ani.json`.
+The bot config lives at `/config/ani.json` inside the container — i.e. the
+`ani.json` in the host directory you set as `ANIME_CONFIG_DIR`.
 
 Settings in `ani.json > settings`:
 
@@ -120,17 +137,17 @@ The bot and web UI share `ani.json`. Anime entries:
 | `al_status` | string? | Cached anime-loads.org status (`"Abgeschlossen"`, `"Laufend"`, etc.) |
 | `al_max_episodes` | int? | Cached max episode count from anime-loads.org |
 | `media_type` | string? | Cached from anime-loads.org Description tab — `"series"`, `"movie"`, `"ova"`, `"special"`, `"web"`, `"bonus"`. Only `"movie"` changes mover routing. |
-| `year` | int? | Cached release year from anime-loads.org — used for Plex movie folder naming `Title (Year)`. |
+| `year` | int? | Cached release year from anime-loads.org — used for `Title (Year)` movie folder naming. |
 | `display_title` | string? | Cached best title from the Description tab (German > English > Japanese) — used for movie folder names. |
 
 ### TVDB Integration
 
 Each anime-loads.org URL represents one season of a series. Release groups often
 mislabel season numbers in filenames (e.g., `S01E01` for what is actually Season 2),
-causing `move-completed` to place files in the wrong season folder.
+causing the file mover to place files in the wrong season folder.
 
 The TVDB fields solve this by letting the user map each anime-loads entry to the
-correct TVDB series and season. `move-completed` then overrides the filename's season
+correct TVDB series and season. The mover then overrides the filename's season
 number when organising files.
 
 **Example:** "Sousou no Frieren Dai 2 Ki" on anime-loads.org is Season 2, but
@@ -143,7 +160,7 @@ is moved to `Frieren/S02/` instead of `Frieren/S01/`.
 2. Select the series, then pick the correct season — the UI auto-suggests based on
    matching episode counts between the anime-loads release and TVDB seasons
 3. For existing entries, use the "Link TVDB" button on the watchlist card
-4. `move-completed` reads `tvdb_season` and `episode_offset` from `ani.json` and
+4. The mover reads `tvdb_season` and `episode_offset` from `ani.json` and
    overrides the season/episode numbers parsed from filenames
 
 **`episode_offset`** handles cases where anime-loads numbers episodes from 1 but
@@ -177,30 +194,38 @@ Completion is automatic. To re-enable checking (e.g. surprise continuation), use
 
 ## File Paths
 
-| Path | Purpose |
-|------|---------|
-| `/mnt/Media/Configs/anime-loads/ani.json` | Bot config + watchlist |
-| `/mnt/Media/Configs/anime-loads/web-prefs.json` | Web UI preferences |
-| `/mnt/Media/data/downloads/anime/` | JDownloader download output |
-| `/mnt/Media/data/media/anime/` | Plex anime series library (move target for series/OVA/special/web) |
-| `/mnt/Media/data/media/anime movies/` | Plex anime movies library (move target for movies, `MOVIE_MEDIA_DIR`) |
-| `/mnt/Media/setup/anime-loads/` | Deployed stack on server |
-| `/mnt/Media/setup/anime-loads/.env` | TVDB API key (created from `.env.example` on first deploy) |
+Paths inside the containers are fixed; the host directories behind them are
+supplied via `.env` and bind-mounted in `docker-compose.yml`.
 
-## move-completed Behaviour
+| Container path | Purpose |
+|----------------|---------|
+| `/config/ani.json` | Bot config + watchlist |
+| `/config/web-prefs.json` | Web UI preferences |
+| `/data/downloads/anime/` | JDownloader download output (`DOWNLOAD_DIR`) |
+| `/data/media/anime/` | Anime series library — move target for series/OVA/special/web (`MEDIA_DIR`) |
+| `/data/media/anime movies/` | Anime movies library — move target for movies (`MOVIE_MEDIA_DIR`) |
 
-The watcher runs every 5 minutes. For each download directory:
+Host directories map to these via `.env`: `ANIME_CONFIG_DIR` → `/config`,
+`ANIME_DATA_DIR` → `/data`, `ANIME_DOWNLOAD_DIR` → JDownloader's `/output`, and
+`ANIME_SETUP_DIR` → the checked-out repo (the web container live-mounts
+`web/app.py` from it). See `.env.example` for the expected format and neutral
+example paths (e.g. `/srv/...`).
 
-1. **Skips** if any file was modified in the last 5 minutes (download still active)
+## File Mover Behaviour
+
+The mover is a background thread inside the `anime-web` service (no separate
+container). It polls every `MOVE_POLL_SECONDS` (default 300 = 5 minutes); the
+dashboard's "Move Now" button triggers a cycle immediately. For each download
+directory:
+
+1. **Skips** if any file was modified within the last `MIN_AGE_MINUTES` (default 5) — download still active
 2. **Skips** if `.part` files exist (incomplete downloads)
 3. **Cleans** leftover `.rar`/`.r00` archives once video files exist
 4. **Resolves** the download dir to an `ani.json` entry via `customPackage`/`name`
 5. **Branches** on the matched entry's `media_type`:
-   - **Movie** → moves the video to `MOVIE_MEDIA_DIR/<Title> (<Year>)/<Title> (<Year>).<ext>` (Plex Movies convention). Uses `display_title` + `year` cached on the entry. No `SxxExx` parsing.
+   - **Movie** → moves the video to `MOVIE_MEDIA_DIR/<Title> (<Year>)/<Title> (<Year>).<ext>` (`Title (Year)` movie-library convention). Uses `display_title` + `year` cached on the entry. No `SxxExx` parsing.
    - **Series / default** → parses `SxxExx` per video, applies `tvdb_season`/`episode_offset` overrides, moves into `MEDIA_DIR/<AnimeName>/S<xx>/`
 6. **Cleans up** empty download directories
-
-Set `DRY_RUN=1` in docker-compose to log actions without moving anything.
 
 ## Testing
 
@@ -241,7 +266,7 @@ The local fork (`bot/`) fixes this by:
 
 ## Dependencies
 
-- `bot/` — private fork of Pfuenzle/anime-loads (built locally via Dockerfile)
+- `bot/` — local fork of Pfuenzle/anime-loads (built locally via Dockerfile)
 - `jlesage/jdownloader-2` — JDownloader with VNC web UI
-- `alpine:latest` — move-completed watcher (with `jq` installed at runtime)
-- Docker network `arr-net` (shared with Sonarr/Radarr stack)
+- An external Docker network you create and name via `ANIME_NETWORK`; the compose
+  file joins it as `anime-net`

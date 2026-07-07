@@ -27,8 +27,7 @@ Automated anime downloading from [anime-loads.org](https://www.anime-loads.org/)
 └──────────────┘
 ```
 
-The file mover is a background thread inside the `anime-web` service, not a
-separate container.
+The file mover is a background thread inside the `anime-web` service, not a separate container.
 
 ## Services
 
@@ -48,17 +47,13 @@ cp .env.example .env
 # (compose fails fast if any are unset). The TVDB API key is optional.
 ```
 
-`.env.example` documents every variable. The required block (`ANIME_*` host
-paths, `ANIME_NETWORK`, `PUID`/`PGID`, `DOCKER_GID`) has no defaults, so an unset
-value stops the deploy loudly rather than guessing.
+`.env.example` documents every variable. The required block (`ANIME_*` host paths, `ANIME_NETWORK`, `PUID`/`PGID`, `DOCKER_GID`) has no defaults, so an unset value stops the deploy loudly rather than guessing.
 
-The TVDB API key is free — get one at https://thetvdb.com/dashboard/account/apikey.
-If omitted, the stack works without TVDB features.
+The TVDB API key is free — get one at https://thetvdb.com/dashboard/account/apikey. If omitted, the stack works without TVDB features.
 
 ### 2. Deploy
 
-The containers join an existing **external** Docker network whose name you set as
-`ANIME_NETWORK` in `.env`. Create it once if it doesn't already exist:
+The containers join an existing **external** Docker network whose name you set as `ANIME_NETWORK` in `.env`. Create it once if it doesn't already exist:
 
 ```bash
 docker network create anime-net   # name must match ANIME_NETWORK in .env
@@ -70,8 +65,7 @@ Then build and start the stack from the repo root:
 docker compose up -d --build
 ```
 
-This builds the bot image from `bot/` and starts all three services. Re-run the
-same command after pulling changes to rebuild and restart.
+This builds the bot image from `bot/` and starts all three services. Re-run the same command after pulling changes to rebuild and restart.
 
 > Homelab/submodule deployments may wrap this in their own tooling; the command
 > above is the self-contained path from a fresh clone.
@@ -88,8 +82,7 @@ The ExternInterface settings are required for the anime-loads bot container to r
 
 ### 4. Anime-Loads Bot Config
 
-The bot config lives at `/config/ani.json` inside the container — i.e. the
-`ani.json` in the host directory you set as `ANIME_CONFIG_DIR`.
+The bot config lives at `/config/ani.json` inside the container — i.e. the `ani.json` in the host directory you set as `ANIME_CONFIG_DIR`.
 
 Settings in `ani.json > settings`:
 
@@ -142,17 +135,11 @@ The bot and web UI share `ani.json`. Anime entries:
 
 ### TVDB Integration
 
-Each anime-loads.org URL represents one season of a series. Release groups often
-mislabel season numbers in filenames (e.g., `S01E01` for what is actually Season 2),
-causing the file mover to place files in the wrong season folder.
+Each anime-loads.org URL represents one season of a series. Release groups often mislabel season numbers in filenames (e.g., `S01E01` for what is actually Season 2), causing the file mover to place files in the wrong season folder.
 
-The TVDB fields solve this by letting the user map each anime-loads entry to the
-correct TVDB series and season. The mover then overrides the filename's season
-number when organising files.
+The TVDB fields solve this by letting the user map each anime-loads entry to the correct TVDB series and season. The mover then overrides the filename's season number when organising files.
 
-**Example:** "Sousou no Frieren Dai 2 Ki" on anime-loads.org is Season 2, but
-releases may name files `Frieren.S01E01.mkv`. With `tvdb_season: 2` set, the file
-is moved to `Frieren/S02/` instead of `Frieren/S01/`.
+**Example:** "Sousou no Frieren Dai 2 Ki" on anime-loads.org is Season 2, but releases may name files `Frieren.S01E01.mkv`. With `tvdb_season: 2` set, the file is moved to `Frieren/S02/` instead of `Frieren/S01/`.
 
 **How it works:**
 
@@ -163,39 +150,29 @@ is moved to `Frieren/S02/` instead of `Frieren/S01/`.
 4. The mover reads `tvdb_season` and `episode_offset` from `ani.json` and
    overrides the season/episode numbers parsed from filenames
 
-**`episode_offset`** handles cases where anime-loads numbers episodes from 1 but
-TVDB continues from a previous season (e.g., offset 12 turns ep 1 into E13). Most
-anime restart at E01 per season, so the default of 0 is usually correct.
+**`episode_offset`** handles cases where anime-loads numbers episodes from 1 but TVDB continues from a previous season (e.g., offset 12 turns ep 1 into E13). Most anime restart at E01 per season, so the default of 0 is usually correct.
 
-If no TVDB API key is configured, all TVDB features are hidden and the stack works
-exactly as before.
+If no TVDB API key is configured, all TVDB features are hidden and the stack works exactly as before.
 
 ### Smart Skip-Checking
 
-The bot avoids unnecessary Selenium scrapes by checking completion status before
-launching a browser. Each cycle, for every entry:
+The bot avoids unnecessary Selenium scrapes by checking completion status before launching a browser. Each cycle, for every entry:
 
 1. **Already complete?** — entries with `complete: true` and no missing episodes are
    skipped entirely (no Selenium, no HTTP)
 2. **Next episode not aired?** — if `skip_until` is set and in the future, the entry
-   is deferred until that date. For a real TVDB airdate (`skip_real_airdate: true`) the
-   bot scrapes from `EARLY_SCRAPE_DAYS` (default 1) before the date, to catch episodes
-   anime-loads.org publishes early; synthetic throttle dates are honored strictly.
+   is deferred until that date. For a real TVDB airdate (`skip_real_airdate: true`) the bot scrapes from `EARLY_SCRAPE_DAYS` (default 1) before the date, to catch episodes anime-loads.org publishes early; synthetic throttle dates are honored strictly.
 3. **TVDB status check** (lightweight HTTP, no Selenium) — if the entry has a `tvdb_id`:
    - Series status is `"Ended"` and all episodes downloaded → mark `complete`, skip
    - Series status is `"Continuing"` → fetch next episode airdate, set `skip_until`
 4. **Normal check** — Selenium scrape runs, and after processing, the bot caches
-   `al_status` and `al_max_episodes`. If anime-loads.org reports the series as
-   `"Abgeschlossen"`/`"Completed"` and all episodes are downloaded, the entry is
-   marked `complete`.
+   `al_status` and `al_max_episodes`. If anime-loads.org reports the series as `"Abgeschlossen"`/`"Completed"` and all episodes are downloaded, the entry is marked `complete`.
 
-Completion is automatic. To re-enable checking (e.g. surprise continuation), use the
-"Mark Incomplete" button on the dashboard.
+Completion is automatic. To re-enable checking (e.g. surprise continuation), use the "Mark Incomplete" button on the dashboard.
 
 ## File Paths
 
-Paths inside the containers are fixed; the host directories behind them are
-supplied via `.env` and bind-mounted in `docker-compose.yml`.
+Paths inside the containers are fixed; the host directories behind them are supplied via `.env` and bind-mounted in `docker-compose.yml`.
 
 | Container path | Purpose |
 |----------------|---------|
@@ -205,18 +182,11 @@ supplied via `.env` and bind-mounted in `docker-compose.yml`.
 | `/data/media/anime/` | Anime series library — move target for series/OVA/special/web (`MEDIA_DIR`) |
 | `/data/media/anime movies/` | Anime movies library — move target for movies (`MOVIE_MEDIA_DIR`) |
 
-Host directories map to these via `.env`: `ANIME_CONFIG_DIR` → `/config`,
-`ANIME_DATA_DIR` → `/data`, `ANIME_DOWNLOAD_DIR` → JDownloader's `/output`, and
-`ANIME_SETUP_DIR` → the checked-out repo (the web container live-mounts
-`web/app.py` from it). See `.env.example` for the expected format and neutral
-example paths (e.g. `/srv/...`).
+Host directories map to these via `.env`: `ANIME_CONFIG_DIR` → `/config`, `ANIME_DATA_DIR` → `/data`, `ANIME_DOWNLOAD_DIR` → JDownloader's `/output`, and `ANIME_SETUP_DIR` → the checked-out repo (the web container live-mounts `web/app.py` from it). See `.env.example` for the expected format and neutral example paths (e.g. `/srv/...`).
 
 ## File Mover Behaviour
 
-The mover is a background thread inside the `anime-web` service (no separate
-container). It polls every `MOVE_POLL_SECONDS` (default 300 = 5 minutes); the
-dashboard's "Move Now" button triggers a cycle immediately. For each download
-directory:
+The mover is a background thread inside the `anime-web` service (no separate container). It polls every `MOVE_POLL_SECONDS` (default 300 = 5 minutes); the dashboard's "Move Now" button triggers a cycle immediately. For each download directory:
 
 1. **Skips** if any file was modified within the last `MIN_AGE_MINUTES` (default 5) — download still active
 2. **Skips** if `.part` files exist (incomplete downloads)
@@ -229,19 +199,14 @@ directory:
 
 ## Testing
 
-A lightweight, hermetic test suite covers the pure-logic functions (release
-matching, language prefs, filename/season parsing, the early-release skip
-helper). It uses stdlib `unittest` only — no extra runtime deps, no network,
-Selenium, Docker, or filesystem dependence.
+A lightweight, hermetic test suite covers the pure-logic functions (release matching, language prefs, filename/season parsing, the early-release skip helper). It uses stdlib `unittest` only — no extra runtime deps, no network, Selenium, Docker, or filesystem dependence.
 
 ```bash
 PYTHONPATH=bot python -m unittest discover tests
 ```
 
 The tests import `web/app.py` and `bot/anibot.py` directly; both are
-import-safe (their server/CLI entry points are guarded by `__name__ ==
-"__main__"`), and the suite stubs the bot's optional heavy deps so they need
-not be installed.
+import-safe (their server/CLI entry points are guarded by `__name__ == "__main__"`), and the suite stubs the bot's optional heavy deps so they need not be installed.
 
 ## Bot Fork Details
 

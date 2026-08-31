@@ -709,7 +709,7 @@ class utils:
                 "all_hashes": images_url,
                 "result": "pending"
             }
-            with open(os.path.join(log_dir, "decision.json"), "w") as f:
+            with open(os.path.join(log_dir, "decision.json"), "w", encoding="utf-8") as f:
                 json.dump(decision, f, indent=2)
             # Cleanup: keep only last 50 captcha logs
             try:
@@ -751,7 +751,7 @@ class utils:
             try:
                 decision["result"] = "rate_limited" if is_likely_ratelimit else "verify_failed"
                 decision["server_message"] = f"rT=2 returned {repr(verify_resp)}, confidence={biggest:.0f}"
-                with open(os.path.join(log_dir, "decision.json"), "w") as f:
+                with open(os.path.join(log_dir, "decision.json"), "w", encoding="utf-8") as f:
                     json.dump(decision, f, indent=2)
             except:
                 pass
@@ -779,7 +779,7 @@ class utils:
         try:
             decision["result"] = response_json.get("code", "unknown")
             decision["server_message"] = str(response_json.get("message", ""))
-            with open(os.path.join(log_dir, "decision.json"), "w") as f:
+            with open(os.path.join(log_dir, "decision.json"), "w", encoding="utf-8") as f:
                 json.dump(decision, f, indent=2)
         except:
             pass

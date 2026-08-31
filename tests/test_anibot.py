@@ -1,10 +1,12 @@
 """Tests for the pure-logic helpers in bot/anibot.py."""
 
+import builtins
 import json
 import os
 import tempfile
 import unittest
 from datetime import date
+from unittest import mock
 
 import support
 
@@ -194,6 +196,86 @@ class WriteRunStateTest(unittest.TestCase):
                           "skipped", "unavailable"})
         self.assertEqual(set(last["events"][0].keys()),
                          {"kind", "anime", "episodes"})
+
+
+class ConfigUtf8Test(unittest.TestCase):
+    """loadconfig/write_run_state must read/write UTF-8 regardless of the
+    platform's default locale encoding (cp1252 on Windows). Fixtures are
+    written as explicit UTF-8 *bytes* (not via the platform-default `open`)
+    so a regression to a bare `open(path, "r")`/`open(path, "w")` would
+    genuinely mangle or fail these, rather than passing on any host."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-configutf8-")
+        self._orig_botfile = anibot.botfile
+        self._orig_botfolder = anibot.botfolder
+        anibot.botfile = os.path.join(self.tmp, "ani.json")
+        anibot.botfolder = self.tmp
+        self.run_state_path = os.path.join(self.tmp, "run_state.json")
+
+    def tearDown(self):
+        anibot.botfile = self._orig_botfile
+        anibot.botfolder = self._orig_botfolder
+
+    def test_loadconfig_reads_umlaut_browserlocation(self):
+        location = "C:\\Übertragung\\firefox.exe"
+        fixture = {
+            "settings": {
+                "jdhost": "127.0.0.1", "hoster": 1, "browserengine": "firefox",
+                "browserlocation": location, "pushbullet_apikey": "", "timedelay": 600,
+                "myjd_user": "u", "myjd_pw": "p", "myjd_device": "d",
+                "jd_deprecated": False, "jd_deprecatedport": 0,
+            }
+        }
+        with open(anibot.botfile, "wb") as f:
+            f.write(json.dumps(fixture, ensure_ascii=False).encode("utf-8"))
+        result = anibot.loadconfig()
+        self.assertEqual(result[3], location)  # browserlocation
+
+    def test_write_run_state_write_open_uses_utf8_encoding(self):
+        # A content round-trip can't catch a missing encoding="utf-8" on the
+        # *write* side here: write_run_state's json.dump call keeps the
+        # default ensure_ascii=True, so non-ASCII output is always escaped to
+        # plain-ASCII \uXXXX sequences regardless of which codec the file was
+        # opened with — a round-trip test would pass identically whether or
+        # not the fix is applied (confirmed: reverting just the write-side
+        # `open(tmp, "w", ...)` back to platform-default left a pure-content
+        # round-trip test green). So this asserts the open() call itself
+        # instead, which does regress if the encoding kwarg is dropped.
+        real_open = builtins.open
+        write_calls = []
+
+        def spy_open(file, mode="r", *args, **kwargs):
+            if isinstance(file, str) and file.endswith(".tmp") and mode == "w":
+                write_calls.append(kwargs.get("encoding"))
+            return real_open(file, mode, *args, **kwargs)
+
+        with mock.patch("builtins.open", side_effect=spy_open):
+            anibot.write_run_state(
+                "2026-06-13T19:18:00Z", "2026-06-13T19:20:00Z", 600, {"checked": 1},
+                [{"kind": "unavailable", "anime": "Naruto", "detail": "skip — already have"}],
+            )
+        self.assertEqual(write_calls, ["utf-8"])
+
+    def test_write_run_state_preserves_existing_umlaut_history(self):
+        # A run_state.json written by a previous cycle may itself contain
+        # non-ASCII bytes; the read side must decode it as UTF-8 rather than
+        # the platform default before appending the new record.
+        fixture = {
+            "schema": 1,
+            "last_run": {"finished_ts": "2026-06-13T19:00:00Z",
+                         "counts": {}, "events": [{"kind": "complete", "anime": "Ü-Anime"}]},
+            "runs": [{"finished_ts": "2026-06-13T19:00:00Z", "counts": {},
+                      "events": [{"kind": "complete", "anime": "Ü-Anime"}]}],
+        }
+        with open(self.run_state_path, "wb") as f:
+            f.write(json.dumps(fixture, ensure_ascii=False).encode("utf-8"))
+        anibot.write_run_state("2026-06-13T19:10:00Z", "2026-06-13T19:11:00Z", 600, {"checked": 2})
+        with open(self.run_state_path, "rb") as f:
+            raw = f.read()
+        state = json.loads(raw.decode("utf-8"))
+        self.assertEqual(state["runs"][0]["events"][0]["anime"], "Ü-Anime")
+        self.assertEqual(len(state["runs"]), 2)
 
 
 class RecordEventTest(unittest.TestCase):

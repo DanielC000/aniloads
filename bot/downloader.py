@@ -26,7 +26,7 @@ def compare(inputstring, validlist):
 def settings():
     try:
         os.makedirs(os.path.dirname(settingsfolder), exist_ok=True)
-        file = open(settingsfile, "r")
+        file = open(settingsfile, "r", encoding="utf-8")
         jdata = json.load(file)
         for key in jdata:
             if(key == "jdhost"):
@@ -193,13 +193,13 @@ def settings():
     jdata = json.dumps(data, indent=4, sort_keys=True)
 
     os.makedirs(os.path.dirname(settingsfolder), exist_ok=True)
-    file = open(settingsfile, "w")
+    file = open(settingsfile, "w", encoding="utf-8")
     file.write(jdata)
     file.close()
 
 def loadSettings():
     os.makedirs(os.path.dirname(settingsfolder), exist_ok=True)
-    file = open(settingsfile, "r")
+    file = open(settingsfile, "r", encoding="utf-8")
     jdata = json.load(file)
     for key in jdata:
         if(key == "jdhost"):
@@ -540,7 +540,7 @@ if(arglen > 1):
         if(sys.argv[i] == "-- settings"):
             try:
                 settingsfile = sys.argv[i+1]
-                file = open(settingsfile, "r")
+                file = open(settingsfile, "r", encoding="utf-8")
                 jdata = json.load(file)
                 for key in jdata:
                     if(key == "jdhost"):

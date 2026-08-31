@@ -192,12 +192,17 @@ def write_run_state(started_ts, finished_ts, timedelay, counts, events=None):
             record["events_truncated"] = True
         path = _run_state_path()
         try:
-            with open(path, "r") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 prev = json.load(f)
             runs = prev.get("runs")
             if not isinstance(runs, list):
                 runs = []
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+        # ValueError also covers UnicodeDecodeError (a corrupt/non-UTF-8 file):
+        # both it and json.JSONDecodeError subclass ValueError, so this degrades
+        # a bad previous-state file to a fresh history instead of losing the
+        # whole write, without swallowing an unrelated bug as if it were a
+        # corrupt file.
+        except (FileNotFoundError, OSError, ValueError):
             runs = []
         runs.append(record)
         if len(runs) > RUN_STATE_HISTORY_MAX:
@@ -207,7 +212,7 @@ def write_run_state(started_ts, finished_ts, timedelay, counts, events=None):
         if d:
             os.makedirs(d, exist_ok=True)
         tmp = path + ".tmp"
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
         os.replace(tmp, path)
     except Exception:
@@ -217,7 +222,7 @@ def write_run_state(started_ts, finished_ts, timedelay, counts, events=None):
 def loadconfig():
     try:
         os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-        infile = open(botfile, "r")
+        infile = open(botfile, "r", encoding="utf-8")
         data = json.load(infile)
         infile.close()
     except Exception as e:
@@ -260,7 +265,7 @@ def loadconfig():
 def editconfig():
     try:
         os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-        infile = open(botfile, "r")
+        infile = open(botfile, "r", encoding="utf-8")
         data = json.load(infile)
         infile.close()
         for key in data:
@@ -449,7 +454,7 @@ def editconfig():
 
     try:
         os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-        f = open(botfile, "r")
+        f = open(botfile, "r", encoding="utf-8")
         data = json.load(f)
         infile.close()
     except:
@@ -458,14 +463,14 @@ def editconfig():
     if(ani_exists):
         data['settings'] = settingsdata
         os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-        jfile = open(botfile, "w")
+        jfile = open(botfile, "w", encoding="utf-8")
         jfile.write(json.dumps(data, indent=4, sort_keys=True))
         jfile.flush()
         jfile.close
     else:
         settingsdata = {"settings": settingsdata}
         os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-        jfile = open(botfile, "w")
+        jfile = open(botfile, "w", encoding="utf-8")
         jfile.write(json.dumps(settingsdata, indent=4, sort_keys=True))
         jfile.flush()
         jfile.close
@@ -570,7 +575,7 @@ def addAnime():
             }
         
             os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-            f = open(botfile, "r")
+            f = open(botfile, "r", encoding="utf-8")
             data = json.load(f)
             f.close()
 
@@ -585,7 +590,7 @@ def addAnime():
                 data['anime'] = fullanimedata 
                 haveAddedAnime = True
                 os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-                jfile = open(botfile, "w")
+                jfile = open(botfile, "w", encoding="utf-8")
                 jfile.write(json.dumps(data, indent=4, sort_keys=True))
                 jfile.flush()
                 jfile.close()
@@ -609,7 +614,7 @@ def addAnime():
 
 
                     os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-                    jfile = open(botfile, "w")
+                    jfile = open(botfile, "w", encoding="utf-8")
                     jfile.write(json.dumps(data, indent=4, sort_keys=True))
                     jfile.flush()
                     jfile.close()
@@ -736,7 +741,7 @@ def addAnime():
                 }
 
             os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-            f = open(botfile, "r")
+            f = open(botfile, "r", encoding="utf-8")
             data = json.load(f)
             f.close()
 
@@ -751,7 +756,7 @@ def addAnime():
                 data['anime'] = fullanimedata 
                 haveAddedAnime = True
                 os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-                jfile = open(botfile, "w")
+                jfile = open(botfile, "w", encoding="utf-8")
                 jfile.write(json.dumps(data, indent=4, sort_keys=True))
                 jfile.flush()
                 jfile.close()
@@ -773,7 +778,7 @@ def addAnime():
 #                animedata = {"anime": animedata}
 #                data.append(animedata)
                     os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-                    jfile = open(botfile, "w")
+                    jfile = open(botfile, "w", encoding="utf-8")
                     jfile.write(json.dumps(data, indent=4, sort_keys=True))
                     jfile.flush()
                     jfile.close()
@@ -974,7 +979,7 @@ def startbot():
                       "skipped": 0, "unavailable": 0, "mismatch": 0}
         events = []
         os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-        f = open(botfile, "r")
+        f = open(botfile, "r", encoding="utf-8")
         data = json.load(f)
         f.close()
 
@@ -996,7 +1001,7 @@ def startbot():
 
         def save_ani():
             os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-            jfile = open(botfile, "w")
+            jfile = open(botfile, "w", encoding="utf-8")
             jfile.write(json.dumps(data, indent=4, sort_keys=True))
             jfile.flush()
             jfile.close()
@@ -1373,7 +1378,7 @@ def removeAnime():
         jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, al_user, al_pass = loadconfig()
 
     os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-    f = open(botfile, "r")
+    f = open(botfile, "r", encoding="utf-8")
     data = json.load(f)
     f.close()
 
@@ -1398,7 +1403,7 @@ def removeAnime():
                     sel_int = int(selection) - 1
                     data['anime'].pop(sel_int)
                     os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-                    jfile = open(botfile, "w")
+                    jfile = open(botfile, "w", encoding="utf-8")
                     jfile.write(json.dumps(data, indent=4, sort_keys=True))
                     jfile.flush()
                     jfile.close()

@@ -134,6 +134,7 @@ def _boot_backoff(attempt, cap=300):
 # a future run-history UI can render one summary per run from it.
 RUN_STATE_FILE = "run_state.json"
 RUN_STATE_HISTORY_MAX = 50
+EVENTS_CAP = 40
 
 def _utcnow_iso():
     """UTC timestamp as RFC3339-ish ISO8601 with a trailing Z. Matches the
@@ -145,14 +146,31 @@ def _run_state_path():
     botfile so a --configfile override keeps the record next to the config."""
     return os.path.join(os.path.dirname(botfile) or ".", RUN_STATE_FILE)
 
-def write_run_state(started_ts, finished_ts, timedelay, counts):
+def _record_event(events, kind, anime, episodes=None, detail=None):
+    """Append one bounded run-state event to `events` (mutated in place).
+
+    Kept deliberately simple (no try/except) — event collection runs inline in
+    the hot scrape loop and must never introduce an exception path into a
+    cycle. `detail` is truncated to 200 chars; callers must never pass a URL,
+    credential, or JD host/port (run_state.json is dashboard-visible)."""
+    event = {"kind": kind, "anime": anime}
+    if episodes:
+        event["episodes"] = list(episodes)
+    if detail:
+        event["detail"] = str(detail)[:200]
+    events.append(event)
+
+def write_run_state(started_ts, finished_ts, timedelay, counts, events=None):
     """Persist one per-cycle run-state record and append it to a bounded history.
 
     Best-effort: a write failure must never break the bot loop, so all errors
     are swallowed. Written atomically (tmp + os.replace) so the dashboard never
     reads a half-written file. `counts` is a free-form dict (entries/checked/
-    downloaded today) — kept open so a future run-summary UI can grow it without
-    a schema bump."""
+    downloaded/errors/skipped/unavailable today). `events` is an ordered list
+    of what actually happened this cycle (download/error/unavailable/complete),
+    capped at EVENTS_CAP entries — the first EVENTS_CAP are kept and
+    `events_truncated` is set when the cap clipped the list; `counts` stays
+    authoritative regardless of clipping."""
     try:
         next_run_ts = ""
         if isinstance(timedelay, int) and timedelay > 0:
@@ -161,13 +179,17 @@ def write_run_state(started_ts, finished_ts, timedelay, counts):
                 next_run_ts = (fin + timedelta(seconds=timedelay)).strftime("%Y-%m-%dT%H:%M:%SZ")
             except (ValueError, TypeError):
                 next_run_ts = ""
+        events = events or []
         record = {
             "started_ts": started_ts,
             "finished_ts": finished_ts,
             "timedelay": timedelay,
             "next_run_ts": next_run_ts,
             "counts": counts,
+            "events": events[:EVENTS_CAP],
         }
+        if len(events) > EVENTS_CAP:
+            record["events_truncated"] = True
         path = _run_state_path()
         try:
             with open(path, "r") as f:
@@ -761,7 +783,7 @@ def addAnime():
 
 
 def handle_failed_batch(batch_result, all_wanted, animeentry, run_counts,
-                        today_iso, name, push, log_fn=log):
+                        today_iso, name, push, log_fn=log, events=None):
     """Apply the outcome of a failed ``downloadBatchCNL`` to bot state.
 
     Distinguishes two cases that ``downloadBatchCNL`` cannot tell apart on its
@@ -782,8 +804,9 @@ def handle_failed_batch(batch_result, all_wanted, animeentry, run_counts,
     so the daily revalidation keeps working and genuinely-new episodes recover.
 
     Returns ``True`` when the cap was refreshed (caller should ``save_ani()``),
-    ``False`` otherwise. Mutates ``animeentry`` and ``run_counts`` in place;
-    performs no I/O of its own, which keeps it unit-testable.
+    ``False`` otherwise. Mutates ``animeentry``, ``run_counts`` and (when
+    passed) ``events`` in place; performs no I/O of its own, which keeps it
+    unit-testable.
     """
     reason = batch_result.get("reason", "unbekannt")
     batch_max = batch_result.get("available_max")
@@ -793,9 +816,15 @@ def handle_failed_batch(batch_result, all_wanted, animeentry, run_counts,
         log_fn("[UNAVAILABLE] " + name + ": keine Downloadlinks für gewünschte "
                "Episoden — verfügbar bis Episode " + str(batch_max)
                + ", markiere als nicht verfügbar", push)
+        run_counts["unavailable"] = run_counts.get("unavailable", 0) + 1
+        if events is not None:
+            _record_event(events, "unavailable", name, episodes=all_wanted,
+                          detail="No download links available (max episode " + str(batch_max) + ")")
     else:
         run_counts["errors"] += 1
         log_fn("[ERROR] Batch-CNL fehlgeschlagen für " + name + ": " + reason + " — überspringe", push)
+        if events is not None:
+            _record_event(events, "error", name, episodes=all_wanted, detail=reason)
     if batch_max is not None:
         animeentry['al_available_max'] = batch_max
         animeentry['al_available_max_set_at'] = today_iso
@@ -925,7 +954,9 @@ def startbot():
         # Per-cycle run-state bookkeeping (persisted for the dashboard's
         # last_run/next_run, independent of the rolling log tail).
         run_started = _utcnow_iso()
-        run_counts = {"entries": 0, "checked": 0, "downloaded": 0, "errors": 0}
+        run_counts = {"entries": 0, "checked": 0, "downloaded": 0, "errors": 0,
+                      "skipped": 0, "unavailable": 0}
+        events = []
         os.makedirs(os.path.dirname(botfolder), exist_ok=True)
         f = open(botfile, "r")
         data = json.load(f)
@@ -943,7 +974,7 @@ def startbot():
             # dashboard are picked up without a manual container restart.
             recheck = timedelay if isinstance(timedelay, int) and timedelay > 0 else 600
             _log.info("Keine Anime in der Liste — erneute Pruefung in " + str(recheck) + " Sekunden")
-            write_run_state(run_started, _utcnow_iso(), recheck, run_counts)
+            write_run_state(run_started, _utcnow_iso(), recheck, run_counts, events)
             time.sleep(recheck)
             continue
 
@@ -983,6 +1014,7 @@ def startbot():
                 # Step 1: Already marked complete and no missing episodes
                 if animeentry.get('complete') and len(missingEpisodes) == 0:
                     _log.info("[SKIP] " + name + " is complete")
+                    run_counts["skipped"] += 1
                     continue
 
                 # Step 2: Check cached anime-loads.org status (no network call)
@@ -994,6 +1026,7 @@ def startbot():
                     _log.info("[COMPLETE] " + name + " — al_status: " + al_status + ", all " + str(al_max) + " episodes downloaded")
                     animeentry['complete'] = True
                     save_ani()
+                    run_counts["skipped"] += 1
                     continue
 
                 # Step 3: Waiting for next episode airdate (skip_until).
@@ -1016,6 +1049,7 @@ def startbot():
                     if honor_skip:
                         if len(missingEpisodes) == 0:
                             _log.info("[SKIP] " + name + " — next episode airs " + skip_until)
+                            run_counts["skipped"] += 1
                             continue
                         else:
                             _log.info("[RETRY] " + name + " — next episode airs " + skip_until
@@ -1042,6 +1076,7 @@ def startbot():
                                 _log.info("[COMPLETE] " + name + " — series ended, all episodes downloaded")
                                 animeentry['complete'] = True
                                 save_ani()
+                                run_counts["skipped"] += 1
                                 continue
 
                         elif series_status == "Continuing" and tvdb_season:
@@ -1062,6 +1097,7 @@ def startbot():
                                                       + ", scraping within " + str(EARLY_SCRAPE_DAYS) + "d for early release")
                                         elif len(missingEpisodes) == 0:
                                             _log.info("[SKIP] " + name + " — next episode airs " + airdate)
+                                            run_counts["skipped"] += 1
                                             continue
                                         else:
                                             _log.info("[RETRY] " + name + " — next episode airs " + airdate
@@ -1079,6 +1115,7 @@ def startbot():
                                 save_ani()
                                 if len(missingEpisodes) == 0:
                                     _log.info("[SKIP] " + name + " — no airdate known, re-check " + default_skip)
+                                    run_counts["skipped"] += 1
                                     continue
                                 else:
                                     _log.info("[RETRY] " + name + " — no airdate known, re-check " + default_skip
@@ -1092,6 +1129,9 @@ def startbot():
                     release = anime.getReleases()[releaseID-1]
                 except:
                     _log.warning("Failed to get Anime, skipping...")
+                    run_counts["checked"] += 1
+                    run_counts["errors"] += 1
+                    _record_event(events, "error", name, detail="Failed to fetch anime data")
                     continue
 
                 now = datetime.now()
@@ -1165,6 +1205,8 @@ def startbot():
                     if not al.username or al.username == "anonymous":
                         run_counts["errors"] += 1
                         log("[ERROR] " + name + ": Login erforderlich für Batch-CNL (" + str(len(all_wanted)) + " Episoden) — überspringe", pb)
+                        _record_event(events, "error", name, episodes=all_wanted,
+                                      detail="Login required for batch download")
                     else:
                         try:
                             log("[BATCH] Versuche Batch-Download für " + str(len(all_wanted)) + " Episoden von " + name, pb)
@@ -1179,6 +1221,7 @@ def startbot():
                                 batch_sent = set(batch_result["episodes_sent"])
                                 run_counts["downloaded"] += len(batch_sent)
                                 log("[BATCH] " + str(len(batch_sent)) + " Episoden von " + name + " zu JDownloader hinzugefügt", pb)
+                                _record_event(events, "download", name, episodes=sorted(batch_sent))
                                 # Record actual available max from CNL data (authoritative; DOM may over-report)
                                 batch_max = batch_result.get("available_max")
                                 if batch_max is not None:
@@ -1208,12 +1251,15 @@ def startbot():
                                 # (see handle_failed_batch). save_ani() stays here so the
                                 # helper remains pure/testable.
                                 if handle_failed_batch(batch_result, all_wanted, animeentry,
-                                                       run_counts, today_iso, name, pb):
+                                                       run_counts, today_iso, name, pb,
+                                                       events=events):
                                     save_ani()
                         except Exception as e:
                             printException(e)
                             run_counts["errors"] += 1
                             log("[ERROR] Batch-CNL fehlgeschlagen für " + name + ": " + str(e) + " — überspringe", pb)
+                            _record_event(events, "error", name, episodes=all_wanted,
+                                          detail="Batch-CNL failed: " + type(e).__name__)
 
                 elif len(all_wanted) == 1:
                     # Single episode: use per-episode download
@@ -1246,8 +1292,12 @@ def startbot():
                         if release_pattern:
                             animeentry['download_folder_pattern'] = release_pattern
                         save_ani()
+                        _record_event(events, "download", name, episodes=[ep])
                     elif ep_unavailable:
                         log("[UNAVAILABLE] Episode " + str(ep) + " von " + name + " — keine Downloadlinks, markiere als nicht verfügbar", pb)
+                        run_counts["unavailable"] += 1
+                        _record_event(events, "unavailable", name, episodes=[ep],
+                                      detail="No download links available")
                         # Cap al_available_max so we stop asking for this (or higher) ep
                         prev_max = animeentry.get('al_available_max')
                         new_max = ep - 1
@@ -1264,9 +1314,12 @@ def startbot():
                     elif isinstance(dl_ret, Exception):
                         run_counts["errors"] += 1
                         log("[ERROR] Episode " + str(ep) + " von " + name + ": " + str(dl_ret), pb)
+                        _record_event(events, "error", name, episodes=[ep],
+                                      detail="Download failed: " + type(dl_ret).__name__)
                     else:
                         run_counts["errors"] += 1
                         log("[ERROR] Episode " + str(ep) + " von " + name + ": JDownloader nicht erreichbar?", pb)
+                        _record_event(events, "error", name, episodes=[ep], detail="JDownloader unreachable")
                         # Transient failure: don't mutate state — next run will retry naturally
 
                 else:
@@ -1281,6 +1334,7 @@ def startbot():
                         _log.info("[COMPLETE] " + name + " — movie release downloaded")
                         animeentry['complete'] = True
                         save_ani()
+                        _record_event(events, "complete", name)
                 elif anime.status in ("Abgeschlossen", "Completed") \
                         and anime.maxEpisodes != 999999 \
                         and animeentry['episodes'] >= anime.maxEpisodes \
@@ -1288,7 +1342,8 @@ def startbot():
                     _log.info("[COMPLETE] " + name + " — anime-loads status: " + anime.status)
                     animeentry['complete'] = True
                     save_ani()
-            write_run_state(run_started, _utcnow_iso(), timedelay, run_counts)
+                    _record_event(events, "complete", name)
+            write_run_state(run_started, _utcnow_iso(), timedelay, run_counts, events)
             _log.info("Schlafe " + str(timedelay) + " Sekunden")
             time.sleep(timedelay)
 

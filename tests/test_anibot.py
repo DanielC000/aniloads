@@ -123,6 +123,97 @@ class WriteRunStateTest(unittest.TestCase):
         self.assertEqual(len(state["runs"]), 1)
         self.assertEqual(state["last_run"]["counts"]["checked"], 3)
 
+    def test_counts_carry_skipped_and_unavailable_free_form(self):
+        # Same free-form growth as errors (see test_counts_carry_errors_free_form)
+        # — skipped/unavailable ride along in counts with no schema bump.
+        anibot.write_run_state(
+            "2026-06-13T19:18:00Z", "2026-06-13T19:20:00Z", 600,
+            {"entries": 8, "checked": 5, "downloaded": 2, "errors": 1,
+             "skipped": 3, "unavailable": 1},
+        )
+        counts = self._read()["last_run"]["counts"]
+        self.assertEqual(counts["skipped"], 3)
+        self.assertEqual(counts["unavailable"], 1)
+
+    def test_events_persisted_for_all_four_kinds(self):
+        events = [
+            {"kind": "download", "anime": "Gantz", "episodes": [1, 2]},
+            {"kind": "error", "anime": "Bleach", "episodes": [5], "detail": "JDownloader unreachable"},
+            {"kind": "unavailable", "anime": "Naruto", "episodes": [700], "detail": "No download links available"},
+            {"kind": "complete", "anime": "One Piece"},
+        ]
+        anibot.write_run_state(
+            "2026-06-13T19:18:00Z", "2026-06-13T19:20:00Z", 600,
+            {"entries": 4, "checked": 4, "downloaded": 2, "errors": 1,
+             "skipped": 0, "unavailable": 1},
+            events,
+        )
+        last = self._read()["last_run"]
+        self.assertEqual([e["kind"] for e in last["events"]],
+                         ["download", "error", "unavailable", "complete"])
+        self.assertNotIn("events_truncated", last)
+
+    def test_events_capped_at_40_and_truncated_flag_set(self):
+        events = [{"kind": "download", "anime": "Show %d" % i, "episodes": [1]}
+                  for i in range(45)]
+        anibot.write_run_state(
+            "2026-06-13T19:18:00Z", "2026-06-13T19:20:00Z", 600, {}, events)
+        last = self._read()["last_run"]
+        self.assertEqual(len(last["events"]), anibot.EVENTS_CAP)
+        self.assertTrue(last["events_truncated"])
+        # First 40 kept in order, not an arbitrary/last-40 slice.
+        self.assertEqual(last["events"][0]["anime"], "Show 0")
+        self.assertEqual(last["events"][-1]["anime"], "Show 39")
+
+    def test_no_events_still_writes_cleanly(self):
+        # Routine cycle: nothing happened, events stays empty, no crash.
+        anibot.write_run_state(
+            "2026-06-13T19:18:00Z", "2026-06-13T19:20:00Z", 600,
+            {"entries": 0, "checked": 0, "downloaded": 0, "errors": 0,
+             "skipped": 0, "unavailable": 0},
+        )
+        last = self._read()["last_run"]
+        self.assertEqual(last["events"], [])
+        self.assertNotIn("events_truncated", last)
+
+    def test_record_matches_fixed_schema_keys(self):
+        # Locks the exact key names the sibling web card renders against.
+        events = [{"kind": "download", "anime": "Gantz", "episodes": [1]}]
+        anibot.write_run_state(
+            "2026-06-13T19:18:00Z", "2026-06-13T19:20:00Z", 600,
+            {"entries": 1, "checked": 1, "downloaded": 1, "errors": 0,
+             "skipped": 0, "unavailable": 0},
+            events,
+        )
+        last = self._read()["last_run"]
+        self.assertEqual(set(last.keys()),
+                         {"started_ts", "finished_ts", "timedelay",
+                          "next_run_ts", "counts", "events"})
+        self.assertEqual(set(last["counts"].keys()),
+                         {"entries", "checked", "downloaded", "errors",
+                          "skipped", "unavailable"})
+        self.assertEqual(set(last["events"][0].keys()),
+                         {"kind", "anime", "episodes"})
+
+
+class RecordEventTest(unittest.TestCase):
+    """`_record_event` is the shared append helper every event call site uses."""
+
+    def test_episodes_omitted_when_absent(self):
+        events = []
+        anibot._record_event(events, "complete", "One Piece")
+        self.assertEqual(events, [{"kind": "complete", "anime": "One Piece"}])
+
+    def test_episodes_included_when_present(self):
+        events = []
+        anibot._record_event(events, "download", "Gantz", episodes=[1, 2, 3])
+        self.assertEqual(events[0]["episodes"], [1, 2, 3])
+
+    def test_detail_truncated_to_200_chars(self):
+        events = []
+        anibot._record_event(events, "error", "Show", detail="x" * 300)
+        self.assertEqual(len(events[0]["detail"]), 200)
+
 
 class HandleFailedBatchTest(unittest.TestCase):
     """A failed downloadBatchCNL must distinguish the benign all-phantom case
@@ -204,6 +295,57 @@ class HandleFailedBatchTest(unittest.TestCase):
         self.assertEqual(entry["al_available_max"], 8)
         self.assertEqual(entry["al_available_max_set_at"], self.TODAY)
         self.assertIn("[ERROR]", self.logs[0])
+
+    def test_all_phantom_records_unavailable_event_and_count(self):
+        batch_result = {
+            "success": False,
+            "reason": "Keine gewünschten Episoden im Batch gefunden",
+            "episodes_sent": [],
+            "episodes_not_found": list(range(14, 28)),
+            "available_max": 13,
+        }
+        run_counts = {"errors": 0, "unavailable": 0}
+        events = []
+        anibot.handle_failed_batch(
+            batch_result, list(range(14, 28)), {}, run_counts,
+            self.TODAY, "Gantz", push=None, log_fn=self._log, events=events)
+        self.assertEqual(run_counts["unavailable"], 1)
+        self.assertEqual(run_counts["errors"], 0)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "unavailable")
+        self.assertEqual(events[0]["anime"], "Gantz")
+        self.assertEqual(events[0]["episodes"], list(range(14, 28)))
+        # No URL/host/credential in detail — dashboard-screenshot safe.
+        self.assertNotIn("://", events[0]["detail"])
+
+    def test_genuine_failure_records_error_event(self):
+        batch_result = {
+            "success": False,
+            "reason": "JDownloader nicht erreichbar",
+            "episodes_sent": [],
+            "episodes_not_found": [],
+            "available_max": None,
+        }
+        run_counts = {"errors": 0, "unavailable": 0}
+        events = []
+        anibot.handle_failed_batch(
+            batch_result, [3, 4, 5], {}, run_counts,
+            self.TODAY, "Bleach", push=None, log_fn=self._log, events=events)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "error")
+        self.assertEqual(events[0]["anime"], "Bleach")
+        self.assertEqual(events[0]["episodes"], [3, 4, 5])
+        self.assertEqual(events[0]["detail"], "JDownloader nicht erreichbar")
+
+    def test_events_param_is_optional(self):
+        # Existing call sites (no events kwarg) must keep working unchanged.
+        batch_result = {
+            "success": False, "reason": "x", "episodes_sent": [],
+            "episodes_not_found": [], "available_max": None,
+        }
+        saved, entry, counts = self._call(batch_result, [1])
+        self.assertFalse(saved)
+        self.assertEqual(counts["errors"], 1)
 
 
 if __name__ == "__main__":

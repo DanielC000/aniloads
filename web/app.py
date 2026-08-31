@@ -314,10 +314,14 @@ def load_run_state():
     verbose logging and made the dashboard show "No runs yet" / "—" while the
     bot was running."""
     try:
-        with open(RUN_STATE_FILE, "r") as f:
+        with open(RUN_STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    # ValueError also covers UnicodeDecodeError (a corrupt/non-UTF-8 file):
+    # both it and json.JSONDecodeError subclass ValueError, so this degrades
+    # a bad file to the empty state instead of a 500, without swallowing an
+    # unrelated bug (e.g. a TypeError) as if it were a corrupt file.
+    except (FileNotFoundError, OSError, ValueError):
         return {}
 
 
@@ -544,14 +548,16 @@ def get_activity():
 
 def load_ani():
     try:
-        with open(ANI_JSON, "r") as f:
+        with open(ANI_JSON, "r", encoding="utf-8") as f:
             return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    # ValueError also covers UnicodeDecodeError (a corrupt/non-UTF-8 file);
+    # see load_run_state's comment for why this is a deliberate widening.
+    except (FileNotFoundError, ValueError):
         return {"settings": {}, "anime": []}
 
 
 def save_ani(data):
-    with open(ANI_JSON, "w") as f:
+    with open(ANI_JSON, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, sort_keys=True)
 
 
@@ -563,20 +569,22 @@ def load_prefs():
         "auto_select": True,
     }
     try:
-        with open(PREFS_FILE, "r") as f:
+        with open(PREFS_FILE, "r", encoding="utf-8") as f:
             stored = json.load(f)
         # Back-compat: old single `language` pref maps to audio_language.
         if "language" in stored and "audio_language" not in stored:
             stored["audio_language"] = stored["language"]
         stored.pop("language", None)
         defaults.update(stored)
-    except (FileNotFoundError, json.JSONDecodeError):
+    # ValueError also covers UnicodeDecodeError (a corrupt/non-UTF-8 file);
+    # see load_run_state's comment for why this is a deliberate widening.
+    except (FileNotFoundError, ValueError):
         pass
     return defaults
 
 
 def save_prefs(prefs):
-    with open(PREFS_FILE, "w") as f:
+    with open(PREFS_FILE, "w", encoding="utf-8") as f:
         json.dump(prefs, f, indent=2)
 
 

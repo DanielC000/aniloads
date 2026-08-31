@@ -1122,6 +1122,66 @@ class WatchlistMutationKeyByUrlTest(unittest.TestCase):
                          (1, entries[1]))
 
 
+class ConfigUtf8Test(unittest.TestCase):
+    """load_ani/load_run_state must read/write UTF-8 regardless of the
+    platform's default locale encoding (cp1252 on Windows). Fixtures are
+    written as explicit UTF-8 *bytes* (not via the platform-default `open`)
+    so a regression to a bare `open(path, "r")`/`open(path, "w")` would
+    genuinely mangle or fail these, rather than passing on any host."""
+
+    def setUp(self):
+        fd, self._ani_path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        fd, self._rs_path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self._orig_ani = app.ANI_JSON
+        self._orig_rs = app.RUN_STATE_FILE
+        app.ANI_JSON = self._ani_path
+        app.RUN_STATE_FILE = self._rs_path
+
+    def tearDown(self):
+        app.ANI_JSON = self._orig_ani
+        app.RUN_STATE_FILE = self._orig_rs
+        for path in (self._ani_path, self._rs_path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def test_ani_json_umlaut_title_round_trips_through_load_and_save(self):
+        title = "Ü-Anime"
+        fixture = {"settings": {}, "anime": [{"name": title, "url": "http://x/u"}]}
+        with open(self._ani_path, "wb") as f:
+            f.write(json.dumps(fixture, ensure_ascii=False, indent=4,
+                                sort_keys=True).encode("utf-8"))
+        loaded = app.load_ani()
+        self.assertEqual(loaded["anime"][0]["name"], title)
+
+        # Save must also round-trip cleanly (write side of the same bug).
+        app.save_ani(loaded)
+        with open(self._ani_path, "rb") as f:
+            raw = f.read()
+        self.assertEqual(json.loads(raw.decode("utf-8"))["anime"][0]["name"], title)
+
+    def test_run_state_em_dash_detail_survives_read_intact(self):
+        detail = "skip — already have"
+        fixture = {"last_run": {"finished_ts": "2026-06-13T19:20:05Z", "detail": detail}}
+        with open(self._rs_path, "wb") as f:
+            f.write(json.dumps(fixture, ensure_ascii=False).encode("utf-8"))
+        loaded = app.load_run_state()
+        self.assertEqual(loaded["last_run"]["detail"], detail)
+
+    def test_undecodable_run_state_degrades_to_empty_state(self):
+        # 0x80 alone is a well-defined character under cp1252 (so a
+        # platform-default `open` would silently mangle rather than fail
+        # here) but is not valid standalone UTF-8 — reading it with
+        # encoding="utf-8" raises UnicodeDecodeError, which must degrade to
+        # {} rather than propagate as a 500.
+        with open(self._rs_path, "wb") as f:
+            f.write(b'{"last_run": {"detail": "\x80"}}')
+        self.assertEqual(app.load_run_state(), {})
+
+
 class ParseBotLogsBranchesTest(unittest.TestCase):
     """Coverage for parse_bot_logs branches beyond the BUG-3 standalone cases:
     docker-ts stripping, in-run event classification, the glued anime-name-prefix

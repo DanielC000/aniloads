@@ -400,11 +400,18 @@ def build_run_summary(record):
     run_state design) rather than the rolling log tail, so the run-history feed
     shows exactly one calm line per cycle instead of every parsed log event.
 
-    Returns plain text like "19:40 — checked 12/12 · 2 downloaded · 1 error".
-    Zero-noise segments (no downloads, no errors) are omitted, but downloads and
-    errors are always surfaced when present. A cycle that did nothing renders as
-    just its time. Returns "" when nothing is renderable (garbage record / no
-    time and no counts) so the caller can skip it."""
+    Returns plain text like
+    "19:40 — checked 2/18 · 16 skipped · 2 downloaded · 1 error". The skip
+    breakdown is what stops a bare "checked 2/18" from reading as a mystery: it
+    accounts for the entries the cycle passed over. Zero-noise segments are
+    omitted, but downloads and errors are always surfaced when present. A cycle
+    that did nothing renders as just its time. Returns "" when nothing is
+    renderable (garbage record / no time and no counts) so the caller can skip
+    it.
+
+    ``skipped`` / ``unavailable`` are optional at read time — an older record, a
+    fresh deploy, or a not-yet-redeployed bot writes neither, and such a record
+    must render exactly as it did before."""
     if not isinstance(record, dict):
         return ""
     fin = _parse_state_ts(record.get("finished_ts"))
@@ -415,12 +422,18 @@ def build_run_summary(record):
     checked = counts.get("checked")
     downloaded = counts.get("downloaded")
     errors = counts.get("errors")
+    skipped = counts.get("skipped")
+    unavailable = counts.get("unavailable")
 
     parts = []
     if entries:
         parts.append("checked {}/{}".format(checked or 0, entries))
     elif checked:
         parts.append("checked {}".format(checked))
+    if skipped:
+        parts.append("{} skipped".format(skipped))
+    if unavailable:
+        parts.append("{} unavailable".format(unavailable))
     if downloaded:
         parts.append("{} downloaded".format(downloaded))
     if errors:
@@ -1192,6 +1205,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .event--muted .event-label { color: var(--text-faint); font-weight: 500; }
   .event--muted .event-msg { color: var(--text-faint); }
 
+  /* A quiet-cycle group and a cycle's low-signal detail collapse behind the
+     same dependency-free toggle as the OK-episode panel. Rows inside are
+     server-rendered, so opening one only flips a class. */
+  .run-entry--quiet .event-msg { color: var(--text-faint); }
+  .run-detail-toggle { padding: var(--s1) 0 0; }
+  .run-detail-btn { background: none; border: none; cursor: pointer; color: var(--accent); font-size: var(--fs-xs); font-family: inherit; padding: var(--s1) 0; }
+  .run-detail-btn:hover { color: var(--accent-hover); }
+  .run-detail { display: none; }
+  .run-detail.run-detail-open { display: block; margin-top: var(--s1); padding-left: var(--s3); border-left: 2px solid var(--border-light); }
+
   /* Episode management panel */
   .ep-panel { margin-top: var(--s3); border-top: 1px solid var(--border); padding-top: var(--s2); }
   .ep-panel summary { font-size: var(--fs-xs); color: var(--text-muted); font-weight: 500; }
@@ -1380,7 +1403,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         ids.forEach(function(id) {
           var key = id.replace(/-/g, '_');
           var el = document.getElementById(id);
-          if (el && d[key] !== undefined) el.innerHTML = d[key];
+          if (el && d[key] !== undefined) {
+            // The feed re-renders every 10s. Remember which run-detail panels
+            // the reader had open (by their stable per-cycle key) and re-open
+            // them, or a poll would silently collapse what they were reading.
+            var open = openRunKeys(el);
+            el.innerHTML = d[key];
+            restoreRunKeys(el, open);
+          }
         });
         if (d.bot_running) {
           var msg = document.getElementById('status-msg');
@@ -1419,6 +1449,42 @@ function expandEps(btn) {
   var open = group.classList.toggle('ep-ok-open');
   var count = btn.dataset.count;
   btn.textContent = (open ? 'Hide ' : 'Show ') + count + ' OK episode' + (count === '1' ? '' : 's');
+}
+
+// Show/hide a run cycle's detail panel: the low-signal events (unavailable /
+// complete) and the cycles folded into a quiet group. Everything inside the
+// panel is server-rendered and already escaped, so this only flips a class —
+// no feed data ever reaches a JS string literal.
+function setRunDetail(btn, open) {
+  var panel = btn.parentNode.nextElementSibling;
+  if (!panel) return;
+  if (open) panel.classList.add('run-detail-open');
+  else panel.classList.remove('run-detail-open');
+  btn.textContent = (open ? 'Hide ' : 'Show ') + btn.dataset.label;
+  btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+function expandRun(btn) {
+  var panel = btn.parentNode.nextElementSibling;
+  setRunDetail(btn, !(panel && panel.classList.contains('run-detail-open')));
+}
+// Keys are only ever compared, never spliced into a selector.
+function openRunKeys(el) {
+  var keys = [], nodes = el.querySelectorAll('.run-detail.run-detail-open');
+  for (var i = 0; i < nodes.length; i++) {
+    if (nodes[i].dataset.runKey) keys.push(nodes[i].dataset.runKey);
+  }
+  return keys;
+}
+function restoreRunKeys(el, keys) {
+  if (!keys.length) return;
+  var nodes = el.querySelectorAll('.run-detail');
+  for (var i = 0; i < nodes.length; i++) {
+    var k = nodes[i].dataset.runKey;
+    if (!k || keys.indexOf(k) === -1) continue;
+    var head = nodes[i].previousElementSibling;
+    var btn = head ? head.querySelector('button') : null;
+    if (btn) setRunDetail(btn, true);
+  }
 }
 </script>
 </body>
@@ -1468,9 +1534,11 @@ _EVENT_PRESENTATION = {
     "moved": ("ok", "Moved"),
     "complete": ("ok", "Complete"),
     "error": ("danger", "Error"),
+    "mismatch": ("warn", "Numbering"),
     "throttle": ("warn", "Throttled"),
     "wait": ("warn", "Waiting"),
     "skip": ("muted", "Skipped"),
+    "unavailable": ("warn", "Unavailable"),
     "sleep": ("muted", "Sleeping"),
     "info": ("muted", "Info"),
     "cleanup": ("muted", "Cleaned"),
@@ -1486,22 +1554,231 @@ def render_event(etype, msg):
         tone=tone, label=label, msg=escape(msg))
 
 
+# A cycle's events split by signal: downloads, errors and numbering mismatches
+# are the news and always get their own visible line; unavailable/complete are
+# background detail that hides behind the expand toggle so the feed stays
+# readable. A "mismatch" (a release numbering its files 41-46 while the
+# watchlist wants 1-7) is the most actionable line the feed can show — it names
+# the config change that fixes it — so it is LOUD: never behind the toggle, and
+# never folded into a "nothing new" group.
+_LOUD_EVENT_KINDS = ("download", "error", "mismatch")
+_QUIET_EVENT_KINDS = ("unavailable", "complete")
+_RUN_EVENT_KINDS = _LOUD_EVENT_KINDS + _QUIET_EVENT_KINDS
+
+
+def run_state_events(record):
+    """The per-cycle events of a run-state record, defensively filtered.
+
+    ``events`` is optional at read time — an older record, a fresh deploy, or a
+    bot that has not been redeployed yet carries none — and an unknown kind is
+    dropped rather than rendered as a mystery line."""
+    if not isinstance(record, dict):
+        return []
+    events = record.get("events")
+    if not isinstance(events, list):
+        return []
+    return [ev for ev in events
+            if isinstance(ev, dict) and ev.get("kind") in _RUN_EVENT_KINDS]
+
+
+def format_run_event(event):
+    """One event as PLAIN TEXT: "One Piece — episodes 1112, 1113", "Gantz —
+    JDownloader nicht erreichbar". Deliberately not HTML — series names are
+    watchlist data (``Fate/stay night & Heaven's Feel``), so the single escape
+    happens once at render time in render_event(). Returns "" for an event with
+    nothing to say."""
+    anime = str(event.get("anime") or "").strip()
+    episodes = [ep for ep in (event.get("episodes") or [])
+                if isinstance(ep, int) and not isinstance(ep, bool)]
+    detail = str(event.get("detail") or "").strip()
+
+    parts = []
+    if anime:
+        parts.append(anime)
+    if episodes:
+        parts.append("episode{} {}".format(
+            "" if len(episodes) == 1 else "s",
+            ", ".join(str(ep) for ep in episodes)))
+    if detail:
+        parts.append(detail)
+    return " — ".join(parts)
+
+
+def render_run_cycle_events(record):
+    """Render one cycle's events, split by signal.
+
+    Returns ``(loud_html, quiet_html, quiet_count)`` — already-escaped HTML for
+    the always-visible download/error lines (plus the truncation notice, which
+    is a caveat about completeness and must never hide), and for the
+    unavailable/complete lines that live behind the toggle."""
+    events = run_state_events(record)
+    loud = ""
+    quiet = ""
+    quiet_count = 0
+    for event in events:
+        kind = event.get("kind")
+        text = format_run_event(event)
+        if not text:
+            continue
+        line = render_event(kind, text)
+        if kind in _LOUD_EVENT_KINDS:
+            loud += line
+        else:
+            quiet += line
+            quiet_count += 1
+
+    if isinstance(record, dict) and record.get("events_truncated"):
+        # Count the RAW recorded list, not the filtered one: an unrecognised
+        # kind (a newer bot than this dashboard) is dropped from rendering, but
+        # it was still recorded — and the one line whose whole job is saying
+        # "this list is incomplete" must not itself state a wrong number.
+        raw = record.get("events")
+        recorded = len(raw) if isinstance(raw, list) else len(events)
+        loud += render_event("info", "event list truncated — only the first {} "
+                                     "of this cycle were recorded".format(recorded))
+    return loud, quiet, quiet_count
+
+
+def _run_detail_key(record):
+    """A stable per-cycle key for the detail panel, so the 10s feed refresh can
+    re-open whatever the reader had open. The finished timestamp is the record's
+    own identity; a record without one simply never restores."""
+    if not isinstance(record, dict):
+        return ""
+    return str(record.get("finished_ts") or "")
+
+
+def render_run_detail(key, label, inner_html):
+    """The show/hide pair the run feed uses — the same dependency-free pattern as
+    the OK-episode toggle. ``inner_html`` is server-rendered and already escaped,
+    so the script only flips a class and no feed data reaches a JS literal."""
+    return ('<div class="run-detail-toggle">'
+            '<button type="button" class="run-detail-btn" data-label="{label}" '
+            'aria-expanded="false" onclick="expandRun(this)">Show {label}</button>'
+            '</div><div class="run-detail" data-run-key="{key}">{inner}</div>').format(
+        label=escape(label, quote=True), key=escape(key, quote=True), inner=inner_html)
+
+
+def render_run_cycle(record):
+    """One cycle on its own line: the summary, its download/error lines, and a
+    toggle for the lower-signal detail."""
+    summary = build_run_summary(record)
+    loud, quiet, quiet_count = render_run_cycle_events(record)
+
+    html = ('<div class="run-entry"><div class="event event--{tone}">'
+            '<span class="event-msg">{msg}</span></div>').format(
+        tone=_run_summary_tone(record), msg=escape(summary))
+    if loud:
+        html += '<div class="run-events">{}</div>'.format(loud)
+    if quiet:
+        html += render_run_detail(
+            _run_detail_key(record),
+            "{} more detail{}".format(quiet_count, "" if quiet_count == 1 else "s"),
+            '<div class="run-events">{}</div>'.format(quiet))
+    return html + "</div>"
+
+
+def cycle_is_quiet(record):
+    """True when a cycle brought no news — nothing downloaded, no errors, and no
+    event worth its own line. Only these fold into a group; a cycle with a
+    download or an error ALWAYS keeps its own line."""
+    counts = record.get("counts") or {} if isinstance(record, dict) else {}
+    if counts.get("downloaded") or counts.get("errors"):
+        return False
+    return not any(ev.get("kind") in _LOUD_EVENT_KINDS
+                   for ev in run_state_events(record))
+
+
+def build_quiet_group_summary(records):
+    """The one line that stands in for a run of consecutive quiet cycles:
+    "18:47 – 19:06 · 18 quiet cycles — checked 0–3/18, nothing new".
+
+    The time span and the checked range are what the folded lines actually said,
+    so nothing the reader needs is invented or lost."""
+    times = []
+    checks = []
+    entry_counts = set()
+    for record in records:
+        fin = _parse_state_ts(record.get("finished_ts"))
+        if fin:
+            times.append(fin)
+        counts = record.get("counts") or {}
+        checked = counts.get("checked")
+        if isinstance(checked, int) and not isinstance(checked, bool):
+            checks.append(checked)
+        entries = counts.get("entries")
+        if isinstance(entries, int) and not isinstance(entries, bool) and entries:
+            entry_counts.add(entries)
+
+    head = ""
+    if times:
+        oldest = min(times).strftime("%H:%M")
+        newest = max(times).strftime("%H:%M")
+        head = oldest if oldest == newest else "{} – {}".format(oldest, newest)
+
+    tail = "nothing new"
+    if checks:
+        low, high = min(checks), max(checks)
+        span = str(low) if low == high else "{}–{}".format(low, high)
+        # Only claim a denominator when every folded cycle agreed on one.
+        if len(entry_counts) == 1:
+            span = "{}/{}".format(span, next(iter(entry_counts)))
+        tail = "checked {}, nothing new".format(span)
+
+    lead = " · ".join(part for part in (head, "{} quiet cycles".format(len(records))) if part)
+    return "{} — {}".format(lead, tail)
+
+
+def render_quiet_group(records):
+    """Fold 2+ consecutive quiet cycles into ONE muted line — the fix for the
+    wall of near-identical routine lines burying the cycles that mattered. A
+    lone quiet cycle is left alone (one line is not a wall). The folded cycles
+    stay reachable behind the toggle, so collapsing hides nothing."""
+    if not records:
+        return ""
+    if len(records) == 1:
+        return render_run_cycle(records[0])
+
+    inner = '<div class="run-events">'
+    for record in records:
+        loud, quiet, _count = render_run_cycle_events(record)
+        inner += ('<div class="event event--muted"><span class="event-msg">{}</span>'
+                  '</div>').format(escape(build_run_summary(record)))
+        inner += loud + quiet
+    inner += "</div>"
+
+    # Newest first, so records[-1] is the oldest end of the span.
+    key = "{}..{}".format(_run_detail_key(records[-1]), _run_detail_key(records[0]))
+    return ('<div class="run-entry run-entry--quiet">'
+            '<div class="event event--muted"><span class="event-msg">{msg}</span></div>'
+            '{detail}</div>').format(
+        msg=escape(build_quiet_group_summary(records)),
+        detail=render_run_detail(key, "all {}".format(len(records)), inner))
+
+
 def render_run_state_history(state_runs, max_runs=20):
-    """Render the run-history feed as ONE concise summary line per cycle, sourced
-    from the bot's persisted run-state records. Newest first. Routine cycles
-    render as a single calm muted line; downloads and errors are surfaced and
-    tone-highlighted. Returns "" when nothing is renderable, so the caller can
-    fall back to the log-parsed event feed."""
+    """Render the run-history feed from the bot's persisted run-state records.
+    Newest first.
+
+    A cycle that did something — a download, an error — gets its own line with
+    those events spelled out (which series, which episodes, what went wrong).
+    Consecutive cycles that did nothing fold into a single muted grouped line,
+    so a wall of identical routine lines can no longer bury the ones that
+    mattered. Returns "" when nothing is renderable, so the caller can fall back
+    to the log-parsed event feed."""
     display = list(reversed(state_runs))[:max_runs]
     html = ""
+    quiet_group = []
     for record in display:
-        summary = build_run_summary(record)
-        if not summary:
+        if not build_run_summary(record):
             continue
-        html += ('<div class="run-entry"><div class="event event--{tone}">'
-                 '<span class="event-msg">{msg}</span></div></div>').format(
-            tone=_run_summary_tone(record), msg=escape(summary))
-    return html
+        if cycle_is_quiet(record):
+            quiet_group.append(record)
+            continue
+        html += render_quiet_group(quiet_group)
+        quiet_group = []
+        html += render_run_cycle(record)
+    return html + render_quiet_group(quiet_group)
 
 
 def render_run_history(runs, state_runs=None, max_runs=20):

@@ -567,6 +567,370 @@ class RenderRunHistoryTest(unittest.TestCase):
         self.assertIn("FromLog", html)
 
 
+def _cycle(ts, **counts):
+    """A run-state record shaped like the bot writes it (events added by tests)."""
+    return {"finished_ts": ts, "counts": counts}
+
+
+class RunSummarySkipBreakdownTest(unittest.TestCase):
+    """"checked 2/18" alone never said why the other 16 were passed over. The
+    skip breakdown is what makes the line self-explanatory."""
+
+    def test_skipped_and_unavailable_surface(self):
+        rec = _cycle("2026-06-13T19:40:00Z", entries=18, checked=2, skipped=16,
+                     downloaded=2, errors=1)
+        self.assertEqual(
+            app.build_run_summary(rec),
+            "19:40 — checked 2/18 · 16 skipped · 2 downloaded · 1 error")
+
+    def test_unavailable_segment(self):
+        rec = _cycle("2026-06-13T19:40:00Z", entries=18, checked=4, skipped=11,
+                     unavailable=3)
+        self.assertEqual(app.build_run_summary(rec),
+                         "19:40 — checked 4/18 · 11 skipped · 3 unavailable")
+
+    def test_zero_and_absent_keys_are_omitted(self):
+        # Both a zero and a missing key stay out of the line (no "0 skipped").
+        self.assertEqual(
+            app.build_run_summary(_cycle("2026-06-13T19:40:00Z", entries=18,
+                                         checked=2, skipped=0, unavailable=0)),
+            "19:40 — checked 2/18")
+        self.assertEqual(
+            app.build_run_summary(_cycle("2026-06-13T19:40:00Z", entries=18, checked=2)),
+            "19:40 — checked 2/18")
+
+
+class RunStateEventsTest(unittest.TestCase):
+    """Events are optional at read time and may be malformed; the feed must not
+    trust them."""
+
+    def test_missing_or_wrong_type_yields_nothing(self):
+        self.assertEqual(app.run_state_events({"counts": {}}), [])
+        self.assertEqual(app.run_state_events({"events": None}), [])
+        self.assertEqual(app.run_state_events({"events": "nope"}), [])
+        self.assertEqual(app.run_state_events(None), [])
+
+    def test_unknown_kinds_are_dropped(self):
+        rec = {"events": [{"kind": "download", "anime": "A", "episodes": [1]},
+                          {"kind": "wat", "anime": "B"},
+                          "not-a-dict"]}
+        kinds = [ev["kind"] for ev in app.run_state_events(rec)]
+        self.assertEqual(kinds, ["download"])
+
+
+class FormatRunEventTest(unittest.TestCase):
+    def test_download_names_series_and_episodes(self):
+        self.assertEqual(
+            app.format_run_event({"kind": "download", "anime": "One Piece",
+                                  "episodes": [1112, 1113]}),
+            "One Piece — episodes 1112, 1113")
+
+    def test_single_episode_is_singular(self):
+        self.assertEqual(
+            app.format_run_event({"kind": "download", "anime": "Gantz", "episodes": [7]}),
+            "Gantz — episode 7")
+
+    def test_error_carries_its_detail(self):
+        self.assertEqual(
+            app.format_run_event({"kind": "error", "anime": "Gantz", "episodes": [],
+                                  "detail": "JDownloader nicht erreichbar"}),
+            "Gantz — JDownloader nicht erreichbar")
+
+    def test_complete_is_just_the_series(self):
+        self.assertEqual(app.format_run_event({"kind": "complete", "anime": "Bleach"}),
+                         "Bleach")
+
+    def test_empty_event_says_nothing(self):
+        self.assertEqual(app.format_run_event({"kind": "download"}), "")
+
+    def test_non_int_episodes_are_ignored(self):
+        out = app.format_run_event({"kind": "download", "anime": "A",
+                                    "episodes": ["x", None, 3]})
+        self.assertEqual(out, "A — episode 3")
+
+
+class RenderRunCycleTest(unittest.TestCase):
+    """A cycle that did something spells out WHAT: which series, which episodes,
+    what went wrong. Low-signal events hide behind the expand toggle."""
+
+    def test_downloads_and_errors_render_as_visible_lines(self):
+        rec = _cycle("2026-06-13T21:54:00Z", entries=20, checked=4, downloaded=14, errors=1)
+        rec["events"] = [
+            {"kind": "download", "anime": "One Piece", "episodes": [1112, 1113]},
+            {"kind": "error", "anime": "Gantz", "episodes": [],
+             "detail": "JDownloader nicht erreichbar"},
+        ]
+        html_out = app.render_run_cycle(rec)
+        self.assertIn("One Piece — episodes 1112, 1113", html_out)
+        self.assertIn("Gantz — JDownloader nicht erreichbar", html_out)
+        # ... and outside any collapsed panel.
+        self.assertNotIn("run-detail", html_out.split('class="run-events"')[1][:400])
+        self.assertIn("event--ok", html_out)
+        self.assertIn("event--danger", html_out)
+
+    def test_low_signal_events_hide_behind_a_closed_toggle(self):
+        rec = _cycle("2026-06-13T19:00:00Z", entries=18, checked=2, downloaded=1)
+        rec["events"] = [
+            {"kind": "download", "anime": "Frieren", "episodes": [4]},
+            {"kind": "unavailable", "anime": "Dandadan", "episodes": [9],
+             "detail": "no German release yet"},
+            {"kind": "complete", "anime": "Bleach"},
+        ]
+        html_out = app.render_run_cycle(rec)
+        self.assertIn('onclick="expandRun(this)"', html_out)
+        self.assertIn("Show 2 more details", html_out)
+        self.assertIn('aria-expanded="false"', html_out)
+        # The panel exists but starts closed; its rows are server-rendered.
+        self.assertIn('<div class="run-detail" data-run-key=', html_out)
+        self.assertNotIn("run-detail-open", html_out)
+        panel = html_out.split('class="run-detail" data-run-key=')[1]
+        self.assertIn("Dandadan — episode 9 — no German release yet", panel)
+        self.assertIn("Bleach", panel)
+        # The download stays out of the collapsed panel.
+        self.assertNotIn("Frieren", panel)
+
+    def test_no_toggle_when_there_is_no_low_signal_detail(self):
+        rec = _cycle("2026-06-13T19:00:00Z", entries=18, checked=2, downloaded=1)
+        rec["events"] = [{"kind": "download", "anime": "Frieren", "episodes": [4]}]
+        self.assertNotIn("run-detail", app.render_run_cycle(rec))
+
+    def test_truncation_is_stated_not_silently_swallowed(self):
+        rec = _cycle("2026-06-13T21:54:00Z", entries=20, checked=20, downloaded=40)
+        rec["events"] = [{"kind": "download", "anime": "S%d" % n, "episodes": [n]}
+                         for n in range(1, 41)]
+        rec["events_truncated"] = True
+        html_out = app.render_run_cycle(rec)
+        self.assertIn("event list truncated", html_out)
+        self.assertIn("first 40", html_out)
+        # The notice is a caveat about completeness: never behind the toggle.
+        self.assertNotIn("run-detail", html_out)
+
+    def test_truncation_notice_counts_the_raw_recorded_list(self):
+        # The filtered list drops kinds this dashboard does not know (a newer
+        # bot). The notice must still report what was RECORDED — the one line
+        # whose job is "this list is incomplete" cannot state a wrong number.
+        rec = _cycle("2026-06-13T21:54:00Z", entries=20, checked=20, downloaded=3)
+        rec["events"] = [{"kind": "download", "anime": "A", "episodes": [1]},
+                         {"kind": "download", "anime": "B", "episodes": [2]},
+                         {"kind": "from-a-newer-bot", "anime": "C"},
+                         {"kind": "also-unknown", "anime": "D"}]
+        rec["events_truncated"] = True
+        html_out = app.render_run_cycle(rec)
+        self.assertIn("only the first 4 of this cycle were recorded", html_out)
+        self.assertNotIn("first 2 of this cycle", html_out)
+
+    def test_series_name_with_ampersand_and_apostrophe_is_escaped(self):
+        # BUG class this repo has shipped two fixes for (a61c2bf, 5292059):
+        # watchlist names are user data and reach HTML here.
+        name = "Fate/stay night & Heaven's Feel"
+        rec = _cycle("2026-06-13T19:00:00Z", entries=1, checked=1, downloaded=1)
+        rec["events"] = [{"kind": "download", "anime": name, "episodes": [3]},
+                         {"kind": "complete", "anime": name}]
+        html_out = app.render_run_cycle(rec)
+        # html.escape() quotes too, so the apostrophe lands as &#x27; — exactly
+        # what the Remove-confirm fixes established as this repo's baseline.
+        self.assertIn("Fate/stay night &amp; Heaven&#x27;s Feel", html_out)
+        # No raw ampersand or apostrophe from the name survives into the markup.
+        self.assertNotIn("night & Heaven", html_out)
+        self.assertNotIn("Heaven's", html_out)
+        self.assertNotIn("<script", html_out)
+
+    def test_detail_string_cannot_inject_markup(self):
+        rec = _cycle("2026-06-13T19:00:00Z", entries=1, checked=1, errors=1)
+        rec["events"] = [{"kind": "error", "anime": "X", "episodes": [],
+                          "detail": "<img src=x onerror=alert(1)>"}]
+        html_out = app.render_run_cycle(rec)
+        self.assertNotIn("<img", html_out)
+        self.assertIn("&lt;img", html_out)
+
+
+class MismatchEventTest(unittest.TestCase):
+    """A numbering mismatch (a release numbering its files 41-46 while the
+    watchlist wants 1-7) is the most actionable line the feed can show: it names
+    the config change that fixes it. It must never hide behind the toggle and
+    must never fold into a "nothing new" group."""
+
+    DETAIL = ("wanted 1-7 but release numbers episodes 41-46 — "
+              "set episode_offset to -40")
+
+    def _mismatch(self):
+        return {"kind": "mismatch", "anime": "Bleach", "episodes": [1, 2, 3, 4, 5, 6, 7],
+                "detail": self.DETAIL}
+
+    def test_it_is_a_loud_kind(self):
+        self.assertIn("mismatch", app._LOUD_EVENT_KINDS)
+        self.assertNotIn("mismatch", app._QUIET_EVENT_KINDS)
+
+    def test_presentation_is_warn_not_danger(self):
+        # A fixable configuration gap, not a failure.
+        self.assertEqual(app._EVENT_PRESENTATION["mismatch"], ("warn", "Numbering"))
+
+    def test_the_shared_event_shape_needs_no_special_formatting(self):
+        self.assertEqual(
+            app.format_run_event(self._mismatch()),
+            "Bleach — episodes 1, 2, 3, 4, 5, 6, 7 — " + self.DETAIL)
+
+    def test_it_renders_visibly_never_behind_the_toggle(self):
+        rec = _cycle("2026-06-13T19:10:00Z", entries=18, checked=1)
+        rec["events"] = [self._mismatch()]
+        html_out = app.render_run_cycle(rec)
+        self.assertIn("Numbering", html_out)
+        self.assertIn("set episode_offset to -40", html_out)
+        self.assertIn("event--warn", html_out)
+        # Nothing collapsed: the cycle carries no toggle at all here.
+        self.assertNotIn("run-detail", html_out)
+
+    def test_a_mismatch_cycle_is_not_quiet(self):
+        # The counts say "nothing happened" — only the event knows better.
+        rec = _cycle("2026-06-13T19:10:00Z", entries=18, checked=1,
+                     downloaded=0, errors=0)
+        self.assertTrue(app.cycle_is_quiet(dict(rec)))
+        rec["events"] = [self._mismatch()]
+        self.assertFalse(app.cycle_is_quiet(rec))
+
+    def test_a_mismatch_cycle_is_never_folded_into_a_quiet_group(self):
+        quiet = [_cycle("2026-06-13T18:%d:00Z" % m, entries=18, checked=2)
+                 for m in (50, 51, 52, 54, 55)]
+        loud = _cycle("2026-06-13T18:53:00Z", entries=18, checked=1)
+        loud["events"] = [self._mismatch()]
+        state_runs = quiet[:3] + [loud] + quiet[3:]
+
+        html_out = app.render_run_state_history(state_runs)
+        self.assertIn("18:53 — checked 1/18", html_out)
+        self.assertIn("set episode_offset to -40", html_out)
+        # It split the wall in two rather than disappearing into it.
+        self.assertEqual(html_out.count("quiet cycles"), 2)
+        self.assertIn("18:54 – 18:55 · 2 quiet cycles", html_out)
+        self.assertIn("18:50 – 18:52 · 3 quiet cycles", html_out)
+        # Its line stands between the two groups, not inside either.
+        detail_at = html_out.index("set episode_offset to -40")
+        self.assertLess(html_out.index("18:54 – 18:55"), detail_at)
+        self.assertLess(detail_at, html_out.index("18:50 – 18:52"))
+        # And it is nowhere inside a collapsed panel.
+        for panel in html_out.split('<div class="run-detail" ')[1:]:
+            self.assertNotIn("episode_offset", panel.split("</div></div>")[0])
+
+    def test_the_detail_is_escaped_like_every_other_event_string(self):
+        rec = _cycle("2026-06-13T19:10:00Z", entries=18, checked=1)
+        rec["events"] = [{"kind": "mismatch", "anime": "Fate/stay night & Heaven's Feel",
+                          "episodes": [1], "detail": "wanted 1-7 & got <41-46>"}]
+        html_out = app.render_run_cycle(rec)
+        self.assertIn("Fate/stay night &amp; Heaven&#x27;s Feel", html_out)
+        self.assertIn("wanted 1-7 &amp; got &lt;41-46&gt;", html_out)
+        self.assertNotIn("<41-46>", html_out)
+
+
+class QuietCycleGroupingTest(unittest.TestCase):
+    """The owner's complaint: sixteen near-identical routine lines buried the
+    cycles that actually did something."""
+
+    def _quiet(self, hhmm, checked=2):
+        return _cycle("2026-06-13T%s:00Z" % hhmm, entries=18, checked=checked,
+                      downloaded=0, errors=0)
+
+    def test_a_cycle_with_downloads_is_never_quiet(self):
+        self.assertTrue(app.cycle_is_quiet(self._quiet("18:50")))
+        self.assertFalse(app.cycle_is_quiet(
+            _cycle("2026-06-13T19:00:00Z", entries=18, checked=2, downloaded=1)))
+        self.assertFalse(app.cycle_is_quiet(
+            _cycle("2026-06-13T19:00:00Z", entries=18, checked=2, errors=1)))
+
+    def test_a_download_event_alone_disqualifies_a_group(self):
+        # Counts may lag; an event that says a download happened is enough.
+        rec = self._quiet("19:00")
+        rec["events"] = [{"kind": "download", "anime": "A", "episodes": [1]}]
+        self.assertFalse(app.cycle_is_quiet(rec))
+
+    def test_low_signal_events_do_not_disqualify_a_group(self):
+        rec = self._quiet("19:00")
+        rec["events"] = [{"kind": "unavailable", "anime": "A", "episodes": [1],
+                          "detail": "not out yet"}]
+        self.assertTrue(app.cycle_is_quiet(rec))
+
+    def test_group_summary_carries_span_count_and_checked_range(self):
+        group = [self._quiet("19:06", checked=2), self._quiet("18:47", checked=0),
+                 self._quiet("18:55", checked=3)]
+        self.assertEqual(app.build_quiet_group_summary(group),
+                         "18:47 – 19:06 · 3 quiet cycles — checked 0–3/18, nothing new")
+
+    def test_group_summary_collapses_an_identical_range(self):
+        group = [self._quiet("19:06"), self._quiet("18:47")]
+        self.assertEqual(app.build_quiet_group_summary(group),
+                         "18:47 – 19:06 · 2 quiet cycles — checked 2/18, nothing new")
+
+    def test_group_summary_drops_the_denominator_when_it_varied(self):
+        group = [self._quiet("19:06", checked=2),
+                 _cycle("2026-06-13T18:47:00Z", entries=20, checked=1)]
+        out = app.build_quiet_group_summary(group)
+        self.assertIn("checked 1–2, nothing new", out)
+        self.assertNotIn("/18", out)
+        self.assertNotIn("/20", out)
+
+    def test_a_lone_quiet_cycle_is_not_grouped(self):
+        html_out = app.render_run_state_history([self._quiet("18:50")])
+        self.assertNotIn("quiet cycles", html_out)
+        self.assertIn("18:50 — checked 2/18", html_out)
+
+    def test_the_owners_wall_of_repeats_folds_into_one_line(self):
+        # The owner's paste, oldest-first as run_state.json stores it.
+        state_runs = [self._quiet("18:46", checked=0)]
+        state_runs += [self._quiet("18:%d" % m, checked=2)
+                       for m in (47, 48, 50, 51, 52)]
+        state_runs.append(_cycle("2026-06-13T18:53:00Z", entries=18, checked=2, downloaded=1))
+        state_runs += [self._quiet("18:%d" % m, checked=2) for m in (54, 55, 56)]
+        state_runs.append(_cycle("2026-06-13T21:54:00Z", entries=20, checked=4, downloaded=14))
+
+        html_out = app.render_run_state_history(state_runs)
+        # Two quiet runs folded (18:46–18:52 and 18:54–18:56), so exactly two
+        # grouped lines — not eleven repeated ones.
+        self.assertEqual(html_out.count("quiet cycles"), 2)
+        self.assertIn("18:46 – 18:52 · 6 quiet cycles — checked 0–2/18, nothing new", html_out)
+        self.assertIn("18:54 – 18:56 · 3 quiet cycles — checked 2/18, nothing new", html_out)
+        # The cycles that DID something still stand alone, newest first.
+        self.assertIn("21:54 — checked 4/20 · 14 downloaded", html_out)
+        self.assertIn("18:53 — checked 2/18 · 1 downloaded", html_out)
+        self.assertLess(html_out.index("21:54"), html_out.index("18:53"))
+        # A grouped line is muted; nothing was thrown away — the folded cycles
+        # stay reachable behind the toggle.
+        self.assertIn("run-entry--quiet", html_out)
+        self.assertIn("Show all 6", html_out)
+        self.assertIn("18:50 — checked 2/18", html_out)
+
+    def test_group_folds_at_the_end_of_the_feed(self):
+        state_runs = [self._quiet("18:47"), self._quiet("18:48"),
+                      _cycle("2026-06-13T19:00:00Z", entries=18, checked=2, downloaded=1)]
+        html_out = app.render_run_state_history(state_runs)
+        self.assertIn("2 quiet cycles", html_out)
+        self.assertLess(html_out.index("19:00"), html_out.index("quiet cycles"))
+
+
+class RunHistoryBackCompatTest(unittest.TestCase):
+    """A record written before the events/skip schema (older bot, fresh deploy,
+    not-yet-redeployed bot) must render exactly as it did — no crash, no blank
+    feed, no phantom "0 skipped"."""
+
+    def test_pre_schema_record_renders_byte_for_byte_as_before(self):
+        rec = {"finished_ts": "2026-06-13T19:40:00Z",
+               "counts": {"entries": 12, "checked": 12, "downloaded": 2, "errors": 1}}
+        self.assertEqual(app.build_run_summary(rec),
+                         "19:40 — checked 12/12 · 2 downloaded · 1 error")
+        self.assertEqual(
+            app.render_run_state_history([rec]),
+            '<div class="run-entry"><div class="event event--danger">'
+            '<span class="event-msg">19:40 &mdash; checked 12/12 &middot; '
+            '2 downloaded &middot; 1 error</span></div></div>'.replace(
+                "&mdash;", "—").replace("&middot;", "·"))
+
+    def test_pre_schema_records_still_group_and_carry_no_toggle(self):
+        runs = [{"finished_ts": "2026-06-13T18:5%d:00Z" % n,
+                 "counts": {"entries": 18, "checked": 2, "downloaded": 0, "errors": 0}}
+                for n in range(3)]
+        html_out = app.render_run_state_history(runs)
+        self.assertIn("18:50 – 18:52 · 3 quiet cycles", html_out)
+        self.assertNotIn("more detail", html_out)
+        self.assertNotIn("0 skipped", html_out)
+
+
 class ConfirmAttrTest(unittest.TestCase):
     """BUG-1: the inline Remove ``confirm()`` must survive names with
     apostrophes (also quotes / &). Previously the name was only HTML-escaped, so

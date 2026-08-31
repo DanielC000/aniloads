@@ -17,6 +17,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _BOT_DIR = os.path.join(_REPO_ROOT, "bot")
 _WEB_APP = os.path.join(_REPO_ROOT, "web", "app.py")
 _BOT_ANIBOT = os.path.join(_BOT_DIR, "anibot.py")
+_BOT_ANIMELOADS = os.path.join(_BOT_DIR, "animeloads.py")
 
 # A throwaway temp dir for LOG_DIR / CONFIG_DIR so module import never touches
 # /config (or C:\config) and never writes outside the test sandbox.
@@ -26,6 +27,7 @@ os.environ.setdefault("CONFIG_DIR", _TMP)
 
 _app_cache = None
 _anibot_cache = None
+_animeloads_cache = None
 
 
 def _load_from_path(name, path):
@@ -67,3 +69,53 @@ def load_anibot():
         _install_anibot_stubs()
         _anibot_cache = _load_from_path("aniloads_anibot", _BOT_ANIBOT)
     return _anibot_cache
+
+
+def _stub_module(name, **attrs):
+    mod = types.ModuleType(name)
+    for k, v in attrs.items():
+        setattr(mod, k, v)
+    sys.modules[name] = mod
+    return mod
+
+
+def _install_animeloads_stubs():
+    """Stub the heavy/optional third-party deps bot/animeloads.py imports at
+    module level (myjdapi, pycryptodome, selenium) so it can be imported
+    hermetically on a test host that lacks them installed. Only the
+    pure-logic helpers are exercised by tests, so none of these stand-ins are
+    ever actually called."""
+    if "myjdapi" not in sys.modules:
+        _stub_module("myjdapi", Myjdapi=type("Myjdapi", (), {}))
+    if "Cryptodome" not in sys.modules:
+        cipher = _stub_module("Cryptodome.Cipher", AES=type(
+            "AES", (), {"MODE_CBC": 2, "new": staticmethod(lambda *a, **k: None)}))
+        crypto = _stub_module("Cryptodome", Cipher=cipher)
+    if "selenium" not in sys.modules:
+        by = _stub_module("selenium.webdriver.common.by", By=type("By", (), {}))
+        common = _stub_module("selenium.webdriver.common", by=by)
+        ui = _stub_module("selenium.webdriver.support.ui", WebDriverWait=type("WebDriverWait", (), {}))
+        ec = _stub_module("selenium.webdriver.support.expected_conditions")
+        support_pkg = _stub_module("selenium.webdriver.support", ui=ui, expected_conditions=ec)
+        ff_service = _stub_module("selenium.webdriver.firefox.service", Service=type("Service", (), {}))
+        ff_options = _stub_module("selenium.webdriver.firefox.options", Options=type("Options", (), {}))
+        ff_pkg = _stub_module("selenium.webdriver.firefox", service=ff_service, options=ff_options)
+        cr_service = _stub_module("selenium.webdriver.chrome.service", Service=type("Service", (), {}))
+        cr_options = _stub_module("selenium.webdriver.chrome.options", Options=type("Options", (), {}))
+        cr_pkg = _stub_module("selenium.webdriver.chrome", service=cr_service, options=cr_options)
+        webdriver = _stub_module("selenium.webdriver", Firefox=type("Firefox", (), {}),
+                                  Chrome=type("Chrome", (), {}), firefox=ff_pkg, chrome=cr_pkg,
+                                  support=support_pkg, common=common)
+        _stub_module("selenium", webdriver=webdriver)
+
+
+def load_animeloads():
+    """Import bot/animeloads.py once, with heavy optional deps (selenium,
+    myjdapi, pycryptodome) stubbed so it imports hermetically."""
+    global _animeloads_cache
+    if _animeloads_cache is None:
+        if _BOT_DIR not in sys.path:
+            sys.path.insert(0, _BOT_DIR)
+        _install_animeloads_stubs()
+        _animeloads_cache = _load_from_path("aniloads_animeloads", _BOT_ANIMELOADS)
+    return _animeloads_cache

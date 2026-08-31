@@ -794,6 +794,16 @@ def handle_failed_batch(batch_result, all_wanted, animeentry, run_counts,
       over-reported the episode count, so none of the wanted episodes exist in
       any release. This is the benign UNAVAILABLE case (the same reality the
       single-ep path handles): logged at INFO, NOT counted as an error.
+    * **Numbering mismatch** — ``downloadBatchCNL`` flagged the result with
+      ``reason_code == "episode_numbering_mismatch"``: every wanted episode
+      and every release-provided episode are disjoint, but not because the
+      wanted episodes are beyond ``available_max`` (that's all-phantom,
+      below) — the release numbers its files in a different scheme (e.g.
+      absolute numbering continuing across cours). This is a third, distinct
+      condition; it must never be confused with all-phantom or genuine
+      failure. Logged as ``[MISMATCH]`` (actionable, names the suggested
+      ``episode_offset``), NOT counted as an error — a dedicated
+      ``run_counts["mismatch"]`` tally instead.
     * **Genuine failure** — no ``available_max`` in the response (e.g. a
       MyJD/JD error or the ``except`` path's caller), or a *partial* phantom
       where some wanted episodes are still in range. Logged as ``[ERROR]`` and
@@ -810,9 +820,15 @@ def handle_failed_batch(batch_result, all_wanted, animeentry, run_counts,
     """
     reason = batch_result.get("reason", "unbekannt")
     batch_max = batch_result.get("available_max")
+    reason_code = batch_result.get("reason_code")
     all_phantom = (batch_max is not None and
                    all(ep > batch_max for ep in all_wanted))
-    if all_phantom:
+    if reason_code == "episode_numbering_mismatch":
+        log_fn("[MISMATCH] " + name + ": " + reason, push)
+        run_counts["mismatch"] = run_counts.get("mismatch", 0) + 1
+        if events is not None:
+            _record_event(events, "mismatch", name, episodes=all_wanted, detail=reason)
+    elif all_phantom:
         log_fn("[UNAVAILABLE] " + name + ": keine Downloadlinks für gewünschte "
                "Episoden — verfügbar bis Episode " + str(batch_max)
                + ", markiere als nicht verfügbar", push)
@@ -955,7 +971,7 @@ def startbot():
         # last_run/next_run, independent of the rolling log tail).
         run_started = _utcnow_iso()
         run_counts = {"entries": 0, "checked": 0, "downloaded": 0, "errors": 0,
-                      "skipped": 0, "unavailable": 0}
+                      "skipped": 0, "unavailable": 0, "mismatch": 0}
         events = []
         os.makedirs(os.path.dirname(botfolder), exist_ok=True)
         f = open(botfile, "r")
@@ -1216,7 +1232,8 @@ def startbot():
                                 myjd_device=myjd_device, jd_deprecated=jd_deprecated,
                                 jd_deprecatedport=jd_deprecatedport,
                                 pkgName=jdPackageName, destinationFolder=destinationFolder,
-                                wanted_episodes=set(all_wanted))
+                                wanted_episodes=set(all_wanted),
+                                episode_offset=animeentry.get('episode_offset', 0) or 0)
                             if batch_result["success"]:
                                 batch_sent = set(batch_result["episodes_sent"])
                                 run_counts["downloaded"] += len(batch_sent)

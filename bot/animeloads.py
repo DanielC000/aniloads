@@ -116,10 +116,24 @@ def _release_name_from_links(links_decoded):
     return re.sub(r'\.(part\d+\.)?(rar|r\d{2,3}|mkv|mp4|avi)$', '', name, flags=re.IGNORECASE)
 
 
+def _format_ep_range(episodes):
+    """Render a sorted episode collection as "N" or "N-M" for log messages."""
+    eps = sorted(episodes)
+    if not eps:
+        return ""
+    if eps[0] == eps[-1]:
+        return str(eps[0])
+    return "%d-%d" % (eps[0], eps[-1])
+
+
 def _group_urls_by_episode(decoded_urls, total_episodes):
     """Group decrypted URL byte-strings by episode number.
 
-    Returns dict mapping 1-based episode number to list of URL strings.
+    Returns dict mapping episode number, exactly as it appears in the
+    release's own filenames, to list of URL strings. This is NOT guaranteed
+    to be 1-based — a release may number its episodes absolutely across
+    cours (e.g. a season-2 release continuing from episode 41 instead of
+    restarting at 1).
     """
     grouped = {}
     unparsed = []
@@ -148,6 +162,83 @@ def _group_urls_by_episode(decoded_urls, total_episodes):
                      len(unparsed), len(unparsed) + sum(len(v) for v in grouped.values()))
 
     return grouped
+
+
+def _match_batch_episodes(wanted_episodes, grouped, episode_offset=0):
+    """Match wanted (watchlist-numbered) episodes against `grouped` (release/
+    site-numbered episode -> URLs, from `_group_urls_by_episode`), honoring
+    `episode_offset`.
+
+    `episode_offset` has identical semantics to the mover's
+    `new_ep = episode + ep_offset` (web/app.py): site number + offset =
+    watchlist number. `wanted_episodes` and every returned episode number are
+    in watchlist numbering; `grouped`'s keys stay in release/site numbering
+    as parsed from the release's own filenames — translation happens here,
+    in both directions, so no other caller has to reason about two numbering
+    schemes.
+
+    Returns a dict:
+      - "filtered_links": [str] — URLs to send.
+      - "episodes_sent": [int] — the subset of wanted_episodes found (watchlist numbering).
+      - "episodes_not_found": [int] — the subset not found (watchlist numbering).
+      - "available_max": int or None — max release episode with links, translated to watchlist numbering.
+      - "reason_code": "episode_numbering_mismatch" or None — set only when
+        `filtered_links` ends up empty *and* that emptiness is a
+        numbering-scheme mismatch (release numbers episodes differently,
+        e.g. absolutely across cours) rather than every wanted episode being
+        genuinely unavailable yet (all-phantom, left for the caller to
+        detect from `available_max` — never both at once).
+      - "reason": str or None — human-readable explanation, set together with reason_code.
+    """
+    offset = episode_offset or 0
+    available_max_site = max(grouped.keys()) if grouped else None
+    available_max = (available_max_site + offset) if available_max_site is not None else None
+
+    episodes_sent = []
+    episodes_not_found = []
+    filtered_links = []
+
+    if wanted_episodes:
+        site_wanted = sorted(ep - offset for ep in wanted_episodes)
+        for site_ep in site_wanted:
+            if site_ep in grouped:
+                filtered_links.extend(grouped[site_ep])
+                episodes_sent.append(site_ep + offset)
+            else:
+                episodes_not_found.append(site_ep + offset)
+    else:
+        # No filter — send everything
+        site_wanted = sorted(grouped.keys())
+        for site_ep in site_wanted:
+            filtered_links.extend(grouped[site_ep])
+            episodes_sent.append(site_ep + offset)
+
+    reason_code = None
+    reason = None
+    if not filtered_links:
+        reason = "Keine gewünschten Episoden im Batch gefunden"
+        # Entirely disjoint from `grouped`, but not because every wanted
+        # episode is genuinely beyond what the release has published yet
+        # (that's the benign all-phantom case, left to the caller) — the
+        # release numbers its files in a different scheme. Detected and
+        # suggested only; never auto-applied, since guessing wrong would
+        # push the wrong episodes to JDownloader.
+        if (wanted_episodes and grouped
+                and not all(ep > available_max_site for ep in site_wanted)):
+            reason_code = "episode_numbering_mismatch"
+            suggested_offset = min(wanted_episodes) - min(grouped.keys())
+            reason = ("wanted %s but release numbers episodes %s — set episode_offset to %d"
+                      % (_format_ep_range(wanted_episodes), _format_ep_range(grouped.keys()),
+                         suggested_offset))
+
+    return {
+        "filtered_links": filtered_links,
+        "episodes_sent": episodes_sent,
+        "episodes_not_found": episodes_not_found,
+        "available_max": available_max,
+        "reason_code": reason_code,
+        "reason": reason,
+    }
 
 
 class animeloads:
@@ -1451,8 +1542,16 @@ return xhr.response"
                          jdhost="", myjd_user="", myjd_pw="", myjd_device="",
                          jd_deprecated=False, jd_deprecatedport="3128",
                          pkgName="", destinationFolder="",
-                         wanted_episodes=None):
+                         wanted_episodes=None, episode_offset=0):
         """Download multiple episodes via batch Click'n'Load (single captcha).
+
+        `wanted_episodes` and the returned `episodes_sent`/`episodes_not_found`/
+        `available_max` are all in the caller's watchlist numbering.
+        `episode_offset` translates between that and the release's own
+        (site/filename) numbering, with the identical semantics as the
+        mover's `new_ep = episode + ep_offset` (web/app.py): site number +
+        offset = watchlist number. Pass the value unchanged from the caller's
+        `episode_offset` field (default 0, i.e. the two numberings match).
 
         Returns dict: {"success": bool, "episodes_sent": [int], "episodes_not_found": [int]}
         Raises ALInvalidLoginException if not logged in.
@@ -1624,30 +1723,22 @@ return xhr.response"
         grouped = _group_urls_by_episode(links_decoded, total_episodes)
         _log.info("[BATCH] Grouped into %d episodes: %s", len(grouped), sorted(grouped.keys()))
 
-        # Actual max episode with downloadable links (may differ from DOM-reported count)
-        available_max = max(grouped.keys()) if grouped else None
-
-        # Filter to wanted episodes
-        episodes_sent = []
-        episodes_not_found = []
-        filtered_links = []
-
-        if wanted_episodes:
-            for ep in sorted(wanted_episodes):
-                if ep in grouped:
-                    filtered_links.extend(grouped[ep])
-                    episodes_sent.append(ep)
-                else:
-                    episodes_not_found.append(ep)
-        else:
-            # No filter — send everything
-            for ep in sorted(grouped.keys()):
-                filtered_links.extend(grouped[ep])
-                episodes_sent.append(ep)
+        match = _match_batch_episodes(wanted_episodes, grouped, episode_offset)
+        episodes_sent = match["episodes_sent"]
+        episodes_not_found = match["episodes_not_found"]
+        available_max = match["available_max"]
+        filtered_links = match["filtered_links"]
 
         if not filtered_links:
-            _log.warning("[BATCH] No links after filtering")
-            return {"success": False, "reason": "Keine gewünschten Episoden im Batch gefunden", "episodes_sent": [], "episodes_not_found": episodes_not_found, "available_max": available_max}
+            if match["reason_code"] == "episode_numbering_mismatch":
+                _log.warning("[MISMATCH] %s", match["reason"])
+            else:
+                _log.warning("[BATCH] No links after filtering")
+            result = {"success": False, "reason": match["reason"], "episodes_sent": [],
+                      "episodes_not_found": episodes_not_found, "available_max": available_max}
+            if match["reason_code"]:
+                result["reason_code"] = match["reason_code"]
+            return result
 
         _log.info("[BATCH] Sending %d links for episodes %s to JDownloader",
                   len(filtered_links), episodes_sent)

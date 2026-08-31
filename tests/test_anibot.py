@@ -337,6 +337,64 @@ class HandleFailedBatchTest(unittest.TestCase):
         self.assertEqual(events[0]["episodes"], [3, 4, 5])
         self.assertEqual(events[0]["detail"], "JDownloader nicht erreichbar")
 
+    def test_mismatch_reason_code_is_not_an_error(self):
+        # The live Bleach shape from card 62b4595a: downloadBatchCNL flags
+        # reason_code, and all_wanted (1-7) sit entirely below available_max
+        # (46) — the phantom heuristic alone would (wrongly) call this a
+        # genuine failure. The reason_code must take priority over it.
+        batch_result = {
+            "success": False,
+            "reason": "wanted 1-7 but release numbers episodes 41-46 — set episode_offset to -40",
+            "reason_code": "episode_numbering_mismatch",
+            "episodes_sent": [],
+            "episodes_not_found": list(range(1, 8)),
+            "available_max": 46,
+        }
+        run_counts = {"errors": 0, "unavailable": 0, "mismatch": 0}
+        saved, entry, counts = self._call(batch_result, list(range(1, 8)), run_counts=run_counts)
+        self.assertEqual(counts["errors"], 0)
+        self.assertEqual(counts["unavailable"], 0)
+        self.assertEqual(counts["mismatch"], 1)
+        self.assertTrue(saved)
+        self.assertEqual(entry["al_available_max"], 46)
+        self.assertEqual(entry["al_available_max_set_at"], self.TODAY)
+        self.assertEqual(len(self.logs), 1)
+        self.assertIn("[MISMATCH]", self.logs[0])
+        self.assertNotIn("[ERROR]", self.logs[0])
+        self.assertNotIn("[UNAVAILABLE]", self.logs[0])
+
+    def test_mismatch_records_mismatch_event_not_error(self):
+        batch_result = {
+            "success": False,
+            "reason": "wanted 1-7 but release numbers episodes 41-46 — set episode_offset to -40",
+            "reason_code": "episode_numbering_mismatch",
+            "episodes_sent": [],
+            "episodes_not_found": list(range(1, 8)),
+            "available_max": 46,
+        }
+        run_counts = {"errors": 0, "mismatch": 0}
+        events = []
+        anibot.handle_failed_batch(
+            batch_result, list(range(1, 8)), {}, run_counts,
+            self.TODAY, "Bleach", push=None, log_fn=self._log, events=events)
+        self.assertEqual(run_counts["errors"], 0)
+        self.assertEqual(run_counts["mismatch"], 1)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "mismatch")
+        self.assertEqual(events[0]["anime"], "Bleach")
+        self.assertEqual(events[0]["episodes"], list(range(1, 8)))
+        self.assertIn("episode_offset", events[0]["detail"])
+
+    def test_mismatch_without_run_counts_key_still_tallies(self):
+        # run_counts dicts built before this fix have no "mismatch" key.
+        batch_result = {
+            "success": False, "reason": "x", "reason_code": "episode_numbering_mismatch",
+            "episodes_sent": [], "episodes_not_found": [1], "available_max": 5,
+        }
+        saved, entry, counts = self._call(batch_result, [1], run_counts={"errors": 0})
+        self.assertEqual(counts["mismatch"], 1)
+        self.assertEqual(counts["errors"], 0)
+
     def test_events_param_is_optional(self):
         # Existing call sites (no events kwarg) must keep working unchanged.
         batch_result = {

@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs, quote
 
 import support
@@ -914,8 +914,10 @@ class RunHistoryBackCompatTest(unittest.TestCase):
                "counts": {"entries": 12, "checked": 12, "downloaded": 2, "errors": 1}}
         self.assertEqual(app.build_run_summary(rec),
                          "19:40 — checked 12/12 · 2 downloaded · 1 error")
+        # The cycle's own markup is unchanged; it now sits under its day header.
         self.assertEqual(
-            app.render_run_state_history([rec]),
+            app.render_run_state_history([rec], now=datetime(2026, 6, 13, 22, 0)),
+            '<div class="run-day">Today</div>'
             '<div class="run-entry"><div class="event event--danger">'
             '<span class="event-msg">19:40 &mdash; checked 12/12 &middot; '
             '2 downloaded &middot; 1 error</span></div></div>'.replace(
@@ -929,6 +931,162 @@ class RunHistoryBackCompatTest(unittest.TestCase):
         self.assertIn("18:50 – 18:52 · 3 quiet cycles", html_out)
         self.assertNotIn("more detail", html_out)
         self.assertNotIn("0 skipped", html_out)
+
+
+# Thu 10 Sep 2026, 12:00 UTC — the pinned "now" for the day-grouping tests.
+_NOW = datetime(2026, 9, 10, 12, 0)
+
+
+class RunHistoryDayGroupingTest(unittest.TestCase):
+    """The bot cycles about once a day, so a bare HH:MM made last Tuesday's
+    line indistinguishable from this morning's. Lines now sit under a header
+    per calendar day (UTC, the zone the times are printed in)."""
+
+    def _quiet(self, ts, checked=2):
+        return _cycle(ts, entries=18, checked=checked, downloaded=0, errors=0)
+
+    def test_day_labels(self):
+        self.assertEqual(app.format_day(date(2026, 9, 10), _NOW), "Today")
+        self.assertEqual(app.format_day(date(2026, 9, 9), _NOW), "Yesterday")
+        self.assertEqual(app.format_day(date(2026, 9, 8), _NOW), "Tue 8 Sep")
+        # Only another year's date spells the year out.
+        self.assertEqual(app.format_day(date(2025, 9, 8), _NOW), "Mon 8 Sep 2025")
+
+    def test_feed_groups_lines_under_day_headers_newest_first(self):
+        state_runs = [  # oldest first, as run_state.json stores them
+            _cycle("2026-09-08T18:44:00Z", entries=18, checked=3, downloaded=1),
+            _cycle("2026-09-09T18:45:00Z", entries=18, checked=2, errors=1),
+            _cycle("2026-09-10T06:10:00Z", entries=18, checked=4, downloaded=2),
+        ]
+        html_out = app.render_run_state_history(state_runs, now=_NOW)
+        self.assertEqual(html_out.count('class="run-day"'), 3)
+        today = html_out.index(">Today<")
+        yesterday = html_out.index(">Yesterday<")
+        older = html_out.index(">Tue 8 Sep<")
+        self.assertLess(today, yesterday)
+        self.assertLess(yesterday, older)
+        # Each line keeps its compact HH:MM and sits under its own day.
+        self.assertLess(today, html_out.index("06:10 — checked 4/18"))
+        self.assertLess(html_out.index("06:10 — checked 4/18"), yesterday)
+        self.assertLess(yesterday, html_out.index("18:45 — checked 2/18"))
+        self.assertLess(html_out.index("18:45 — checked 2/18"), older)
+        self.assertLess(older, html_out.index("18:44 — checked 3/18"))
+
+    def test_one_header_per_day_not_per_line(self):
+        state_runs = [_cycle("2026-09-10T0%d:00:00Z" % h, entries=5, checked=5, downloaded=1)
+                      for h in (1, 2, 3)]
+        html_out = app.render_run_state_history(state_runs, now=_NOW)
+        self.assertEqual(html_out.count('class="run-day"'), 1)
+        self.assertTrue(html_out.startswith('<div class="run-day">Today</div>'))
+
+    def test_quiet_fold_splits_at_midnight(self):
+        state_runs = [self._quiet("2026-09-08T23:50:00Z"), self._quiet("2026-09-08T23:55:00Z"),
+                      self._quiet("2026-09-09T00:05:00Z"), self._quiet("2026-09-09T00:10:00Z")]
+        html_out = app.render_run_state_history(state_runs, now=_NOW)
+        # Two folds, one per day, each under its own header — never one span
+        # reading "23:50 – 00:10".
+        self.assertEqual(html_out.count("quiet cycles"), 2)
+        self.assertIn("00:05 – 00:10 · 2 quiet cycles", html_out)
+        self.assertIn("23:50 – 23:55 · 2 quiet cycles", html_out)
+        self.assertNotIn("23:50 – 00:10", html_out)
+        self.assertLess(html_out.index(">Yesterday<"), html_out.index("00:05 – 00:10"))
+        self.assertLess(html_out.index("00:05 – 00:10"), html_out.index(">Tue 8 Sep<"))
+        self.assertLess(html_out.index(">Tue 8 Sep<"), html_out.index("23:50 – 23:55"))
+        # Both folds still expand to their own cycles.
+        self.assertEqual(html_out.count("Show all 2"), 2)
+
+    def test_a_lone_quiet_cycle_either_side_of_midnight_is_not_folded(self):
+        state_runs = [self._quiet("2026-09-08T23:50:00Z"), self._quiet("2026-09-09T00:10:00Z")]
+        html_out = app.render_run_state_history(state_runs, now=_NOW)
+        self.assertNotIn("quiet cycles", html_out)
+        self.assertIn("00:10 — checked 2/18", html_out)
+        self.assertIn("23:50 — checked 2/18", html_out)
+
+    def test_group_summary_names_days_when_handed_a_multi_day_span(self):
+        group = [self._quiet("2026-09-09T00:10:00Z"), self._quiet("2026-09-08T23:50:00Z")]
+        self.assertEqual(app.build_quiet_group_summary(group, _NOW),
+                         "Tue 8 Sep 23:50 – Yesterday 00:10 · 2 quiet cycles"
+                         " — checked 2/18, nothing new")
+
+    def test_garbage_timestamps_still_render_without_a_header(self):
+        state_runs = [
+            {"finished_ts": "not-a-date", "counts": {"entries": 4, "checked": 4, "downloaded": 1}},
+            {"finished_ts": None, "counts": {"entries": 4, "checked": 1}},
+            {"counts": {"entries": 4, "checked": 2}},
+        ]
+        html_out = app.render_run_state_history(state_runs, now=_NOW)
+        self.assertNotIn("run-day", html_out)
+        self.assertIn("checked 4/4 · 1 downloaded", html_out)
+
+    def test_undated_record_stays_under_the_current_header(self):
+        state_runs = [_cycle("2026-09-09T18:00:00Z", entries=4, checked=4, downloaded=1),
+                      {"finished_ts": "garbage", "counts": {"entries": 4, "checked": 3, "downloaded": 1}},
+                      _cycle("2026-09-10T08:00:00Z", entries=4, checked=4, downloaded=2)]
+        html_out = app.render_run_state_history(state_runs, now=_NOW)
+        self.assertEqual(html_out.count('class="run-day"'), 2)
+        self.assertLess(html_out.index("checked 3/4"), html_out.index(">Yesterday<"))
+
+    def test_series_names_stay_escaped_under_a_day_header(self):
+        rec = _cycle("2026-09-09T18:00:00Z", entries=4, checked=4, downloaded=1)
+        rec["events"] = [{"kind": "download", "anime": "Fate/stay night & Heaven's Feel",
+                          "episodes": [3]}]
+        html_out = app.render_run_state_history([rec], now=_NOW)
+        self.assertIn(">Yesterday<", html_out)
+        self.assertIn("Fate/stay night &amp; Heaven&#x27;s Feel", html_out)
+        self.assertNotIn("Heaven's", html_out)
+
+    def test_last_run_stat_carries_its_day_when_not_today(self):
+        state_last = {"finished_ts": "2026-09-10T06:10:05Z", "counts": {"entries": 8, "checked": 5}}
+        self.assertEqual(app.format_last_run_display(state_last, now=_NOW),
+                         "06:10:05 &mdash; checked 5/8")
+        state_last["finished_ts"] = "2026-09-09T18:44:05Z"
+        self.assertEqual(app.format_last_run_display(state_last, now=_NOW),
+                         "Yesterday 18:44:05 &mdash; checked 5/8")
+        state_last["finished_ts"] = "2026-09-08T18:44:05Z"
+        self.assertEqual(app.format_last_run_display(state_last, now=_NOW),
+                         "Tue 8 Sep 18:44:05 &mdash; checked 5/8")
+
+
+class LogFeedDayGroupingTest(unittest.TestCase):
+    """The log-fallback feed has only the bot's [HH:MM:SS]; the date comes from
+    the Docker RFC3339 prefix parse_bot_logs() keeps as docker_ts."""
+
+    def test_docker_prefix_dates_carry_into_day_headers(self):
+        raw = [
+            "2026-09-08T18:44:00.123456789Z [18:44:00] Prüfe Naruto & Co auf updates",
+            "2026-09-08T18:44:05.000000000Z [DOWNLOAD] Naruto & Co ep5",
+            "2026-09-10T06:10:00.000000000Z [06:10:00] Prüfe Frieren auf updates",
+            "2026-09-10T06:10:04.000000000Z [DOWNLOAD] Frieren ep2",
+        ]
+        html_out = app.render_run_history(app.parse_bot_logs(raw), None, now=_NOW)
+        self.assertEqual(html_out.count('class="run-day"'), 2)
+        self.assertLess(html_out.index(">Today<"), html_out.index("Frieren"))
+        self.assertLess(html_out.index("Frieren"), html_out.index(">Tue 8 Sep<"))
+        self.assertLess(html_out.index(">Tue 8 Sep<"), html_out.index("Naruto &amp; Co"))
+        self.assertIn('<span class="run-time">18:44:00</span>', html_out)
+
+    def test_no_docker_timestamp_means_no_header(self):
+        runs = [{"time": "19:40", "anime": "Naruto", "events": [{"type": "download", "msg": "ep5"}]}]
+        html_out = app.render_run_history(runs, None, now=_NOW)
+        self.assertIn("Naruto", html_out)
+        self.assertNotIn("run-day", html_out)
+
+    def test_headers_follow_the_bot_clock_not_docker_utc(self):
+        # TZ=Europe/Berlin: the bot prints 00:30 on the 10th while Docker says
+        # 22:30Z on the 9th. The line shows 00:30, so it belongs to the 10th.
+        raw = ["2026-09-09T22:30:00.000000000Z [00:30:00] Prüfe Frieren auf updates",
+               "2026-09-09T22:30:04.000000000Z [DOWNLOAD] Frieren ep2"]
+        html_out = app.render_run_history(app.parse_bot_logs(raw), None,
+                                          now=datetime(2026, 9, 9, 23, 0))
+        self.assertIn(">Today<", html_out)
+        self.assertNotIn("Yesterday", html_out)
+
+    def test_log_last_run_stat_carries_its_day(self):
+        raw = ["2026-09-09T18:44:00.000000000Z [18:44:00] Prüfe Frieren auf updates"]
+        runs = app.parse_bot_logs(raw)
+        act = {"status": {"running": True}, "runs": runs, "last_run": runs[-1], "next_run": ""}
+        _s, last_html, _n = app.render_activity(act, now=_NOW)
+        self.assertEqual(last_html, "Yesterday 18:44:00 &mdash; Frieren")
 
 
 class ConfirmAttrTest(unittest.TestCase):
@@ -1423,9 +1581,24 @@ class RenderMoveStatusTest(unittest.TestCase):
     def test_idle_with_last_run_time(self):
         app._move_running = False
         app._move_last_run = datetime(2026, 6, 13, 19, 20, 5)
-        status_html, last_html = app.render_move_status()
+        status_html, last_html = app.render_move_status(now=datetime(2026, 6, 13, 23, 0))
         self.assertIn("Idle", status_html)
         self.assertEqual(last_html, "19:20:05")
+
+    def test_last_run_names_its_day_when_not_today(self):
+        app._move_running = False
+        app._move_last_run = datetime(2026, 6, 13, 19, 20, 5)
+        _s, last_html = app.render_move_status(now=datetime(2026, 6, 14, 8, 0))
+        self.assertEqual(last_html, "Yesterday 19:20:05")
+        _s, last_html = app.render_move_status(now=datetime(2026, 6, 16, 8, 0))
+        self.assertEqual(last_html, "Sat 13 Jun 19:20:05")
+
+    def test_aware_utc_stamp_is_compared_as_utc(self):
+        # The mover worker stamps datetime.now(timezone.utc) — aware, not naive.
+        app._move_running = False
+        app._move_last_run = datetime(2026, 6, 13, 23, 50, 0, tzinfo=timezone.utc)
+        _s, last_html = app.render_move_status(now=datetime(2026, 6, 14, 0, 10))
+        self.assertEqual(last_html, "Yesterday 23:50:00")
 
     def test_download_dir_not_mounted(self):
         app._move_running = False

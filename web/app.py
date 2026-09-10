@@ -356,6 +356,42 @@ def _parse_state_ts(ts):
         return None
 
 
+# Dates in the feed. Timestamps are naive UTC and printed as-is, so "today" is
+# the UTC calendar day too: a day boundary drawn in any other zone would put a
+# 23:30 line under the wrong header. `now` is injectable so tests can pin it.
+
+def _utc_now():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def format_day(day, now=None):
+    """A calendar day as a reader says it: "Today", "Yesterday", else
+    "Tue 8 Sep" (plus the year once it is not this year's). ``day`` is a date."""
+    today = (now or _utc_now()).date()
+    if day == today:
+        return "Today"
+    if day == today - timedelta(days=1):
+        return "Yesterday"
+    # %a/%b rather than %-d, which is not portable to Windows' strftime.
+    label = "{} {} {}".format(day.strftime("%a"), day.day, day.strftime("%b"))
+    if day.year != today.year:
+        label += " {}".format(day.year)
+    return label
+
+
+def format_day_time(dt, fmt="%H:%M:%S", now=None):
+    """A time with a day qualifier only when it is not today:
+    "18:44:05", "Yesterday 18:44:05", "Tue 8 Sep 18:44:05"."""
+    label = format_day(dt.date(), now)
+    clock = dt.strftime(fmt)
+    return clock if label == "Today" else "{} {}".format(label, clock)
+
+
+def render_run_day(day, now=None):
+    """The muted header a run-history day's lines sit under."""
+    return '<div class="run-day">{}</div>'.format(escape(format_day(day, now)))
+
+
 def format_next_run_display(state_last):
     """Next-run ETA string from the persisted run-state record, or "" if it
     cannot be derived."""
@@ -369,13 +405,15 @@ def format_next_run_display(state_last):
     return _humanize_eta(next_time, datetime.now(timezone.utc).replace(tzinfo=None), delay)
 
 
-def format_last_run_display(state_last):
+def format_last_run_display(state_last, now=None):
     """Last-run line from the persisted run-state record: the cycle's UTC finish
     time plus a brief count summary (e.g. "19:20:05 &mdash; checked 5/8, 2
-    downloaded"). Returns "" when nothing renderable is present, so the caller
-    falls back to the log-tail display."""
+    downloaded"). The time carries a day qualifier when the run was not today
+    ("Yesterday 19:20:05"), since the bot may only cycle once a day. Returns ""
+    when nothing renderable is present, so the caller falls back to the
+    log-tail display."""
     fin = _parse_state_ts(state_last.get("finished_ts"))
-    hhmmss = fin.strftime("%H:%M:%S") if fin else ""
+    hhmmss = format_day_time(fin, now=now) if fin else ""
 
     counts = state_last.get("counts") or {}
     entries = counts.get("entries")
@@ -1199,6 +1237,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .run-time { color: var(--text-faint); font-size: var(--fs-xs); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   .run-anime { color: var(--text-heading); font-weight: 600; font-size: var(--fs-sm); }
   .run-events { margin-top: var(--s2); display: flex; flex-direction: column; gap: 1px; }
+  /* Day header: the feed's HH:MM lines are grouped under the calendar day they
+     ran on, in the same quiet label voice as the activity stats. The entry
+     divider above already separates the days, so the label carries no rule of
+     its own and sits closer to its lines than to the previous day. */
+  .run-day { color: var(--text-muted); font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; padding: var(--s5) 0 0; }
+  .run-day:first-child { padding-top: 0; }
 
   /* one event line: clear label + message; downloads & errors dominate,
      routine sleep/skip lines stay quiet so the feed reads calm */
@@ -1503,7 +1547,7 @@ function restoreRunKeys(el, keys) {
 # Renderers
 # ---------------------------------------------------------------------------
 
-def render_activity(activity):
+def render_activity(activity, now=None):
     """Render the activity status bar values."""
     status = activity["status"]
     bot_running = status.get("running", False)
@@ -1520,6 +1564,12 @@ def render_activity(activity):
         last_text = last_run_display
     elif last_run and last_run.get("time"):
         last_text = last_run["time"]
+        offset = _log_clock_offset(activity.get("runs") or [last_run])
+        day = _log_run_day(last_run, offset)
+        if day:
+            label = format_day(day, (now or _utc_now()) + offset)
+            if label != "Today":
+                last_text = "{} {}".format(label, last_text)
         if last_run.get("anime"):
             last_text += " &mdash; {}".format(escape(last_run["anime"]))
     elif not docker.available:
@@ -1697,12 +1747,15 @@ def cycle_is_quiet(record):
                    for ev in run_state_events(record))
 
 
-def build_quiet_group_summary(records):
+def build_quiet_group_summary(records, now=None):
     """The one line that stands in for a run of consecutive quiet cycles:
     "18:47 – 19:06 · 18 quiet cycles — checked 0–3/18, nothing new".
 
     The time span and the checked range are what the folded lines actually said,
-    so nothing the reader needs is invented or lost."""
+    so nothing the reader needs is invented or lost. The feed splits folds at
+    day boundaries so the span sits under its day header; should a caller hand
+    in a group spanning days anyway, both ends name their day rather than
+    passing "23:50 – 00:10" off as ten minutes."""
     times = []
     checks = []
     entry_counts = set()
@@ -1720,8 +1773,12 @@ def build_quiet_group_summary(records):
 
     head = ""
     if times:
-        oldest = min(times).strftime("%H:%M")
-        newest = max(times).strftime("%H:%M")
+        first, last = min(times), max(times)
+        if first.date() == last.date():
+            oldest, newest = first.strftime("%H:%M"), last.strftime("%H:%M")
+        else:
+            oldest = "{} {}".format(format_day(first.date(), now), first.strftime("%H:%M"))
+            newest = "{} {}".format(format_day(last.date(), now), last.strftime("%H:%M"))
         head = oldest if oldest == newest else "{} – {}".format(oldest, newest)
 
     tail = "nothing new"
@@ -1737,7 +1794,7 @@ def build_quiet_group_summary(records):
     return "{} — {}".format(lead, tail)
 
 
-def render_quiet_group(records):
+def render_quiet_group(records, now=None):
     """Fold 2+ consecutive quiet cycles into ONE muted line — the fix for the
     wall of near-identical routine lines burying the cycles that mattered. A
     lone quiet cycle is left alone (one line is not a wall). The folded cycles
@@ -1760,44 +1817,85 @@ def render_quiet_group(records):
     return ('<div class="run-entry run-entry--quiet">'
             '<div class="event event--muted"><span class="event-msg">{msg}</span></div>'
             '{detail}</div>').format(
-        msg=escape(build_quiet_group_summary(records)),
+        msg=escape(build_quiet_group_summary(records, now)),
         detail=render_run_detail(key, "all {}".format(len(records)), inner))
 
 
-def render_run_state_history(state_runs, max_runs=20):
+def render_run_state_history(state_runs, max_runs=20, now=None):
     """Render the run-history feed from the bot's persisted run-state records.
-    Newest first.
+    Newest first, grouped under a header per calendar day ("Today",
+    "Yesterday", "Tue 8 Sep") so each line can keep its compact HH:MM.
 
     A cycle that did something — a download, an error — gets its own line with
     those events spelled out (which series, which episodes, what went wrong).
     Consecutive cycles that did nothing fold into a single muted grouped line,
     so a wall of identical routine lines can no longer bury the ones that
-    mattered. Returns "" when nothing is renderable, so the caller can fall back
-    to the log-parsed event feed."""
+    mattered. A fold never crosses a day header: a new day closes the open
+    group first. A record whose timestamp is missing or garbage stays under the
+    current header. Returns "" when nothing is renderable, so the caller can
+    fall back to the log-parsed event feed."""
     display = list(reversed(state_runs))[:max_runs]
     html = ""
     quiet_group = []
+    current_day = None
     for record in display:
         if not build_run_summary(record):
             continue
+        fin = _parse_state_ts(record.get("finished_ts"))
+        if fin and fin.date() != current_day:
+            html += render_quiet_group(quiet_group, now)
+            quiet_group = []
+            current_day = fin.date()
+            html += render_run_day(current_day, now)
         if cycle_is_quiet(record):
             quiet_group.append(record)
             continue
-        html += render_quiet_group(quiet_group)
+        html += render_quiet_group(quiet_group, now)
         quiet_group = []
         html += render_run_cycle(record)
-    return html + render_quiet_group(quiet_group)
+    return html + render_quiet_group(quiet_group, now)
 
 
-def render_run_history(runs, state_runs=None, max_runs=20):
+def _log_clock_offset(runs):
+    """How far the bot's own log clock (the ``[HH:MM:SS]`` it prints, in the
+    container's TZ) sits from Docker's UTC line prefix, read off the newest run
+    carrying both. The log feed shows the bot's clock, so its day headers must
+    be drawn on that clock too, or a 00:30 line would sit under the previous
+    day. Zero when nothing pairs up (the compose default is TZ=UTC anyway)."""
+    for run in reversed(runs):
+        ts = _parse_state_ts(run.get("docker_ts"))
+        try:
+            clock = datetime.strptime(run.get("time") or "", "%H:%M:%S").time()
+        except ValueError:
+            continue
+        if ts is None:
+            continue
+        # The bot's clock may have already crossed midnight, or not yet.
+        local = min((datetime.combine(ts.date() + timedelta(days=d), clock)
+                     for d in (-1, 0, 1)), key=lambda c: abs(c - ts))
+        # Round to a quarter hour: zones are, the two stamps' jitter is not.
+        return timedelta(seconds=round((local - ts).total_seconds() / 900) * 900)
+    return timedelta(0)
+
+
+def _log_run_day(run, offset):
+    """The bot-clock calendar day a log-parsed run happened on, or None when
+    its line carried no usable Docker timestamp."""
+    ts = _parse_state_ts(run.get("docker_ts")) if isinstance(run, dict) else None
+    return (ts + offset).date() if ts else None
+
+
+def render_run_history(runs, state_runs=None, max_runs=20, now=None):
     """Render the run history feed.
 
     Prefers the bot's persisted run-state records (`state_runs`) — one concise
     summary line per cycle, independent of the rolling log tail. Falls back to
     the log-parsed event feed (`runs`) when no run-state records exist, so the
-    no-record case (older bot, fresh deploy) does not regress."""
+    no-record case (older bot, fresh deploy) does not regress. Both feeds group
+    their lines under calendar-day headers; a log line without a Docker
+    timestamp simply stays under the current one."""
     if state_runs:
-        state_html = render_run_state_history(state_runs, max_runs=max_runs)
+        state_html = render_run_state_history(state_runs, max_runs=max_runs, now=now)
         if state_html:
             return state_html
 
@@ -1808,8 +1906,11 @@ def render_run_history(runs, state_runs=None, max_runs=20):
 
     # Show most recent runs first, limit count
     display_runs = list(reversed(runs))[:max_runs]
+    offset = _log_clock_offset(runs)
+    local_now = (now or _utc_now()) + offset
 
     html = ""
+    current_day = None
     for run in display_runs:
         time_str = run.get("time", "")
         anime = run.get("anime", "")
@@ -1820,6 +1921,11 @@ def render_run_history(runs, state_runs=None, max_runs=20):
 
         if not anime and not events:
             continue
+
+        day = _log_run_day(run, offset)
+        if day and day != current_day:
+            current_day = day
+            html += render_run_day(day, local_now)
 
         html += '<div class="run-entry">'
         # Only show a header when there's a real anime name or a run time. Routine
@@ -1845,8 +1951,8 @@ def render_run_history(runs, state_runs=None, max_runs=20):
     return html
 
 
-def render_move_status():
-    """Render move status and last run time."""
+def render_move_status(now=None):
+    """Render move status and last run time (day-qualified when not today)."""
     if _move_running:
         status_html = '<span class="status-dot running"></span>Running'
     else:
@@ -1854,7 +1960,12 @@ def render_move_status():
 
     with _move_lock:
         if _move_last_run:
-            last_html = _move_last_run.strftime("%H:%M:%S")
+            last = _move_last_run
+            # The worker stamps an aware UTC time; compare days on naive UTC
+            # like every other feed timestamp.
+            if last.tzinfo is not None:
+                last = last.astimezone(timezone.utc).replace(tzinfo=None)
+            last_html = format_day_time(last, now=now)
         elif not os.path.isdir(DOWNLOAD_DIR):
             last_html = '<span class="faint">Download dir not mounted</span>'
         else:

@@ -1,5 +1,6 @@
 """Tests for the pure-logic functions in web/app.py."""
 
+import contextlib
 import html
 import json
 import os
@@ -7,12 +8,24 @@ import shutil
 import tempfile
 import time
 import unittest
+import zoneinfo
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs, quote
 
 import support
 
 app = support.load_app()
+
+
+def setUpModule():
+    # Render-time conversion uses the process's zone by default. The
+    # expectations below are written for TZ=UTC, so pin that rather than lean
+    # on the host's zone; the local-zone tests set their own.
+    app._display_tz = timezone.utc
+
+
+def tearDownModule():
+    app._display_tz = None
 
 
 class LangInListTest(unittest.TestCase):
@@ -936,6 +949,28 @@ class RunHistoryBackCompatTest(unittest.TestCase):
 # Thu 10 Sep 2026, 12:00 UTC — the pinned "now" for the day-grouping tests.
 _NOW = datetime(2026, 9, 10, 12, 0)
 
+# Europe/Berlin in summer, as a fixed offset so the cross-midnight tests need
+# no tz database; the DST test uses the real zone when the host has one.
+_CEST = timezone(timedelta(hours=2), "CEST")
+
+
+@contextlib.contextmanager
+def _display_zone(tz):
+    """Render as if the process ran under ``tz`` (what TZ=... gives libc)."""
+    saved = app._display_tz
+    app._display_tz = tz
+    try:
+        yield
+    finally:
+        app._display_tz = saved
+
+
+def _berlin():
+    try:
+        return zoneinfo.ZoneInfo("Europe/Berlin")
+    except zoneinfo.ZoneInfoNotFoundError:
+        return None
+
 
 class RunHistoryDayGroupingTest(unittest.TestCase):
     """The bot cycles about once a day, so a bare HH:MM made last Tuesday's
@@ -1071,13 +1106,15 @@ class LogFeedDayGroupingTest(unittest.TestCase):
         self.assertIn("Naruto", html_out)
         self.assertNotIn("run-day", html_out)
 
-    def test_headers_follow_the_bot_clock_not_docker_utc(self):
-        # TZ=Europe/Berlin: the bot prints 00:30 on the 10th while Docker says
-        # 22:30Z on the 9th. The line shows 00:30, so it belongs to the 10th.
+    def test_headers_follow_the_local_clock_not_docker_utc(self):
+        # TZ=Europe/Berlin (both containers): the bot prints 00:30 on the 10th
+        # while Docker says 22:30Z on the 9th. The line shows 00:30, so it
+        # belongs to the 10th.
         raw = ["2026-09-09T22:30:00.000000000Z [00:30:00] Prüfe Frieren auf updates",
                "2026-09-09T22:30:04.000000000Z [DOWNLOAD] Frieren ep2"]
-        html_out = app.render_run_history(app.parse_bot_logs(raw), None,
-                                          now=datetime(2026, 9, 9, 23, 0))
+        with _display_zone(_CEST):
+            html_out = app.render_run_history(app.parse_bot_logs(raw), None,
+                                              now=datetime(2026, 9, 9, 23, 0))
         self.assertIn(">Today<", html_out)
         self.assertNotIn("Yesterday", html_out)
 
@@ -1087,6 +1124,112 @@ class LogFeedDayGroupingTest(unittest.TestCase):
         act = {"status": {"running": True}, "runs": runs, "last_run": runs[-1], "next_run": ""}
         _s, last_html, _n = app.render_activity(act, now=_NOW)
         self.assertEqual(last_html, "Yesterday 18:44:00 &mdash; Frieren")
+
+
+class LocalZoneDisplayTest(unittest.TestCase):
+    """Run-state stores UTC, but the bot's log lines are in the container's TZ.
+    Times, day headers and "Today" are converted to the process's zone at
+    render time, so a TZ=Europe/Berlin dashboard reads like its own logs."""
+
+    def _quiet(self, ts):
+        return _cycle(ts, entries=18, checked=2, downloaded=0, errors=0)
+
+    def test_times_are_shown_on_the_local_clock(self):
+        rec = _cycle("2026-09-10T06:10:00Z", entries=4, checked=4, downloaded=1)
+        with _display_zone(_CEST):
+            self.assertEqual(app.build_run_summary(rec), "08:10 — checked 4/4 · 1 downloaded")
+        self.assertEqual(app.build_run_summary(rec), "06:10 — checked 4/4 · 1 downloaded")
+
+    def test_quiet_fold_splits_at_local_midnight_not_utc(self):
+        # 21:50Z-22:10Z on the 9th is all one UTC day, but Berlin crosses
+        # midnight at 22:00Z: 23:50/23:55 on the 9th, 00:05/00:10 on the 10th.
+        state_runs = [self._quiet("2026-09-09T21:50:00Z"), self._quiet("2026-09-09T21:55:00Z"),
+                      self._quiet("2026-09-09T22:05:00Z"), self._quiet("2026-09-09T22:10:00Z")]
+        with _display_zone(_CEST):
+            html_out = app.render_run_state_history(state_runs, now=_NOW)
+        self.assertEqual(html_out.count('class="run-day"'), 2)
+        self.assertLess(html_out.index(">Today<"), html_out.index("00:05 – 00:10 · 2 quiet cycles"))
+        self.assertLess(html_out.index("00:05 – 00:10"), html_out.index(">Yesterday<"))
+        self.assertLess(html_out.index(">Yesterday<"), html_out.index("23:50 – 23:55 · 2 quiet cycles"))
+        # The same records on the UTC clock: one day, one fold.
+        html_utc = app.render_run_state_history(state_runs, now=_NOW)
+        self.assertEqual(html_utc.count('class="run-day"'), 1)
+        self.assertIn(">Yesterday<", html_utc)
+        self.assertIn("21:50 – 22:10 · 4 quiet cycles", html_utc)
+
+    def test_today_is_the_local_day(self):
+        # 22:30Z on the 9th is already 00:30 on the 10th in Berlin, so a run
+        # at 20:00Z (22:00 local) was yesterday there, and today in UTC.
+        now = datetime(2026, 9, 9, 22, 30)
+        state_last = {"finished_ts": "2026-09-09T20:00:00Z", "counts": {"entries": 8, "checked": 5}}
+        with _display_zone(_CEST):
+            self.assertEqual(app.format_last_run_display(state_last, now=now),
+                             "Yesterday 22:00:00 &mdash; checked 5/8")
+        self.assertEqual(app.format_last_run_display(state_last, now=now),
+                         "20:00:00 &mdash; checked 5/8")
+
+    def test_last_run_after_local_midnight_is_today(self):
+        state_last = {"finished_ts": "2026-09-09T22:30:05Z", "counts": {"entries": 8, "checked": 5}}
+        now = datetime(2026, 9, 10, 6, 0)
+        with _display_zone(_CEST):
+            self.assertEqual(app.format_last_run_display(state_last, now=now),
+                             "00:30:05 &mdash; checked 5/8")
+        self.assertEqual(app.format_last_run_display(state_last, now=now),
+                         "Yesterday 22:30:05 &mdash; checked 5/8")
+
+    def test_move_status_uses_the_local_clock(self):
+        saved = app._move_last_run
+        app._move_last_run = datetime(2026, 6, 13, 23, 50, 0, tzinfo=timezone.utc)
+        try:
+            with _display_zone(_CEST):
+                _s, last_html = app.render_move_status(now=datetime(2026, 6, 14, 0, 10))
+        finally:
+            app._move_last_run = saved
+        self.assertEqual(last_html, "01:50:00")
+
+    def test_state_and_log_feeds_agree(self):
+        # One moment, 22:30Z on the 9th, seen through both feeds under Berlin:
+        # the bot printed 00:30, the state line says 00:30, both under Today.
+        now = datetime(2026, 9, 10, 6, 0)
+        rec = _cycle("2026-09-09T22:30:00Z", entries=4, checked=4, downloaded=1)
+        raw = ["2026-09-09T22:30:00.000000000Z [00:30:00] Prüfe Frieren auf updates",
+               "2026-09-09T22:30:04.000000000Z [DOWNLOAD] Frieren ep2"]
+        with _display_zone(_CEST):
+            state_html = app.render_run_state_history([rec], now=now)
+            log_html = app.render_run_history(app.parse_bot_logs(raw), None, now=now)
+        self.assertTrue(state_html.startswith('<div class="run-day">Today</div>'))
+        self.assertTrue(log_html.startswith('<div class="run-day">Today</div>'))
+        self.assertIn("00:30 — checked 4/4", state_html)
+        self.assertIn('<span class="run-time">00:30:00</span>', log_html)
+
+    def test_next_run_eta_does_not_depend_on_the_zone(self):
+        next_ts = _iso(datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=330))
+        with _display_zone(_CEST):
+            self.assertEqual(app.format_next_run_display({"next_run_ts": next_ts,
+                                                          "timedelay": 600}), "~5 min")
+
+    def test_unconvertible_timestamp_stays_in_utc(self):
+        # +2h past the last representable instant overflows; the page must not.
+        with _display_zone(_CEST):
+            self.assertEqual(app._to_local(datetime(9999, 12, 31, 23, 0)),
+                             datetime(9999, 12, 31, 23, 0))
+
+    @unittest.skipIf(_berlin() is None, "no tz database for Europe/Berlin")
+    def test_dst_boundaries_use_each_timestamps_own_offset(self):
+        berlin = _berlin()
+        with _display_zone(berlin):
+            # Autumn: 02:30 happens twice on 25 Oct, once in CEST, once in CET.
+            self.assertEqual(app._local_ts("2026-10-25T00:30:00Z"), datetime(2026, 10, 25, 2, 30))
+            self.assertEqual(app._local_ts("2026-10-25T01:30:00Z"), datetime(2026, 10, 25, 2, 30))
+            # Spring: 02:xx never happens on 29 Mar; 01:30Z is already 03:30.
+            self.assertEqual(app._local_ts("2026-03-29T00:30:00Z"), datetime(2026, 3, 29, 1, 30))
+            self.assertEqual(app._local_ts("2026-03-29T01:30:00Z"), datetime(2026, 3, 29, 3, 30))
+            # Winter is +1: 23:30Z is half past midnight on the next day.
+            html_out = app.render_run_state_history(
+                [_cycle("2026-12-01T23:30:00Z", entries=4, checked=4, downloaded=1)],
+                now=datetime(2026, 12, 2, 8, 0))
+        self.assertTrue(html_out.startswith('<div class="run-day">Today</div>'))
+        self.assertIn("00:30 — checked 4/4", html_out)
 
 
 class ConfirmAttrTest(unittest.TestCase):

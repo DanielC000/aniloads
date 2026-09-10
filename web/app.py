@@ -356,18 +356,45 @@ def _parse_state_ts(ts):
         return None
 
 
-# Dates in the feed. Timestamps are naive UTC and printed as-is, so "today" is
-# the UTC calendar day too: a day boundary drawn in any other zone would put a
-# 23:30 line under the wrong header. `now` is injectable so tests can pin it.
+# Dates in the feed. Timestamps are stored as naive UTC and only turned into
+# local wall time here, at render time, so every time, day header and
+# "Today"/"Yesterday" is drawn on one clock: the process's own zone. None means
+# exactly that: astimezone() goes through libc, which honours TZ, and compose
+# hands the bot the same TZ, so the feed reads like the bot's own log lines. A
+# TZ libc cannot resolve falls back to UTC, which is the old output. Tests pin
+# the zone so they don't depend on the host's. `now` is always the current UTC
+# instant (naive) and is injectable so tests can pin it too.
+_display_tz = None
+
 
 def _utc_now():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _to_local(dt):
+    """A UTC datetime (naive means UTC) as naive local wall time. A value the
+    platform cannot convert (a garbage year far outside the epoch) stays in UTC
+    rather than failing the page."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    try:
+        dt = dt.astimezone(_display_tz)
+    except (OverflowError, OSError, ValueError):
+        pass
+    return dt.replace(tzinfo=None)
+
+
+def _local_ts(ts):
+    """A run-state UTC timestamp as naive local wall time, or None."""
+    dt = _parse_state_ts(ts)
+    return _to_local(dt) if dt else None
+
+
 def format_day(day, now=None):
     """A calendar day as a reader says it: "Today", "Yesterday", else
-    "Tue 8 Sep" (plus the year once it is not this year's). ``day`` is a date."""
-    today = (now or _utc_now()).date()
+    "Tue 8 Sep" (plus the year once it is not this year's). ``day`` is a local
+    date; ``now`` is the UTC instant that decides which day is today."""
+    today = _to_local(now or _utc_now()).date()
     if day == today:
         return "Today"
     if day == today - timedelta(days=1):
@@ -380,7 +407,7 @@ def format_day(day, now=None):
 
 
 def format_day_time(dt, fmt="%H:%M:%S", now=None):
-    """A time with a day qualifier only when it is not today:
+    """A local wall time with a day qualifier only when it is not today:
     "18:44:05", "Yesterday 18:44:05", "Tue 8 Sep 18:44:05"."""
     label = format_day(dt.date(), now)
     clock = dt.strftime(fmt)
@@ -406,13 +433,13 @@ def format_next_run_display(state_last):
 
 
 def format_last_run_display(state_last, now=None):
-    """Last-run line from the persisted run-state record: the cycle's UTC finish
-    time plus a brief count summary (e.g. "19:20:05 &mdash; checked 5/8, 2
-    downloaded"). The time carries a day qualifier when the run was not today
+    """Last-run line from the persisted run-state record: the cycle's local
+    finish time plus a brief count summary (e.g. "19:20:05 &mdash; checked 5/8,
+    2 downloaded"). The time carries a day qualifier when the run was not today
     ("Yesterday 19:20:05"), since the bot may only cycle once a day. Returns ""
     when nothing renderable is present, so the caller falls back to the
     log-tail display."""
-    fin = _parse_state_ts(state_last.get("finished_ts"))
+    fin = _local_ts(state_last.get("finished_ts"))
     hhmmss = format_day_time(fin, now=now) if fin else ""
 
     counts = state_last.get("counts") or {}
@@ -456,7 +483,7 @@ def build_run_summary(record):
     must render exactly as it did before."""
     if not isinstance(record, dict):
         return ""
-    fin = _parse_state_ts(record.get("finished_ts"))
+    fin = _local_ts(record.get("finished_ts"))
     hhmm = fin.strftime("%H:%M") if fin else ""
 
     counts = record.get("counts") or {}
@@ -1564,10 +1591,9 @@ def render_activity(activity, now=None):
         last_text = last_run_display
     elif last_run and last_run.get("time"):
         last_text = last_run["time"]
-        offset = _log_clock_offset(activity.get("runs") or [last_run])
-        day = _log_run_day(last_run, offset)
+        day = _log_run_day(last_run)
         if day:
-            label = format_day(day, (now or _utc_now()) + offset)
+            label = format_day(day, now)
             if label != "Today":
                 last_text = "{} {}".format(label, last_text)
         if last_run.get("anime"):
@@ -1760,7 +1786,7 @@ def build_quiet_group_summary(records, now=None):
     checks = []
     entry_counts = set()
     for record in records:
-        fin = _parse_state_ts(record.get("finished_ts"))
+        fin = _local_ts(record.get("finished_ts"))
         if fin:
             times.append(fin)
         counts = record.get("counts") or {}
@@ -1841,7 +1867,7 @@ def render_run_state_history(state_runs, max_runs=20, now=None):
     for record in display:
         if not build_run_summary(record):
             continue
-        fin = _parse_state_ts(record.get("finished_ts"))
+        fin = _local_ts(record.get("finished_ts"))
         if fin and fin.date() != current_day:
             html += render_quiet_group(quiet_group, now)
             quiet_group = []
@@ -1856,33 +1882,13 @@ def render_run_state_history(state_runs, max_runs=20, now=None):
     return html + render_quiet_group(quiet_group, now)
 
 
-def _log_clock_offset(runs):
-    """How far the bot's own log clock (the ``[HH:MM:SS]`` it prints, in the
-    container's TZ) sits from Docker's UTC line prefix, read off the newest run
-    carrying both. The log feed shows the bot's clock, so its day headers must
-    be drawn on that clock too, or a 00:30 line would sit under the previous
-    day. Zero when nothing pairs up (the compose default is TZ=UTC anyway)."""
-    for run in reversed(runs):
-        ts = _parse_state_ts(run.get("docker_ts"))
-        try:
-            clock = datetime.strptime(run.get("time") or "", "%H:%M:%S").time()
-        except ValueError:
-            continue
-        if ts is None:
-            continue
-        # The bot's clock may have already crossed midnight, or not yet.
-        local = min((datetime.combine(ts.date() + timedelta(days=d), clock)
-                     for d in (-1, 0, 1)), key=lambda c: abs(c - ts))
-        # Round to a quarter hour: zones are, the two stamps' jitter is not.
-        return timedelta(seconds=round((local - ts).total_seconds() / 900) * 900)
-    return timedelta(0)
-
-
-def _log_run_day(run, offset):
-    """The bot-clock calendar day a log-parsed run happened on, or None when
-    its line carried no usable Docker timestamp."""
-    ts = _parse_state_ts(run.get("docker_ts")) if isinstance(run, dict) else None
-    return (ts + offset).date() if ts else None
+def _log_run_day(run):
+    """The local calendar day a log-parsed run happened on, or None when its
+    line carried no usable Docker timestamp. Docker's prefix is UTC; the local
+    day matches the bot's printed ``[HH:MM:SS]`` because both containers get
+    the same TZ, so a 00:30 line sits under the day it says it is."""
+    ts = _local_ts(run.get("docker_ts")) if isinstance(run, dict) else None
+    return ts.date() if ts else None
 
 
 def render_run_history(runs, state_runs=None, max_runs=20, now=None):
@@ -1906,8 +1912,6 @@ def render_run_history(runs, state_runs=None, max_runs=20, now=None):
 
     # Show most recent runs first, limit count
     display_runs = list(reversed(runs))[:max_runs]
-    offset = _log_clock_offset(runs)
-    local_now = (now or _utc_now()) + offset
 
     html = ""
     current_day = None
@@ -1922,10 +1926,10 @@ def render_run_history(runs, state_runs=None, max_runs=20, now=None):
         if not anime and not events:
             continue
 
-        day = _log_run_day(run, offset)
+        day = _log_run_day(run)
         if day and day != current_day:
             current_day = day
-            html += render_run_day(day, local_now)
+            html += render_run_day(day, now)
 
         html += '<div class="run-entry">'
         # Only show a header when there's a real anime name or a run time. Routine
@@ -1960,12 +1964,9 @@ def render_move_status(now=None):
 
     with _move_lock:
         if _move_last_run:
-            last = _move_last_run
-            # The worker stamps an aware UTC time; compare days on naive UTC
+            # The worker stamps an aware UTC time; shown on the local clock
             # like every other feed timestamp.
-            if last.tzinfo is not None:
-                last = last.astimezone(timezone.utc).replace(tzinfo=None)
-            last_html = format_day_time(last, now=now)
+            last_html = format_day_time(_to_local(_move_last_run), now=now)
         elif not os.path.isdir(DOWNLOAD_DIR):
             last_html = '<span class="faint">Download dir not mounted</span>'
         else:

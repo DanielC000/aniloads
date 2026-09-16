@@ -7,6 +7,8 @@ import support
 animeloads = support.load_animeloads()
 match_batch_episodes = animeloads._match_batch_episodes
 format_ep_range = animeloads._format_ep_range
+searchResult = animeloads.searchResult
+apihelper = animeloads.apihelper
 
 
 def _grouped(episode_numbers):
@@ -106,6 +108,91 @@ class MatchBatchEpisodesTest(unittest.TestCase):
         result = match_batch_episodes(None, _grouped([41, 42]), episode_offset=-40)
         self.assertEqual(sorted(result["episodes_sent"]), [1, 2])
         self.assertEqual(result["episodes_not_found"], [])
+
+
+def _search_result(url="https://www.anime-loads.org/media/123-test", name="Test Anime",
+                    typ="series", relDate="2020", epCountCurrent="5", epCountMax="12",
+                    dubLang=None, subLang=None, genre="Action"):
+    """Build a real searchResult, the shape animeloads.search() returns, with
+    throwaway session/animeloads refs since the accessors under test never
+    touch them."""
+    return searchResult(url, name, typ, relDate, epCountCurrent, epCountMax,
+                         dubLang if dubLang is not None else ["German"],
+                         subLang if subLang is not None else ["English"],
+                         genre, session=None, animeloads=None)
+
+
+class SearchResultAccessorTest(unittest.TestCase):
+    """web/app.py's search_anime() reads a live search result exclusively
+    through these accessors (getUrl/getDubLang/getSubLang/...) — a wrong
+    method name here silently drops every search result behind the caller's
+    broad except/pass, so exercise the real class, never a mock."""
+
+    def test_getUrl_returns_url(self):
+        r = _search_result(url="https://www.anime-loads.org/media/42-foo")
+        self.assertEqual(r.getUrl(), "https://www.anime-loads.org/media/42-foo")
+
+    def test_has_no_getURL_capitalized_variant(self):
+        # getURL (capital URL) belongs to the `anime` class, not searchResult.
+        # web/app.py must never call it on a search result.
+        self.assertFalse(hasattr(searchResult, "getURL"))
+
+    def test_getDubLang_returns_the_list(self):
+        r = _search_result(dubLang=["German", "Japanese"])
+        self.assertEqual(r.getDubLang(), ["German", "Japanese"])
+
+    def test_getSubLang_returns_the_list_not_the_method(self):
+        r = _search_result(subLang=["English"])
+        result = r.getSubLang()
+        self.assertEqual(result, ["English"])
+        self.assertNotEqual(result, r.getSubLang)
+
+
+class SearchAnimeBuilderTest(unittest.TestCase):
+    """Regression test for the dashboard's search-result builder (mirrors
+    web/app.py's search_anime loop) against REAL searchResult instances, so
+    a reintroduced wrong-accessor bug fails loudly instead of being swallowed."""
+
+    def _build(self, results):
+        out = []
+        for r in results:
+            out.append({
+                "name": r.getName(),
+                "url": r.getUrl(),
+                "type": r.getTyp(),
+                "episodes": "{}/{}".format(r.getCurrentEpisodeCount(), r.getMaxEpisodeCount()),
+                "genre": r.getGenre(),
+                "dubs": ", ".join(r.getDubLang() or []),
+                "subs": ", ".join(r.getSubLang() or []),
+            })
+        return out
+
+    def test_real_search_results_produce_non_empty_output(self):
+        results = [
+            _search_result(name="Show One", dubLang=["German"], subLang=["English"]),
+            _search_result(name="Show Two", dubLang=[], subLang=["English"]),
+        ]
+        out = self._build(results)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]["name"], "Show One")
+        self.assertEqual(out[0]["dubs"], "German")
+        self.assertEqual(out[1]["dubs"], "")
+        self.assertEqual(out[1]["subs"], "English")
+
+
+class GetSearchURLEncodingTest(unittest.TestCase):
+    def test_ampersand_is_encoded(self):
+        url = apihelper.getSearchURL("fullmetal & alchemist")
+        self.assertEqual(url, "https://www.anime-loads.org/search?q=fullmetal+%26+alchemist")
+        self.assertNotIn("&alchemist", url.split("q=", 1)[1])
+
+    def test_space_is_encoded(self):
+        url = apihelper.getSearchURL("one piece")
+        self.assertEqual(url, "https://www.anime-loads.org/search?q=one+piece")
+
+    def test_hash_is_encoded(self):
+        url = apihelper.getSearchURL("re:zero #2")
+        self.assertNotIn("#", url)
 
 
 if __name__ == "__main__":

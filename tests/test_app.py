@@ -321,6 +321,93 @@ class RenderReleasesEscapingTest(unittest.TestCase):
         self.assertIn("Sub: Eng&amp;Co", out)
 
 
+class SearchAnimeRealResultTest(unittest.TestCase):
+    """Regression test for the dashboard's "search by name" add path: it was
+    silently returning zero results because search_anime() called a method
+    name (getURL) that only exists on animeloads.anime, not on the
+    searchResult objects al.search() actually returns (getUrl). Drive
+    search_anime() with REAL bot/animeloads.py searchResult instances (never
+    a mock, which would hide a wrong method name) via a fake AL.search()."""
+
+    def setUp(self):
+        animeloads_mod = support.load_animeloads()
+        self._searchResult = animeloads_mod.searchResult
+
+        class FakeAL:
+            def __init__(fake_self, *a, **k):
+                pass
+
+        self._orig_al_available = app.AL_AVAILABLE
+        self._orig_al = getattr(app, "AL", None)
+        app.AL_AVAILABLE = True
+        app.AL = FakeAL
+        app.AL.FIREFOX = "firefox"
+
+    def tearDown(self):
+        app.AL_AVAILABLE = self._orig_al_available
+        app.AL = self._orig_al
+
+    def _real_result(self, name, dubLang, subLang):
+        return self._searchResult(
+            "https://www.anime-loads.org/media/1-" + name, name, "series",
+            "2020", "1", "12", dubLang, subLang, "Action", None, None)
+
+    def test_real_results_are_not_dropped(self):
+        results = [self._real_result("Show One", ["German"], ["English"])]
+        app.AL.search = lambda self, query: results
+
+        out, err = app.search_anime("show one")
+
+        self.assertIsNone(err)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["name"], "Show One")
+        self.assertEqual(out[0]["url"], "https://www.anime-loads.org/media/1-Show One")
+        self.assertEqual(out[0]["dubs"], "German")
+        self.assertEqual(out[0]["subs"], "English")
+
+    def test_a_result_that_still_errors_is_logged_not_swallowed(self):
+        class Broken:
+            def getName(broken_self):
+                raise RuntimeError("boom")
+
+        app.AL.search = lambda self, query: [Broken()]
+
+        with self.assertLogs("anime-web", level="WARNING") as log_ctx:
+            out, err = app.search_anime("broken")
+
+        self.assertIsNone(err)
+        self.assertEqual(out, [])
+        self.assertTrue(any("search_anime" in msg for msg in log_ctx.output))
+
+
+class RenderSearchResultsLangTest(unittest.TestCase):
+    def test_dub_and_sub_shown_when_present(self):
+        out = app.render_search_results([{
+            "name": "Show", "url": "http://x", "type": "series",
+            "episodes": "1/12", "genre": "Action",
+            "dubs": "German", "subs": "English",
+        }])
+        self.assertIn("Dub: German", out)
+        self.assertIn("Sub: English", out)
+
+    def test_lang_line_omitted_when_no_data(self):
+        out = app.render_search_results([{
+            "name": "Show", "url": "http://x", "type": "series",
+            "episodes": "1/12", "genre": "Action",
+            "dubs": "", "subs": "",
+        }])
+        self.assertNotIn("Dub:", out)
+        self.assertNotIn("Sub:", out)
+
+    def test_lang_values_are_html_escaped(self):
+        out = app.render_search_results([{
+            "name": "Show", "url": "http://x", "type": "series",
+            "episodes": "1/12", "genre": "Action",
+            "dubs": "Ger&man", "subs": "",
+        }])
+        self.assertIn("Dub: Ger&amp;man", out)
+
+
 class RenderWatchlistPendingTest(unittest.TestCase):
     def test_no_match_pending_renders_explanatory_line(self):
         out = app.render_watchlist(

@@ -728,13 +728,15 @@ def search_anime(query):
             try:
                 out.append({
                     "name": r.getName(),
-                    "url": r.getURL(),
+                    "url": r.getUrl(),
                     "type": r.getTyp(),
                     "episodes": "{}/{}".format(r.getCurrentEpisodeCount(), r.getMaxEpisodeCount()),
                     "genre": r.getGenre(),
+                    "dubs": ", ".join(r.getDubLang() or []),
+                    "subs": ", ".join(r.getSubLang() or []),
                 })
             except Exception:
-                pass
+                _log.warning("search_anime: failed to read a search result", exc_info=True)
         return out, None
     except Exception as e:
         return None, str(e)
@@ -2243,12 +2245,22 @@ def render_search_results(results):
         return ""
     html = '<div class="section"><h2>Search Results</h2>'
     for r in results:
+        lang_bits = []
+        if r.get("dubs"):
+            lang_bits.append("Dub: " + escape(r["dubs"]))
+        if r.get("subs"):
+            lang_bits.append("Sub: " + escape(r["subs"]))
+        lang_line = ('<div class="anime-meta">' + " &middot; ".join(lang_bits) + '</div>') if lang_bits else ""
+
+        fields = {k: escape(str(v)) for k, v in r.items()}
+        fields["lang_line"] = lang_line
         html += """
         <div class="card">
           <div style="display:flex;justify-content:space-between;align-items:start;gap:12px;">
             <div>
               <div class="anime-name">{name}</div>
               <div class="anime-meta">{type} &middot; {episodes} episodes &middot; {genre}</div>
+              {lang_line}
               <div class="anime-url">{url}</div>
             </div>
             <form method="POST" action="/add-url" style="margin:0;">
@@ -2256,7 +2268,7 @@ def render_search_results(results):
               <button type="submit" class="btn btn-primary btn-sm">Add to watchlist</button>
             </form>
           </div>
-        </div>""".format(**{k: escape(str(v)) for k, v in r.items()})
+        </div>""".format(**fields)
     html += "</div>"
     return html
 

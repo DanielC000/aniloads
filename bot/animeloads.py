@@ -20,7 +20,7 @@ import re
 
 import os, sys
 
-from urllib.parse import unquote
+from urllib.parse import unquote, quote_plus
 
 from selenium import webdriver
 from selenium.webdriver.firefox.service import Service as FirefoxService
@@ -290,6 +290,15 @@ class animeloads:
             #num__results = 1
             result = searchResult(redir_url, redir_anime.getName(), redir_anime.getType(), redir_anime.getYear(), redir_anime.getCurrentEpisodes(), redir_anime.getMaxEpisodes(), ["UNKNOWN"], ["UNKNOWN"], redir_anime.getMainGenre(), self.session, self)
             searchresults.append(result)
+            # updateInfo() keeps its driver alive for downloadEpisode reuse, but
+            # this anime object is thrown away right here, so quit it now or the
+            # Firefox process leaks on every single-result search.
+            try:
+                if getattr(redir_anime, "_driver", None):
+                    redir_anime._driver.quit()
+                    redir_anime._driver = None
+            except Exception:
+                pass
         else:
             search_dom = etree.HTML(searchdata.text)
             searchboxes = search_dom.xpath("//div/div[@class='panel panel-default' and 1]/div[@class='panel-body' and 1]")
@@ -790,7 +799,7 @@ class utils:
 class apihelper:
     @staticmethod
     def getSearchURL(query):
-        return "https://www.anime-loads.org/search?q=" + query
+        return "https://www.anime-loads.org/search?q=" + quote_plus(query)
 
 
 
@@ -831,7 +840,7 @@ class searchResult():
         return self.dubLang
 
     def getSubLang(self):
-        return self.getSubLang
+        return self.subLang
 
     def getGenre(self):
         return self.genre

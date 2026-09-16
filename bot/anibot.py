@@ -78,6 +78,24 @@ def log(message, pushbullet):
         pass
     _log.info(message)
 
+def _pushkey_set(pushkey):
+    return isinstance(pushkey, str) and pushkey.strip() != ""
+
+def init_pushbullet(pushkey):
+    """Build the Pushbullet client, or "" when disabled/unusable.
+
+    The Pushbullet constructor validates the key over the network, so an
+    invalid/revoked key, a null/missing key in ani.json, or a boot-time
+    network error must not crash the bot into a container restart loop.
+    """
+    if not _pushkey_set(pushkey):
+        return ""
+    try:
+        return Pushbullet(pushkey)
+    except Exception as e:
+        _log.warning("Pushbullet disabled: %s", e)
+        return ""
+
 def compare(inputstring, validlist):
     for v in validlist:
         if(v.lower() in inputstring.lower()):
@@ -882,10 +900,7 @@ def startbot():
             time.sleep(delay)
             jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport, al_user, al_pass = loadconfig()
 
-    if(pushkey != ""):
-        pb = Pushbullet(pushkey)
-    else:
-        pb = ""
+    pb = init_pushbullet(pushkey)
     
     # The animeloads() constructor launches headless Firefox/geckodriver to fetch
     # DDoS-Guard cookies. A cold-start Selenium failure (resource contention while

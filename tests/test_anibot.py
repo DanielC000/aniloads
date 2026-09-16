@@ -198,6 +198,68 @@ class WriteRunStateTest(unittest.TestCase):
                          {"kind", "anime", "episodes"})
 
 
+class FakePushbullet:
+    """Stands in for pushbullet.Pushbullet: the real constructor validates
+    the key over the network, which is exactly the failure mode under test."""
+
+    def __init__(self, key):
+        if key != "valid-key":
+            raise Exception("Invalid access token")
+        self.key = key
+
+    def push_note(self, title, message):
+        raise Exception("network error")
+
+
+class InitPushbulletTest(unittest.TestCase):
+    """bot/anibot.py ~L885: an invalid/revoked Pushbullet key, or a null key
+    in ani.json, must not crash the bot into a container restart loop."""
+
+    def setUp(self):
+        self._orig_pushbullet = anibot.Pushbullet
+        anibot.Pushbullet = FakePushbullet
+
+    def tearDown(self):
+        anibot.Pushbullet = self._orig_pushbullet
+
+    def test_valid_key_constructs_client(self):
+        pb = anibot.init_pushbullet("valid-key")
+        self.assertIsInstance(pb, FakePushbullet)
+
+    def test_invalid_key_disables_without_raising(self):
+        pb = anibot.init_pushbullet("revoked-key")
+        self.assertEqual(pb, "")
+
+    def test_none_key_is_treated_as_unset(self):
+        self.assertEqual(anibot.init_pushbullet(None), "")
+
+    def test_false_key_is_treated_as_unset(self):
+        self.assertEqual(anibot.init_pushbullet(False), "")
+
+    def test_whitespace_key_is_treated_as_unset(self):
+        self.assertEqual(anibot.init_pushbullet("   "), "")
+
+    def test_empty_string_key_is_treated_as_unset(self):
+        self.assertEqual(anibot.init_pushbullet(""), "")
+
+    def test_pushbullet_import_missing_does_not_raise(self):
+        # Simulates the `from pushbullet import Pushbullet` ImportError path,
+        # where the module sets Pushbullet = None.
+        anibot.Pushbullet = None
+        self.assertEqual(anibot.init_pushbullet("valid-key"), "")
+
+
+class LogPushbulletNeverRaisesTest(unittest.TestCase):
+    """log() must never propagate a failed push (invalid key, network error,
+    or pb == "" for a disabled client) — only best-effort deliver + log."""
+
+    def test_unset_pushbullet_does_not_raise(self):
+        anibot.log("hello", "")
+
+    def test_pushbullet_push_failure_does_not_raise(self):
+        anibot.log("hello", FakePushbullet("valid-key"))
+
+
 class ConfigUtf8Test(unittest.TestCase):
     """loadconfig/write_run_state must read/write UTF-8 regardless of the
     platform's default locale encoding (cp1252 on Windows). Fixtures are

@@ -51,6 +51,15 @@ CONFIG_DIR = os.environ.get("CONFIG_DIR", "/config")
 ANI_JSON = os.path.join(CONFIG_DIR, "ani.json")
 PREFS_FILE = os.path.join(CONFIG_DIR, "web-prefs.json")
 RUN_STATE_FILE = os.path.join(CONFIG_DIR, "run_state.json")
+# Soft run-now trigger consumed by bot/anibot.py's sleep_until_next_cycle() /
+# consume_run_now_trigger() — replaces restarting the bot container (see
+# trigger_run_now() below). RUN_NOW_STATE_FILE is dashboard-only bookkeeping
+# for the cooldown: the bot deletes RUN_NOW_FILE within a few seconds of
+# consuming it, well before the cooldown window is up, so the cooldown can't
+# be tracked off that file's presence/mtime alone.
+RUN_NOW_FILE = os.path.join(CONFIG_DIR, "run_now")
+RUN_NOW_STATE_FILE = os.path.join(CONFIG_DIR, "run_now_last.json")
+RUN_NOW_COOLDOWN_SECONDS = int(os.environ.get("RUN_NOW_COOLDOWN_SECONDS", "120"))
 MOVE_HISTORY_FILE = os.path.join(CONFIG_DIR, "move_history.json")
 PORT = int(os.environ.get("PORT", "8080"))
 BOT_CONTAINER = os.environ.get("BOT_CONTAINER", "anime-loads")
@@ -155,21 +164,6 @@ class DockerAPI:
             except Exception:
                 pass
         return lines
-
-    def restart_container(self, container=BOT_CONTAINER):
-        if not self.available:
-            return False, "Docker socket not available"
-        # Fire-and-forget: Docker restart blocks for seconds while the
-        # container stops + starts.  Run it in a background thread so the
-        # HTTP handler can redirect the browser immediately.
-        t = threading.Thread(
-            target=self._request,
-            args=("POST", "/containers/{}/restart?t=5".format(container)),
-            daemon=True,
-        )
-        t.start()
-        return True, "Container restart triggered"
-
 
 docker = DockerAPI()
 
@@ -711,6 +705,140 @@ def update_ani(fn):
     returning a replacement dict) — no network/scrape calls inside it, since
     it runs while the lock is held; do any scraping before calling this."""
     return anistore.update(ANI_JSON, fn, default={"settings": {}, "anime": []})
+
+
+# ---------------------------------------------------------------------------
+# Soft run-now / per-entry check-now
+# ---------------------------------------------------------------------------
+
+def _load_run_now_last():
+    try:
+        with open(RUN_NOW_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    # ValueError also covers UnicodeDecodeError (a corrupt/non-UTF-8 file);
+    # see load_run_state's comment for why this is a deliberate widening.
+    except (FileNotFoundError, OSError, ValueError):
+        return {}
+
+
+def _write_small_json(path, data):
+    """Atomically write a small dashboard-only JSON file (tmp + os.replace).
+    Unlike anistore.save, this is never read/written by the bot container, so
+    it needs no cross-container permission matching — a fixed 0o644 mode
+    (same as save_move_state) is enough."""
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=d, prefix=".dashboard-")
+        os.chmod(tmp_path, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, path)
+        return True
+    except OSError as e:
+        _log.error("[run-now] Failed to persist %s: %s", path, e)
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        return False
+
+
+def run_now_cooldown_remaining(now=None):
+    """Seconds remaining before another run-now/check-now request is
+    allowed, or 0 if the cooldown has elapsed (or none has ever run).
+
+    Tracked in RUN_NOW_STATE_FILE rather than off the run_now trigger
+    file's own presence/mtime — the bot deletes that file within a few
+    seconds of consuming it (see sleep_until_next_cycle's slice_seconds),
+    well before the RUN_NOW_COOLDOWN_SECONDS window is actually up."""
+    now = now or datetime.utcnow()
+    last = _load_run_now_last().get("last_requested_at")
+    if not last:
+        return 0
+    try:
+        last_dt = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, TypeError):
+        return 0
+    remaining = RUN_NOW_COOLDOWN_SECONDS - (now - last_dt).total_seconds()
+    return max(0, int(remaining))
+
+
+def trigger_run_now(entry_url=None):
+    """Queue a run-now (entry_url=None) or per-entry "Check now" request,
+    subject to the shared cooldown.
+
+    Writes the RUN_NOW_FILE trigger the bot's inter-cycle sleep wakes early
+    on (see bot/anibot.py's sleep_until_next_cycle / consume_run_now_trigger)
+    — a soft, non-destructive replacement for restarting the bot container:
+    it never kills an in-flight cycle (possibly mid JDownloader hand-off),
+    and it doesn't force a browser re-init + re-login.
+
+    For a per-entry request, also sets force_check=True on that watchlist
+    entry (cleared by the bot after one scrape — see anibot.resolve_force_check)
+    so that entry's skip logic (airdate/complete/skip_until/TVDB) is bypassed
+    for this one triggered cycle; the global trigger file is still needed so
+    the bot actually wakes up to run that cycle.
+
+    Returns (ok, message)."""
+    remaining = run_now_cooldown_remaining()
+    if remaining > 0:
+        return False, "Cooling down — try again in {}s".format(remaining)
+
+    name = None
+    if entry_url:
+        outcome = {}
+
+        def _set_force_check(data):
+            anime_list = data.get("anime", [])
+            _, entry = find_entry_by_url(anime_list, entry_url)
+            if entry is None:
+                outcome["result"] = "not_found"
+                return
+            entry["force_check"] = True
+            outcome["result"] = "ok"
+            outcome["name"] = entry.get("name", "?")
+
+        update_ani(_set_force_check)
+        if outcome.get("result") != "ok":
+            return False, "Entry not found"
+        name = outcome.get("name")
+
+    now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    if not _write_run_now_trigger(now_iso):
+        return False, "Failed to write run-now trigger"
+    _write_small_json(RUN_NOW_STATE_FILE, {"last_requested_at": now_iso})
+
+    if name:
+        return True, "Check now queued for {} — starts within a few seconds".format(name)
+    return True, "Run now queued — starts after the current cycle, within a few seconds"
+
+
+def _write_run_now_trigger(timestamp):
+    """Write RUN_NOW_FILE's content as plain text (an ISO timestamp), not
+    JSON — the bot only checks for the file's existence and reads its
+    content as an opaque string (anibot.consume_run_now_trigger)."""
+    d = os.path.dirname(RUN_NOW_FILE) or "."
+    os.makedirs(d, exist_ok=True)
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=d, prefix=".run-now-")
+        os.chmod(tmp_path, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(timestamp)
+        os.replace(tmp_path, RUN_NOW_FILE)
+        return True
+    except OSError as e:
+        _log.error("[run-now] Failed to write trigger file: %s", e)
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        return False
 
 
 def load_prefs():
@@ -1959,7 +2087,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
       <div>
         <form method="POST" action="/run-now" style="margin:0;">
-          <button type="submit" class="btn btn-warning" onclick="return confirm('Restart bot and trigger a new run?')">Run Now</button>
+          <button type="submit" class="btn btn-warning">Run Now</button>
         </form>
       </div>
     </div>
@@ -2909,10 +3037,16 @@ def render_watchlist(anime_list, pending_list=None):
               </div>
               {folder_html}
             </div>
-            <form method="POST" action="/remove" style="margin:0;">
-              <input type="hidden" name="key" value="{key}">
-              <button type="submit" class="btn btn-danger btn-sm" onclick="{remove_confirm}">Remove</button>
-            </form>
+            <div style="display:flex;gap:8px;">
+              <form method="POST" action="/check-now" style="margin:0;">
+                <input type="hidden" name="key" value="{key}">
+                <button type="submit" class="btn btn-ghost btn-sm">Check now</button>
+              </form>
+              <form method="POST" action="/remove" style="margin:0;">
+                <input type="hidden" name="key" value="{key}">
+                <button type="submit" class="btn btn-danger btn-sm" onclick="{remove_confirm}">Remove</button>
+              </form>
+            </div>
           </div>
           {ep_panel}
         </div>""".format(
@@ -3327,12 +3461,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch_post(self, parsed, params):
         if parsed.path == "/run-now":
-            ok, msg = docker.restart_container()
+            ok, msg = trigger_run_now()
             if ok:
-                _log.info("[bot] Restart requested via dashboard")
-                self._redirect_msg("Bot restarting, new run will begin shortly")
+                _log.info("[bot] Run now requested via dashboard")
+                self._redirect_msg(msg)
             else:
-                _log.warning("[bot] Restart failed: %s", msg)
+                _log.warning("[bot] Run now request rejected: %s", msg)
+                self._redirect_msg("Error: {}".format(msg))
+
+        elif parsed.path == "/check-now":
+            entry_url = params.get("key", "")
+            ok, msg = trigger_run_now(entry_url=entry_url)
+            if ok:
+                _log.info("[bot] Check now requested via dashboard: %s", entry_url)
+                self._redirect_msg(msg)
+            else:
+                _log.warning("[bot] Check now request rejected: %s", msg)
                 self._redirect_msg("Error: {}".format(msg))
 
         elif parsed.path == "/move-now":

@@ -287,6 +287,152 @@ def compute_entry_delta(before, after, scalar_fields=BOT_OWNED_SCALAR_FIELDS,
 
     return fields, unset, list_deltas
 
+# Soft run-now: the dashboard drops this trigger file next to ani.json (see
+# web/app.py's trigger_run_now()) instead of restarting the bot container.
+# The bot wakes its inter-cycle sleep early when it appears (sleep_until_next_cycle)
+# and consumes (deletes) it at the start of the cycle it triggers
+# (consume_run_now_trigger) — a request arriving mid-cycle just sits there until
+# that point, so it is always honored *after* the running cycle, never by
+# interrupting it.
+RUN_NOW_FILE = "run_now"
+RUN_NOW_SLEEP_SLICE = int(os.environ.get("RUN_NOW_SLEEP_SLICE", "5"))
+
+def _run_now_path():
+    """Path to the run_now trigger file, alongside the watchlist (ani.json).
+    Derived from botfile like _run_state_path()."""
+    return os.path.join(os.path.dirname(botfile) or ".", RUN_NOW_FILE)
+
+def sleep_until_next_cycle(seconds, trigger_path, slice_seconds=RUN_NOW_SLEEP_SLICE,
+                            sleep_fn=time.sleep, time_fn=time.monotonic):
+    """Sleep for `seconds`, waking early if `trigger_path` appears.
+
+    Sleeps in slices of at most `slice_seconds` instead of one long
+    time.sleep() call, so a run-now request created mid-sleep (or already
+    sitting there from a cycle that just finished) is noticed within
+    `slice_seconds` instead of waiting out the rest of the inter-cycle
+    delay. Never called from inside a cycle — this only runs between
+    cycles, so a trigger can never interrupt in-flight work (e.g. a
+    JDownloader hand-off).
+
+    Returns True if woken early by the trigger file, False if `seconds`
+    elapsed naturally without one appearing. `sleep_fn`/`time_fn` are
+    injectable so tests can exercise this without a real sleep."""
+    if not isinstance(seconds, int) or seconds <= 0:
+        return os.path.exists(trigger_path)
+    deadline = time_fn() + seconds
+    while True:
+        if os.path.exists(trigger_path):
+            return True
+        remaining = deadline - time_fn()
+        if remaining <= 0:
+            return False
+        sleep_fn(min(slice_seconds, remaining))
+
+def consume_run_now_trigger(path):
+    """Atomically consume (delete) the run_now trigger file if present.
+
+    Returns its content (the ISO timestamp the dashboard wrote) if a
+    trigger was pending, or None if there was none. A race where the file
+    vanishes between the read and the remove (only the bot ever deletes it,
+    so this should not happen in practice) is swallowed — the request was
+    already effectively consumed either way."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return content or "manual"
+
+def resolve_force_check(path, url):
+    """Peek a FRESH on-disk read of `url`'s entry for a pending
+    `force_check` request (dashboard "Check now" on one card), and
+    unconditionally clear it — a one-shot override honored at most once,
+    even if the scrape that follows fails.
+
+    Reads fresh (not the cycle-start snapshot passed around the rest of
+    startbot()'s loop) so a request made after this cycle began is still
+    honored this same cycle. `force_check` is deliberately NOT in
+    BOT_OWNED_SCALAR_FIELDS — it is dashboard-set/bot-cleared, so clearing
+    it must be this explicit merge_entry_fields(unset=...) call, never a
+    side effect of the bot's own per-cycle field-level save_ani().
+
+    Returns True if a request was pending (now cleared), False otherwise —
+    including when the entry was removed by the dashboard between the
+    cycle-start snapshot and this peek: it is simply not found in the fresh
+    read, so nothing is cleared and (per merge_entry's contract) nothing is
+    resurrected."""
+    try:
+        with anistore.locked(path):
+            data = anistore.load(path)
+    except anistore.CorruptStoreError:
+        return False
+    pending = False
+    for entry in data.get('anime', []) or []:
+        if entry.get('url') == url:
+            pending = bool(entry.get('force_check'))
+            break
+    if pending:
+        anistore.merge_entry_fields(path, "anime", url, unset=["force_check"])
+    return pending
+
+def pre_scrape_skip_decision(animeentry, name, missing_count, episodes, force_check, today):
+    """Steps 1-3 of the smart-skip logic (complete flag, cached al_status
+    completion, skip_until airdate throttle) as one pure decision, so the
+    per-entry `force_check` bypass has a single gate to test instead of
+    three separate inline conditions each needing their own guard.
+
+    `force_check=True` (a dashboard "Check now" request already consumed by
+    resolve_force_check()) bypasses all three steps for this one scrape —
+    no skip, no log line here (the caller logs the check-now request
+    itself).
+
+    Returns {"skip": bool, "mark_complete": bool, "log": (level, tag, msg) or None}.
+    `mark_complete` tells the caller to set animeentry['complete'] = True
+    and persist it (Step 2) — a side effect this pure function cannot
+    perform itself."""
+    if force_check:
+        return {"skip": False, "mark_complete": False, "log": None}
+
+    # Step 1: already marked complete and no missing episodes.
+    if animeentry.get('complete') and missing_count == 0:
+        return {"skip": True, "mark_complete": False,
+                "log": ("info", "SKIP", name + " is complete")}
+
+    # Step 2: cached anime-loads.org status (no network call).
+    al_status = animeentry.get('al_status', '')
+    al_max = animeentry.get('al_max_episodes')
+    if al_status in ("Abgeschlossen", "Completed", "Complete") \
+            and al_max and episodes is not None and episodes >= al_max \
+            and missing_count == 0:
+        return {"skip": True, "mark_complete": True,
+                "log": ("info", "COMPLETE", name + " — al_status: " + al_status
+                        + ", all " + str(al_max) + " episodes downloaded")}
+
+    # Step 3: waiting for next episode airdate (skip_until).
+    skip_until = animeentry.get('skip_until', '')
+    if skip_until:
+        if animeentry.get('skip_real_airdate'):
+            honor_skip = not should_scrape_despite_skip(skip_until, today, EARLY_SCRAPE_DAYS)
+        else:
+            try:
+                honor_skip = today < date.fromisoformat(skip_until)
+            except (ValueError, TypeError):
+                honor_skip = False
+        if honor_skip:
+            if missing_count == 0:
+                return {"skip": True, "mark_complete": False,
+                        "log": ("info", "SKIP", name + " — next episode airs " + skip_until)}
+            else:
+                return {"skip": False, "mark_complete": False,
+                        "log": ("info", "RETRY", name + " — next episode airs " + skip_until
+                                + " but " + str(missing_count) + " missing episodes to retry")}
+
+    return {"skip": False, "mark_complete": False, "log": None}
+
 def _boot_backoff(attempt, cap=300):
     """Capped exponential backoff (seconds) for in-process boot retries.
 
@@ -335,7 +481,7 @@ def _record_event(events, kind, anime, episodes=None, detail=None):
         event["detail"] = str(detail)[:200]
     events.append(event)
 
-def write_run_state(started_ts, finished_ts, timedelay, counts, events=None):
+def write_run_state(started_ts, finished_ts, timedelay, counts, events=None, trigger=None):
     """Persist one per-cycle run-state record and append it to a bounded history.
 
     Best-effort: a write failure must never break the bot loop, so all errors
@@ -345,7 +491,10 @@ def write_run_state(started_ts, finished_ts, timedelay, counts, events=None):
     of what actually happened this cycle (download/error/unavailable/complete),
     capped at EVENTS_CAP entries — the first EVENTS_CAP are kept and
     `events_truncated` is set when the cap clipped the list; `counts` stays
-    authoritative regardless of clipping."""
+    authoritative regardless of clipping. `trigger` is additive: omitted (the
+    default) for a routine timer-driven cycle, or "manual" when this cycle was
+    woken early by the dashboard's run-now trigger file — see
+    consume_run_now_trigger()."""
     try:
         next_run_ts = ""
         if isinstance(timedelay, int) and timedelay > 0:
@@ -363,6 +512,8 @@ def write_run_state(started_ts, finished_ts, timedelay, counts, events=None):
             "counts": counts,
             "events": events[:EVENTS_CAP],
         }
+        if trigger:
+            record["trigger"] = trigger
         if len(events) > EVENTS_CAP:
             record["events_truncated"] = True
         path = _run_state_path()
@@ -1217,6 +1368,11 @@ def startbot():
     while(True):
         # Per-cycle run-state bookkeeping (persisted for the dashboard's
         # last_run/next_run, independent of the rolling log tail).
+        # Consumed at the START of the cycle it triggers — a request that
+        # arrived mid-cycle just sat in the file until now, so it is always
+        # honored *after* the previous cycle finished, never by interrupting it.
+        manual_trigger = consume_run_now_trigger(_run_now_path())
+        trigger = "manual" if manual_trigger else None
         run_started = _utcnow_iso()
         run_counts = {"entries": 0, "checked": 0, "downloaded": 0, "errors": 0,
                       "skipped": 0, "unavailable": 0, "mismatch": 0}
@@ -1226,8 +1382,8 @@ def startbot():
         if corrupt_err is not None:
             _log.error("ani.json ist beschaedigt, ueberspringe Zyklus: %s", corrupt_err)
             recheck = timedelay if isinstance(timedelay, int) and timedelay > 0 else 600
-            write_run_state(run_started, _utcnow_iso(), recheck, run_counts, events)
-            time.sleep(recheck)
+            write_run_state(run_started, _utcnow_iso(), recheck, run_counts, events, trigger=trigger)
+            sleep_until_next_cycle(recheck, _run_now_path())
             continue
 
         anidata = ""
@@ -1242,8 +1398,8 @@ def startbot():
             # dashboard are picked up without a manual container restart.
             recheck = timedelay if isinstance(timedelay, int) and timedelay > 0 else 600
             _log.info("Keine Anime in der Liste — erneute Pruefung in " + str(recheck) + " Sekunden")
-            write_run_state(run_started, _utcnow_iso(), recheck, run_counts, events)
-            time.sleep(recheck)
+            write_run_state(run_started, _utcnow_iso(), recheck, run_counts, events, trigger=trigger)
+            sleep_until_next_cycle(recheck, _run_now_path())
             continue
 
         if(anidata != ""):
@@ -1302,56 +1458,33 @@ def startbot():
                     return found
 
                 # --- Smart skip logic -------------------------------------------
-                # Step 1: Already marked complete and no missing episodes
-                if animeentry.get('complete') and len(missingEpisodes) == 0:
-                    _log.info("[SKIP] " + name + " is complete")
-                    run_counts["skipped"] += 1
-                    continue
+                # force_check: a dashboard "Check now" click on this one entry.
+                # Peeked fresh (not this cycle's snapshot) and cleared unconditionally
+                # right here — a one-shot bypass of Steps 1-4 below, honored at most
+                # once even if the scrape that follows fails.
+                force_check = resolve_force_check(botfile, url)
+                if force_check:
+                    _log.info("[CHECK-NOW] " + name + " — forced check requested, bypassing skip logic")
 
-                # Step 2: Check cached anime-loads.org status (no network call)
-                al_status = animeentry.get('al_status', '')
-                al_max = animeentry.get('al_max_episodes')
-                if al_status in ("Abgeschlossen", "Completed", "Complete") \
-                        and al_max and episodes >= al_max \
-                        and len(missingEpisodes) == 0:
-                    _log.info("[COMPLETE] " + name + " — al_status: " + al_status + ", all " + str(al_max) + " episodes downloaded")
+                # Steps 1-3 (complete flag / cached al_status / skip_until throttle)
+                decision = pre_scrape_skip_decision(
+                    animeentry, name, len(missingEpisodes), episodes, force_check, date.today())
+                if decision["log"]:
+                    level, tag, msg = decision["log"]
+                    getattr(_log, level)("[" + tag + "] " + msg)
+                if decision["mark_complete"]:
                     animeentry['complete'] = True
                     if not save_ani(): continue
+                if decision["skip"]:
                     run_counts["skipped"] += 1
                     continue
-
-                # Step 3: Waiting for next episode airdate (skip_until).
-                # Only a REAL TVDB-predicted airdate (skip_real_airdate) gets the
-                # early-scrape window — scrape on the eve to catch an episode
-                # anime-loads.org published before its airdate. Synthetic throttle
-                # dates (no-airdate default, THROTTLE step) regenerate daily, so
-                # early-scraping them would recur into perpetual every-cycle
-                # scraping; those are honored strictly. Missing marker (legacy
-                # entry) → treat as not-real until the next Step 4 pass re-marks it.
-                skip_until = animeentry.get('skip_until', '')
-                if skip_until:
-                    if animeentry.get('skip_real_airdate'):
-                        honor_skip = not should_scrape_despite_skip(skip_until, date.today(), EARLY_SCRAPE_DAYS)
-                    else:
-                        try:
-                            honor_skip = date.today() < date.fromisoformat(skip_until)
-                        except (ValueError, TypeError):
-                            honor_skip = False
-                    if honor_skip:
-                        if len(missingEpisodes) == 0:
-                            _log.info("[SKIP] " + name + " — next episode airs " + skip_until)
-                            run_counts["skipped"] += 1
-                            continue
-                        else:
-                            _log.info("[RETRY] " + name + " — next episode airs " + skip_until
-                                      + " but " + str(len(missingEpisodes)) + " missing episodes to retry")
 
                 # Step 4: TVDB-based checks (lightweight HTTP, no Selenium)
                 # Movies are not series — skip TVDB series status logic.
                 tvdb_id = animeentry.get('tvdb_id')
                 tvdb_season = animeentry.get('tvdb_season')
                 is_movie_cached = animeentry.get('media_type') == 'movie'
-                if tvdb_id and tvdb.available and not is_movie_cached:
+                if not force_check and tvdb_id and tvdb.available and not is_movie_cached:
                     try:
                         series_status = tvdb.get_series_status(tvdb_id)
                         if series_status:
@@ -1605,9 +1738,9 @@ def startbot():
                     animeentry['complete'] = True
                     _record_event(events, "complete", name)
                     save_ani()
-            write_run_state(run_started, _utcnow_iso(), timedelay, run_counts, events)
+            write_run_state(run_started, _utcnow_iso(), timedelay, run_counts, events, trigger=trigger)
             _log.info("Schlafe " + str(timedelay) + " Sekunden")
-            time.sleep(timedelay)
+            sleep_until_next_cycle(timedelay, _run_now_path())
 
 def removeAnime():
     jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, al_user, al_pass = loadconfig()

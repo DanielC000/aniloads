@@ -6,6 +6,8 @@ import html
 import json
 import os
 import shutil
+import stat
+import sys
 import tempfile
 import threading
 import time
@@ -3358,6 +3360,143 @@ class GetHealthResilientToRaisingCheckTest(unittest.TestCase):
         self.assertIn("boom", by_label["TVDB"]["detail"])
         # The rest are unaffected by TVDB's failure.
         self.assertIn(by_label["Disk Space"]["state"], {"ok", "warn", "fail", "unknown"})
+
+
+class RunNowTriggerTest(unittest.TestCase):
+    """Soft run-now/check-now: writes a trigger file for the bot to wake on
+    instead of restarting the container (see bot/anibot.py's
+    sleep_until_next_cycle / consume_run_now_trigger), subject to a shared
+    cooldown."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="aniloads-runnow-")
+        self._orig_ani = app.ANI_JSON
+        self._orig_run_now = app.RUN_NOW_FILE
+        self._orig_run_now_state = app.RUN_NOW_STATE_FILE
+        self._orig_cooldown = app.RUN_NOW_COOLDOWN_SECONDS
+        app.ANI_JSON = os.path.join(self._tmp, "ani.json")
+        app.RUN_NOW_FILE = os.path.join(self._tmp, "run_now")
+        app.RUN_NOW_STATE_FILE = os.path.join(self._tmp, "run_now_last.json")
+        app.RUN_NOW_COOLDOWN_SECONDS = 120
+
+    def tearDown(self):
+        app.ANI_JSON = self._orig_ani
+        app.RUN_NOW_FILE = self._orig_run_now
+        app.RUN_NOW_STATE_FILE = self._orig_run_now_state
+        app.RUN_NOW_COOLDOWN_SECONDS = self._orig_cooldown
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_global_trigger_writes_file_and_cooldown_state(self):
+        ok, msg = app.trigger_run_now()
+        self.assertTrue(ok)
+        self.assertTrue(os.path.isfile(app.RUN_NOW_FILE))
+        self.assertIn("queued", msg.lower())
+        self.assertTrue(os.path.isfile(app.RUN_NOW_STATE_FILE))
+
+    def test_no_prior_request_has_no_cooldown(self):
+        self.assertEqual(app.run_now_cooldown_remaining(), 0)
+
+    def test_second_request_within_cooldown_is_rejected(self):
+        ok1, _ = app.trigger_run_now()
+        self.assertTrue(ok1)
+        ok2, msg2 = app.trigger_run_now()
+        self.assertFalse(ok2)
+        self.assertIn("Cooling down", msg2)
+
+    def test_cooldown_elapses(self):
+        app.trigger_run_now()
+        self.assertGreater(app.run_now_cooldown_remaining(), 0)
+        future = datetime.utcnow() + timedelta(seconds=app.RUN_NOW_COOLDOWN_SECONDS + 1)
+        self.assertEqual(app.run_now_cooldown_remaining(now=future), 0)
+
+    def test_per_entry_check_now_sets_force_check(self):
+        app.save_ani({"anime": [{"name": "A", "url": "http://x/a"}]})
+        ok, msg = app.trigger_run_now(entry_url="http://x/a")
+        self.assertTrue(ok)
+        self.assertIn("A", msg)
+        data = app.load_ani()
+        self.assertTrue(data["anime"][0]["force_check"])
+        self.assertTrue(os.path.isfile(app.RUN_NOW_FILE))
+
+    def test_per_entry_check_now_missing_entry_errors(self):
+        app.save_ani({"anime": []})
+        ok, msg = app.trigger_run_now(entry_url="http://x/missing")
+        self.assertFalse(ok)
+        self.assertIn("not found", msg.lower())
+        self.assertFalse(os.path.isfile(app.RUN_NOW_FILE))
+
+    def test_check_now_also_subject_to_cooldown_and_leaves_entry_untouched(self):
+        app.save_ani({"anime": [{"name": "A", "url": "http://x/a"}]})
+        app.trigger_run_now()
+        ok, msg = app.trigger_run_now(entry_url="http://x/a")
+        self.assertFalse(ok)
+        self.assertIn("Cooling down", msg)
+        # The rejected request must not have set force_check.
+        data = app.load_ani()
+        self.assertNotIn("force_check", data["anime"][0])
+
+    @unittest.skipIf(sys.platform == "win32",
+                      "POSIX permission bits; not meaningful on the Windows test host")
+    def test_trigger_file_is_world_readable(self):
+        app.trigger_run_now()
+        mode = stat.S_IMODE(os.stat(app.RUN_NOW_FILE).st_mode)
+        self.assertTrue(mode & 0o004,
+                         "trigger file must be readable by others — the bot "
+                         "container consumes it as a different (root) user")
+
+
+class RunNowCheckNowPostTest(unittest.TestCase):
+    """do_POST dispatch for /run-now and /check-now, using the same
+    __new__/stub harness as HandlerPostRoutingTest."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="aniloads-runnow-post-")
+        self._orig_ani = app.ANI_JSON
+        self._orig_run_now = app.RUN_NOW_FILE
+        self._orig_run_now_state = app.RUN_NOW_STATE_FILE
+        self._orig_cooldown = app.RUN_NOW_COOLDOWN_SECONDS
+        app.ANI_JSON = os.path.join(self._tmp, "ani.json")
+        app.RUN_NOW_FILE = os.path.join(self._tmp, "run_now")
+        app.RUN_NOW_STATE_FILE = os.path.join(self._tmp, "run_now_last.json")
+        app.RUN_NOW_COOLDOWN_SECONDS = 120
+
+    def tearDown(self):
+        app.ANI_JSON = self._orig_ani
+        app.RUN_NOW_FILE = self._orig_run_now
+        app.RUN_NOW_STATE_FILE = self._orig_run_now_state
+        app.RUN_NOW_COOLDOWN_SECONDS = self._orig_cooldown
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _post(self, path, params):
+        captured = {}
+        h = app.Handler.__new__(app.Handler)
+        h.path = path
+        h._read_post = lambda: params
+        h._redirect_msg = lambda msg: captured.__setitem__("msg", msg)
+        h._redirect = lambda url: captured.__setitem__("url", url)
+        h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
+        h.do_POST()
+        return captured
+
+    def test_run_now_queues(self):
+        result = self._post("/run-now", {})
+        self.assertIn("queued", result["msg"].lower())
+        self.assertTrue(os.path.isfile(app.RUN_NOW_FILE))
+
+    def test_run_now_within_cooldown_errors(self):
+        self._post("/run-now", {})
+        result = self._post("/run-now", {})
+        self.assertTrue(result["msg"].startswith("Error:"))
+
+    def test_check_now_sets_force_check_and_queues(self):
+        app.save_ani({"anime": [{"name": "A", "url": "http://x/a"}]})
+        result = self._post("/check-now", {"key": "http://x/a"})
+        self.assertIn("queued", result["msg"].lower())
+        self.assertTrue(app.load_ani()["anime"][0]["force_check"])
+
+    def test_check_now_missing_key_errors(self):
+        result = self._post("/check-now", {"key": "http://x/missing"})
+        self.assertTrue(result["msg"].startswith("Error:"))
 
 
 if __name__ == "__main__":

@@ -100,13 +100,20 @@ Settings in `ani.json > settings`:
 Open http://SERVER_IP:8085. Features:
 
 - **Bot Activity** — live status, last run time, next run estimate
-- **Run Now** — trigger an immediate bot check
+- **Run Now** — wake the bot early for an immediate cycle (see "Run Now / Check Now" below)
 - **Run History** — colour-coded feed of recent runs (downloads, errors, checks)
 - **Watchlist** — add/remove anime, see episode counts, retry status, TVDB season mapping, and completion status
+- **Check Now** (per watchlist card) — force one entry's next triggered cycle to bypass its skip logic
 - **Preferences** — default language, resolution, auto-select
 - **Add Anime** — paste an anime-loads.org URL or search by name, with TVDB season correlation
 - **TVDB Linking** — link/unlink existing watchlist entries to TVDB series and seasons
 - **Smart Skip Badges** — shows "Complete" (green), "Next: date" (orange), and anime-loads status per entry. "Mark Incomplete" button to force re-checking.
+
+### Run Now / Check Now
+
+"Run Now" and "Check Now" write a trigger file (`run_now` in the shared config dir) instead of restarting the bot container: the bot's inter-cycle sleep wakes early (within a few seconds) when the file appears, and consumes it at the start of the cycle it triggers — a request made while a cycle is already running is honored right after that cycle finishes, never by interrupting it (no killed JDownloader hand-off, no forced browser re-init/re-login). "Check Now" additionally sets `force_check` on that one watchlist entry so its next triggered cycle bypasses the skip logic (see "Smart Skip-Checking" above).
+
+Both actions share one cooldown — `RUN_NOW_COOLDOWN_SECONDS` (default 120) — to protect anime-loads.org from being hit repeatedly; the dashboard shows how long until the next request is allowed. Restarting the bot container is still available directly via Docker (`docker restart anime-loads`) if ever needed, but is no longer wired into the dashboard UI.
 
 ## ani.json Schema
 
@@ -133,6 +140,7 @@ The bot and web UI share `ani.json`. Anime entries:
 | `media_type` | string? | Cached from anime-loads.org Description tab — `"series"`, `"movie"`, `"ova"`, `"special"`, `"web"`, `"bonus"`. Only `"movie"` changes mover routing. |
 | `year` | int? | Cached release year from anime-loads.org — used for `Title (Year)` movie folder naming. |
 | `display_title` | string? | Cached best title from the Description tab (German > English > Japanese) — used for movie folder names. |
+| `force_check` | bool? | Set by the dashboard's per-entry "Check Now" button; bypasses skip-checking for one scrape, then cleared by the bot. |
 
 ### TVDB Integration
 
@@ -171,6 +179,8 @@ The bot avoids unnecessary Selenium scrapes by checking completion status before
    `al_status` and `al_max_episodes`. If anime-loads.org reports the series as `"Abgeschlossen"`/`"Completed"` and all episodes are downloaded, the entry is marked `complete`.
 
 Completion is automatic. To re-enable checking (e.g. surprise continuation), use the "Mark Incomplete" button on the dashboard.
+
+Each card's **Check Now** button bypasses steps 1-4 above for that entry's next triggered cycle only (set via `force_check`, cleared by the bot after one scrape) — use it to force an immediate scrape of an entry that would otherwise be skipped (e.g. to test a fix, or check a release the site published early). See "Run Now / Check Now" below.
 
 ## File Paths
 

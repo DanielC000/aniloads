@@ -896,5 +896,263 @@ class LoadAniCycleStartTest(unittest.TestCase):
         self.assertIsInstance(err, anibot.anistore.CorruptStoreError)
 
 
+class SleepUntilNextCycleTest(unittest.TestCase):
+    """The soft run-now trigger: the bot's inter-cycle sleep is sliced so a
+    run-now request wakes it early instead of restarting the container."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-runnow-")
+        self.trigger_path = os.path.join(self.tmp, "run_now")
+
+    def tearDown(self):
+        try:
+            os.remove(self.trigger_path)
+        except OSError:
+            pass
+
+    def _fake_clock(self):
+        now = [0.0]
+        calls = []
+
+        def sleep_fn(s):
+            calls.append(s)
+            now[0] += s
+
+        def time_fn():
+            return now[0]
+
+        return sleep_fn, time_fn, calls
+
+    def test_sleeps_full_duration_when_no_trigger_appears(self):
+        sleep_fn, time_fn, calls = self._fake_clock()
+        woke_early = anibot.sleep_until_next_cycle(
+            12, self.trigger_path, slice_seconds=5, sleep_fn=sleep_fn, time_fn=time_fn)
+        self.assertFalse(woke_early)
+        self.assertAlmostEqual(sum(calls), 12)
+        # Sliced into <= slice_seconds chunks, not one long sleep.
+        self.assertTrue(all(c <= 5 for c in calls))
+
+    def test_wakes_early_when_trigger_appears_mid_sleep(self):
+        sleep_fn, time_fn, calls = self._fake_clock()
+
+        def sleep_and_maybe_trigger(s):
+            sleep_fn(s)
+            if len(calls) == 2:
+                with open(self.trigger_path, "w", encoding="utf-8") as f:
+                    f.write("2026-06-13T19:00:00Z")
+
+        woke_early = anibot.sleep_until_next_cycle(
+            600, self.trigger_path, slice_seconds=5,
+            sleep_fn=sleep_and_maybe_trigger, time_fn=time_fn)
+        self.assertTrue(woke_early)
+        # Woke after the 2 slices that preceded the trigger appearing, not
+        # the full 600s — a mid-sleep trigger is noticed within slice_seconds.
+        self.assertEqual(len(calls), 2)
+
+    def test_trigger_already_present_never_sleeps(self):
+        # Simulates a request that arrived *during the previous cycle* (not
+        # during this sleep) — by the time this sleep call begins, the file
+        # is already sitting there, so it must return instantly without
+        # ever calling sleep_fn. This is how a mid-cycle trigger is honored
+        # right after the cycle ends, never by interrupting it.
+        with open(self.trigger_path, "w", encoding="utf-8") as f:
+            f.write("2026-06-13T19:00:00Z")
+        calls = []
+        woke_early = anibot.sleep_until_next_cycle(
+            600, self.trigger_path, slice_seconds=5,
+            sleep_fn=lambda s: calls.append(s), time_fn=lambda: 0.0)
+        self.assertTrue(woke_early)
+        self.assertEqual(calls, [])
+
+    def test_zero_or_invalid_delay_checks_trigger_once(self):
+        self.assertFalse(anibot.sleep_until_next_cycle(0, self.trigger_path))
+        self.assertFalse(anibot.sleep_until_next_cycle(None, self.trigger_path))
+        with open(self.trigger_path, "w", encoding="utf-8") as f:
+            f.write("x")
+        self.assertTrue(anibot.sleep_until_next_cycle(0, self.trigger_path))
+
+
+class ConsumeRunNowTriggerTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-consume-")
+        self.path = os.path.join(self.tmp, "run_now")
+
+    def test_absent_file_returns_none(self):
+        self.assertIsNone(anibot.consume_run_now_trigger(self.path))
+
+    def test_present_file_is_deleted_and_content_returned(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("2026-06-13T19:00:00Z")
+        content = anibot.consume_run_now_trigger(self.path)
+        self.assertEqual(content, "2026-06-13T19:00:00Z")
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_empty_file_still_signals_a_trigger(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("")
+        content = anibot.consume_run_now_trigger(self.path)
+        self.assertEqual(content, "manual")
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_second_call_after_consumption_returns_none(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("2026-06-13T19:00:00Z")
+        anibot.consume_run_now_trigger(self.path)
+        self.assertIsNone(anibot.consume_run_now_trigger(self.path))
+
+
+class ResolveForceCheckTest(unittest.TestCase):
+    """Per-entry force_check (dashboard 'Check now'): a one-shot flag the bot
+    peeks fresh and clears explicitly, independent of the bot-owned
+    field-level merge (see BOT_OWNED_SCALAR_FIELDS)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-forcecheck-")
+        self.path = os.path.join(self.tmp, "ani.json")
+
+    def _write(self, anime):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"settings": {}, "anime": anime}, f)
+
+    def _read(self):
+        with open(self.path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_pending_request_is_reported_and_cleared(self):
+        self._write([{"name": "A", "url": "http://x/a", "force_check": True}])
+        self.assertTrue(anibot.resolve_force_check(self.path, "http://x/a"))
+        self.assertNotIn("force_check", self._read()["anime"][0])
+
+    def test_no_request_returns_false_and_leaves_entry_untouched(self):
+        entry = {"name": "A", "url": "http://x/a", "skip_until": "2099-01-01"}
+        self._write([entry])
+        self.assertFalse(anibot.resolve_force_check(self.path, "http://x/a"))
+        self.assertEqual(self._read()["anime"][0], entry)
+
+    def test_missing_url_returns_false(self):
+        self._write([{"name": "A", "url": "http://x/a"}])
+        self.assertFalse(anibot.resolve_force_check(self.path, "http://x/nope"))
+
+    def test_entry_removed_mid_cycle_does_not_resurrect_it(self):
+        # The bot's per-cycle snapshot still has this entry (with
+        # force_check=True from before the cycle started), but the
+        # dashboard has since removed it from the on-disk file — the fresh
+        # peek must see it as gone, not resurrect it via the unset merge.
+        self._write([{"name": "Other", "url": "http://x/other"}])
+        self.assertFalse(anibot.resolve_force_check(self.path, "http://x/a"))
+        anime = self._read()["anime"]
+        self.assertEqual(len(anime), 1)
+        self.assertEqual(anime[0]["url"], "http://x/other")
+
+    def test_corrupt_file_returns_false_instead_of_raising(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("{not valid json")
+        self.assertFalse(anibot.resolve_force_check(self.path, "http://x/a"))
+
+
+class PreScrapeSkipDecisionTest(unittest.TestCase):
+    """Steps 1-3 of the smart-skip logic, and the force_check bypass that
+    overrides all of them for one scrape."""
+
+    TODAY = date(2026, 6, 13)
+
+    def _decide(self, force_check=False, **entry_fields):
+        entry = dict(entry_fields)
+        missing_count = len(entry.pop("missing", []) or [])
+        episodes = entry.pop("episodes", 5)
+        return anibot.pre_scrape_skip_decision(
+            entry, "Naruto", missing_count, episodes, force_check, self.TODAY)
+
+    def test_complete_with_no_missing_skips(self):
+        d = self._decide(complete=True)
+        self.assertTrue(d["skip"])
+        self.assertFalse(d["mark_complete"])
+        self.assertEqual(d["log"], ("info", "SKIP", "Naruto is complete"))
+
+    def test_complete_with_missing_does_not_skip(self):
+        d = self._decide(complete=True, missing=[3])
+        self.assertFalse(d["skip"])
+        self.assertIsNone(d["log"])
+
+    def test_al_status_complete_marks_and_skips(self):
+        d = self._decide(al_status="Abgeschlossen", al_max_episodes=12, episodes=12)
+        self.assertTrue(d["skip"])
+        self.assertTrue(d["mark_complete"])
+        self.assertEqual(d["log"][1], "COMPLETE")
+
+    def test_skip_until_future_skips_when_no_missing(self):
+        d = self._decide(skip_until="2026-06-20")
+        self.assertTrue(d["skip"])
+        self.assertEqual(d["log"], ("info", "SKIP", "Naruto — next episode airs 2026-06-20"))
+
+    def test_skip_until_future_retries_when_missing(self):
+        d = self._decide(skip_until="2026-06-20", missing=[4])
+        self.assertFalse(d["skip"])
+        self.assertEqual(d["log"][1], "RETRY")
+
+    def test_skip_until_past_does_not_skip(self):
+        d = self._decide(skip_until="2026-01-01")
+        self.assertFalse(d["skip"])
+        self.assertIsNone(d["log"])
+
+    def test_real_airdate_honors_early_scrape_window(self):
+        # EARLY_SCRAPE_DAYS defaults to 1 — the eve of a real airdate scrapes.
+        d = self._decide(skip_until="2026-06-14", skip_real_airdate=True)
+        self.assertFalse(d["skip"])
+
+    def test_no_skip_conditions_falls_through(self):
+        d = self._decide()
+        self.assertFalse(d["skip"])
+        self.assertFalse(d["mark_complete"])
+        self.assertIsNone(d["log"])
+
+    def test_force_check_bypasses_complete_flag(self):
+        d = self._decide(force_check=True, complete=True)
+        self.assertFalse(d["skip"])
+        self.assertFalse(d["mark_complete"])
+        self.assertIsNone(d["log"])
+
+    def test_force_check_bypasses_al_status_complete(self):
+        d = self._decide(force_check=True, al_status="Abgeschlossen",
+                          al_max_episodes=12, episodes=12)
+        self.assertFalse(d["skip"])
+        self.assertFalse(d["mark_complete"])
+
+    def test_force_check_bypasses_skip_until(self):
+        d = self._decide(force_check=True, skip_until="2026-12-31")
+        self.assertFalse(d["skip"])
+        self.assertIsNone(d["log"])
+
+
+class WriteRunStateTriggerTest(unittest.TestCase):
+    """run_state records whether a cycle was woken by a manual run-now
+    trigger — additive, so a routine timer-driven cycle's record is
+    unchanged (see WriteRunStateTest.test_record_matches_fixed_schema_keys)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-runstate-trigger-")
+        self._orig_botfile = anibot.botfile
+        anibot.botfile = os.path.join(self.tmp, "ani.json")
+        self.path = os.path.join(self.tmp, "run_state.json")
+
+    def tearDown(self):
+        anibot.botfile = self._orig_botfile
+
+    def _read(self):
+        with open(self.path, "r") as f:
+            return json.load(f)
+
+    def test_manual_trigger_recorded(self):
+        anibot.write_run_state(
+            "2026-06-13T19:00:00Z", "2026-06-13T19:01:00Z", 600, {"checked": 1},
+            trigger="manual")
+        self.assertEqual(self._read()["last_run"]["trigger"], "manual")
+
+    def test_no_trigger_omits_the_key(self):
+        anibot.write_run_state(
+            "2026-06-13T19:00:00Z", "2026-06-13T19:01:00Z", 600, {"checked": 1})
+        self.assertNotIn("trigger", self._read()["last_run"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -65,9 +65,9 @@ Then build and start the stack from the repo root:
 docker compose up -d --build
 ```
 
-This builds the `anime-loads:local` image from `bot/` and starts all three services. Both `anime-loads` and `anime-web` run that image.
+This builds the `anime-loads:local` image from the repo root (`bot/Dockerfile`, which also bakes in `web/app.py`) and starts all three services. Both `anime-loads` and `anime-web` run that image.
 
-**After every pull or repo update, rebuild the image before restarting.** Use the same `docker compose up -d --build`, or `docker compose build` followed by the restart. A plain `docker compose restart` or `up -d` without `--build` isn't enough. `anime-web` live-mounts only `web/app.py` from the checkout, but `app.py` imports `tvdb`, `anistore`, `notify` and `config_defaults` from the image's copy of `bot/`. If you skip the rebuild, a new `app.py` runs against stale modules and the dashboard can crash on import.
+**After every pull or repo update, rebuild the image before restarting.** Use the same `docker compose up -d --build`, or `docker compose build` followed by the restart. A plain `docker compose restart` or `up -d` without `--build` isn't enough. Both the dashboard (`web/app.py`) and the bot modules it imports (`tvdb`, `anistore`, `notify`, `config_defaults`) are baked into the image — nothing is live-mounted from the checkout anymore, so any dashboard or bot change needs a rebuild before it takes effect.
 
 > Homelab/submodule deployments may wrap this in their own tooling; the command above is the self-contained path from a fresh clone.
 
@@ -206,7 +206,7 @@ Paths inside the containers are fixed; the host directories behind them are supp
 | `/data/media/anime/` | Anime series library — move target for series/OVA/special/web (`MEDIA_DIR`) |
 | `/data/media/anime movies/` | Anime movies library — move target for movies (`MOVIE_MEDIA_DIR`) |
 
-Host directories map to these via `.env`: `ANIME_CONFIG_DIR` → `/config`, `ANIME_DATA_DIR` → `/data`, `ANIME_DOWNLOAD_DIR` → JDownloader's `/output`, and `ANIME_SETUP_DIR` → the checked-out repo (the web container live-mounts `web/app.py` from it). See `.env.example` for the expected format and neutral example paths (e.g. `/srv/...`).
+Host directories map to these via `.env`: `ANIME_CONFIG_DIR` → `/config`, `ANIME_DATA_DIR` → `/data`, `ANIME_DOWNLOAD_DIR` → JDownloader's `/output`. See `.env.example` for the expected format and neutral example paths (e.g. `/srv/...`).
 
 **Invariant:** `ANIME_DOWNLOAD_DIR` must be exactly `${ANIME_DATA_DIR}/downloads/anime`. JDownloader writes into `ANIME_DOWNLOAD_DIR`, but the mover reads `/data/downloads/anime` (`DOWNLOAD_DIR` is hard-coded in `docker-compose.yml`), which is `ANIME_DATA_DIR/downloads/anime` on the host. Point them anywhere else and the mover watches an empty directory while finished downloads pile up unmoved.
 

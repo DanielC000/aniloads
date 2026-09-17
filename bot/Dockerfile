@@ -14,10 +14,11 @@ RUN apt-get update \
     && tar -xf /tmp/gecko.tar.gz -C /usr/local/bin && rm /tmp/gecko.tar.gz \
     && chmod +x /usr/local/bin/geckodriver
 
-COPY requirements.txt .
+COPY bot/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY bot/ .
+COPY web/app.py /app/app.py
 
 ENTRYPOINT ["python", "anibot.py", "--configfile", "/config/ani.json"]
 CMD ["--docker"]

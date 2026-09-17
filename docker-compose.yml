@@ -31,8 +31,8 @@ services:
   anime-loads:
     container_name: anime-loads
     build:
-      context: ./bot
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: bot/Dockerfile
     image: anime-loads:local
     restart: unless-stopped
     environment:
@@ -114,7 +114,6 @@ services:
       - DASHBOARD_ALLOWED_ORIGINS=${DASHBOARD_ALLOWED_ORIGINS:-}
     volumes:
       - "${ANIME_CONFIG_DIR:?set in .env (see .env.example)}:/config"
-      - "${ANIME_SETUP_DIR:?set in .env (see .env.example)}/web/app.py:/app/app.py:ro"
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - "${ANIME_DATA_DIR:?set in .env (see .env.example)}:/data"
     group_add:

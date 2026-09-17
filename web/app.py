@@ -2174,7 +2174,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .btn-ghost { background: var(--surface-2); color: var(--text-muted); border: 1px solid var(--border); }
   .btn-ghost:hover { background: var(--border); color: var(--text); }
 
-  input[type=text], input[type=url], input[type=number], input[type=password], select { width: 100%; padding: 10px 14px; border-radius: var(--radius-sm); border: 1px solid var(--border-light); background: var(--surface-2); color: var(--text); font-size: var(--fs-sm); margin-bottom: var(--s3); transition: border-color var(--tr); }
+  input[type=text], input[type=url], input[type=search], input[type=number], input[type=password], select { width: 100%; padding: 10px 14px; border-radius: var(--radius-sm); border: 1px solid var(--border-light); background: var(--surface-2); color: var(--text); font-size: var(--fs-sm); margin-bottom: var(--s3); transition: border-color var(--tr); }
   input[disabled] { opacity: 0.6; cursor: not-allowed; }
   select { appearance: none; -webkit-appearance: none; }
   input:focus, select:focus { outline: none; border-color: var(--accent); }
@@ -2344,6 +2344,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .wl-remove-confirm { display: flex; flex-direction: column; gap: var(--s2); padding: var(--s3); border-radius: var(--radius-sm); background: var(--danger-bg); font-size: var(--fs-sm); }
   .wl-remove-confirm strong { color: var(--text-heading); }
 
+  /* Watchlist filter strip: status chips that double as counts, then a
+     name filter and sort. Revealed by the script; hidden cards use [hidden]. */
+  .wl-controls { display: flex; flex-direction: column; gap: var(--s3); margin-bottom: var(--s4); }
+  .wl-controls[hidden], .wl-card[hidden], .wl-pending[hidden], #wl-none[hidden] { display: none; }
+  .wl-chips { display: flex; flex-wrap: wrap; gap: var(--s2); }
+  .wl-chip { display: inline-flex; align-items: center; gap: var(--s2); min-height: 32px; padding: 0 var(--s3); border-radius: var(--radius-sm); border: 1px solid var(--border); background: transparent; color: var(--text-muted); font: inherit; font-size: var(--fs-xs); font-weight: 500; cursor: pointer; transition: background-color var(--tr), border-color var(--tr), color var(--tr); }
+  .wl-chip:hover { color: var(--text); border-color: var(--border-light); }
+  .wl-chip-n { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+  .wl-chip[aria-pressed="true"] { background: var(--accent-soft-bg); border-color: transparent; color: var(--accent-soft-text); }
+  .wl-chip[aria-pressed="true"] .wl-chip-n { color: inherit; }
+  .wl-tools { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--s2) var(--s3); }
+  .wl-tool { display: flex; flex-direction: column; gap: 2px; flex: 0 1 180px; }
+  .wl-tool-q { flex: 1 1 240px; max-width: 360px; }
+  .wl-tool label { color: var(--text-muted); font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; }
+  .wl-tool input, .wl-tool select { margin: 0; padding: 6px 10px; min-height: 36px; font-size: var(--fs-sm); }
+  .wl-tool select { padding-right: 28px; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239aa3b2' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; }
+  .wl-shown { margin: 0; font-size: var(--fs-xs); color: var(--text-faint); }
+  .wl-shown:empty { display: none; }
+  #wl-none { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: var(--s3); }
+
   @media (max-width: 600px) {
     .activity-grid { grid-template-columns: 1fr 1fr; gap: var(--s3); }
     .form-row { flex-wrap: wrap; }
@@ -2352,6 +2372,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .wl-card .btn, .wl-panel > summary, .wl-card .folder-input, .ep-add-row input[type=number], input[type=number].wl-num, select.wl-select { min-height: 44px; }
     .wl-field { flex: 1 1 120px; }
     .wl-card .folder-input { max-width: none; flex-basis: 100%; }
+    .wl-chip, .wl-tool input, .wl-tool select { min-height: 44px; }
+    .wl-tool, .wl-tool-q { flex: 1 1 100%; max-width: none; }
   }
   @media (prefers-reduced-motion: reduce) {
     * { transition: none !important; animation: none !important; }
@@ -2530,8 +2552,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 %%SEARCH_RESULTS%%
 
 <div class="section">
-  <h2>Watchlist (%%COUNT%% anime)</h2>
-  %%WATCHLIST%%
+  <h2>Watchlist (%%COUNT%%)</h2>
+  %%WATCHLIST_CONTROLS%%
+  <div id="wl-list">%%WATCHLIST%%</div>
 </div>
 </main>
 
@@ -2565,8 +2588,116 @@ function scrapeBusy(form, label) {
   return true;
 }
 
+// Watchlist filter + sort, client-side. Cards carry their state as data-*
+// from the server; the 10s poll never touches #wl-list, so this only runs
+// on load and on input. The chosen chip and sort persist per browser.
 (function() {
-  var ids = ['bot-status','last-run','next-run','run-history','health',
+  var box = document.getElementById('wl-controls');
+  var list = document.getElementById('wl-list');
+  if (!box || !list) return;
+  var KEY = 'aniloads.watchlist-view';
+  var q = document.getElementById('wl-q');
+  var sortSel = document.getElementById('wl-sort');
+  var shown = document.getElementById('wl-shown');
+  var none = document.getElementById('wl-none');
+  var chips = [].slice.call(box.querySelectorAll('.wl-chip'));
+  var cards = [].slice.call(list.querySelectorAll('.wl-card, .wl-pending'));
+  var view = {filter: 'all', sort: 'list'};
+  try {
+    var saved = JSON.parse(localStorage.getItem(KEY) || 'null');
+    if (saved && typeof saved === 'object') {
+      if (typeof saved.filter === 'string') view.filter = saved.filter;
+      if (typeof saved.sort === 'string') view.sort = saved.sort;
+    }
+  } catch (e) {}
+  // A saved chip whose count is now zero is not rendered: fall back to All.
+  if (!chips.some(function(b) { return b.dataset.filter === view.filter; })) view.filter = 'all';
+  if (![].some.call(sortSel.options, function(o) { return o.value === view.sort; })) view.sort = 'list';
+
+  function save() {
+    try { localStorage.setItem(KEY, JSON.stringify(view)); } catch (e) {}
+  }
+  function matches(card) {
+    var f = view.filter;
+    if (f === 'all') return true;
+    if (f === 'no-tvdb') return card.dataset.tvdb === '0';
+    return card.dataset.state === f;
+  }
+  function apply() {
+    var needle = q.value.trim().toLowerCase();
+    var n = 0;
+    cards.forEach(function(c) {
+      var ok = matches(c) && (!needle || c.dataset.name.indexOf(needle) !== -1);
+      c.hidden = !ok;
+      if (ok) n++;
+    });
+    chips.forEach(function(b) {
+      b.setAttribute('aria-pressed', b.dataset.filter === view.filter ? 'true' : 'false');
+    });
+    shown.textContent = n === cards.length ? '' : 'Showing ' + n + ' of ' + cards.length;
+    none.hidden = n !== 0;
+  }
+  function arrange() {
+    var pending = cards.filter(function(c) { return c.dataset.state === 'pending'; });
+    var items = cards.filter(function(c) { return c.dataset.state !== 'pending'; });
+    var added = function(c) { return +c.dataset.added; };
+    items.sort(function(a, b) {
+      if (view.sort === 'name') return a.dataset.name.localeCompare(b.dataset.name) || added(a) - added(b);
+      if (view.sort === 'added') return added(b) - added(a);
+      if (view.sort === 'next') {
+        var x = a.dataset.next, y = b.dataset.next;
+        if (x !== y) return !x ? 1 : !y ? -1 : (x < y ? -1 : 1);
+      }
+      return added(a) - added(b);
+    });
+    pending.concat(items).forEach(function(c) { list.appendChild(c); });
+  }
+  // A link to one card (#anchor) must land on it even when the saved
+  // filter hides it: drop back to All so the target shows.
+  function reveal() {
+    var target;
+    try { target = location.hash && document.getElementById(decodeURIComponent(location.hash.slice(1))); } catch (e) {}
+    if (!target || !list.contains(target)) return;
+    var card = target.closest('.wl-card, .wl-pending');
+    if (!card || !card.hidden) return;
+    view.filter = 'all';
+    q.value = '';
+    save();
+    apply();
+    target.scrollIntoView();
+  }
+
+  chips.forEach(function(b) {
+    b.addEventListener('click', function() {
+      view.filter = b.dataset.filter;
+      save();
+      apply();
+    });
+  });
+  q.addEventListener('input', apply);
+  sortSel.addEventListener('change', function() {
+    view.sort = sortSel.value;
+    save();
+    arrange();
+  });
+  document.getElementById('wl-clear').addEventListener('click', function() {
+    view.filter = 'all';
+    q.value = '';
+    save();
+    apply();
+    chips[0].focus();
+  });
+  window.addEventListener('hashchange', reveal);
+
+  sortSel.value = view.sort;
+  arrange();
+  apply();
+  box.hidden = false;
+  reveal();
+})();
+
+(function() {
+  var ids = ['bot-status','bot-status','last-run','next-run','run-history','health',
              'move-status','move-last-run','move-history','move-stuck'];
   function refresh() {
     // Keep the reader's "Show older cycles" depth across polls.
@@ -3269,7 +3400,7 @@ def render_watchlist(anime_list, pending_list=None, entry_outcomes=None):
                 no_match_line = ""
 
             html += """
-            <div class="card card-accent">
+            <div class="card card-accent wl-pending" data-state="pending" data-name="{fname}">
               <div style="display:flex;justify-content:space-between;align-items:start;gap:12px;">
                 <div>
                   <div class="anime-name">{name} {status_badge}</div>
@@ -3284,7 +3415,7 @@ def render_watchlist(anime_list, pending_list=None, entry_outcomes=None):
               </div>
             </div>""".format(name=escape(name), url=escape(url), pref_badges=pref_badges,
                              status_badge=status_badge, no_match_line=no_match_line, key=escape(url),
-                             remove_confirm=remove_confirm)
+                             remove_confirm=remove_confirm, fname=escape(str(name).casefold()))
 
     for i, a in enumerate(anime_list):
         html += render_watchlist_card(i, a, entry_outcomes.get(a.get("url")))
@@ -3478,6 +3609,91 @@ def render_entry_check(outcome, now=None):
     if error:
         html += '<p class="wl-checked wl-checked--danger">{}</p>'.format(escape(error))
     return html
+
+
+# Watchlist filter chips: (state, label). "pending" and "no-tvdb" are not
+# card states; the client matches them on the card kind and data-tvdb.
+_WL_FILTERS = (("all", "All"), ("airing", "Airing"), ("retrying", "Retrying"),
+               ("complete", "Complete"), ("paused", "Paused"),
+               ("pending", "Pending"), ("no-tvdb", "No TVDB"))
+
+
+def watchlist_filter_state(entry, today=None):
+    """The card's filter state, read off watchlist_status so a chip always
+    agrees with the status line: paused / retrying / movie / complete / new
+    (waiting for first download) / airing."""
+    tone, headline, _ = watchlist_status(entry, today)
+    if tone == "paused":
+        return "paused"
+    if tone == "danger":
+        return "retrying"
+    if entry.get("media_type") == "movie":
+        return "movie"
+    if headline == "Complete":
+        return "complete"
+    if headline == "Waiting for first download":
+        return "new"
+    return "airing"
+
+
+def watchlist_filter_attrs(i, entry, today=None):
+    """data-* attributes the client-side filter and sort read from a card."""
+    state = watchlist_filter_state(entry, today)
+    day = _parse_airdate(entry.get("skip_until")) if state == "airing" else None
+    return ('data-state="{}" data-tvdb="{}" data-name="{}" data-added="{}" '
+            'data-next="{}"').format(
+                state, 1 if entry.get("tvdb_id") else 0,
+                escape(str(entry.get("name", "")).casefold()), i,
+                day.isoformat() if day else "")
+
+
+def render_watchlist_controls(anime_list, pending_list=None):
+    """Filter chips with counts, a name filter and a sort choice. Rendered
+    hidden: the script reveals it, so without JS nothing dead is on show."""
+    pending_list = pending_list or []
+    if not anime_list and not pending_list:
+        return ""
+    counts = {"all": len(anime_list) + len(pending_list), "pending": len(pending_list),
+              "no-tvdb": sum(1 for a in anime_list if not a.get("tvdb_id"))}
+    for a in anime_list:
+        state = watchlist_filter_state(a)
+        counts[state] = counts.get(state, 0) + 1
+    chips = ""
+    for key, label in _WL_FILTERS:
+        n = counts.get(key, 0)
+        if key != "all" and not n:
+            continue
+        chips += ('<button type="button" class="wl-chip" data-filter="{key}" '
+                  'aria-pressed="{pressed}">{label}<span class="wl-chip-n">{n}</span>'
+                  '</button>').format(key=key, label=label, n=n,
+                                      pressed="true" if key == "all" else "false")
+    return (
+        '<div class="wl-controls" id="wl-controls" hidden>'
+        '<div class="wl-chips" role="group" aria-label="Filter watchlist by status">{chips}</div>'
+        '<div class="wl-tools">'
+        '<div class="wl-tool wl-tool-q"><label for="wl-q">Filter by name</label>'
+        '<input type="search" id="wl-q" autocomplete="off" spellcheck="false"></div>'
+        '<div class="wl-tool"><label for="wl-sort">Sort</label>'
+        '<select id="wl-sort">'
+        '<option value="list">Watchlist order</option>'
+        '<option value="name">Name</option>'
+        '<option value="added">Recently added</option>'
+        '<option value="next">Next episode</option>'
+        '</select></div>'
+        '</div>'
+        '<p class="wl-shown" id="wl-shown" aria-live="polite"></p>'
+        '</div>'
+        '<p class="empty" id="wl-none" hidden>No anime match these filters. '
+        '<button type="button" class="btn btn-ghost btn-sm" id="wl-clear">Show all</button></p>'
+    ).format(chips=chips)
+
+
+def watchlist_heading_count(anime_list, pending_list=None):
+    """"12 anime" or "12 anime, 2 pending": entries and pending apart."""
+    text = "{} anime".format(len(anime_list))
+    if pending_list:
+        text += ", {} pending".format(len(pending_list))
+    return text
 
 
 def compact_ranges(numbers):
@@ -3912,7 +4128,7 @@ def render_watchlist_card(i, a, outcome=None):
                 _key_input(key), _sr(" for {}".format(name)))
 
     return """
-        <article class="card wl-card" aria-labelledby="wl-name-{i}">
+        <article class="card wl-card" aria-labelledby="wl-name-{i}" {filter_attrs}>
           <div class="wl-head">
             <div class="wl-title">
               <h3 class="anime-name" id="wl-name-{i}">{name}</h3>
@@ -3925,7 +4141,7 @@ def render_watchlist_card(i, a, outcome=None):
           <div class="wl-panels">{ep_panel}{edit_panel}</div>
         </article>""".format(
         i=i, name=escape(name), url_html=_watchlist_url_html(url),
-        head_action=head_action,
+        head_action=head_action, filter_attrs=watchlist_filter_attrs(i, a),
         status_html=status_html,
         check_html="" if a.get("paused") else render_entry_check(outcome), facts_html=facts_html,
         ep_panel=_render_episode_panel(i, a, key, name),
@@ -4578,7 +4794,6 @@ def render_page(status="", search_html="", prefs_open=False, ani_data=None, sear
     anime_list = data.get("anime", [])
     pending_list = data.get("pending", [])
     prefs = load_prefs()
-    total = len(anime_list) + len(pending_list)
 
     activity = get_activity()
     bot_status_html, last_run_html, next_run_html = render_activity(activity)
@@ -4614,7 +4829,8 @@ def render_page(status="", search_html="", prefs_open=False, ani_data=None, sear
     page = page.replace("%%WATCHLIST%%", render_watchlist(
         anime_list, pending_list, run_state.get("entries")))
     page = page.replace("%%SETTINGS_CARD%%", render_settings_card(data.get("settings"), AUTH_ENABLED))
-    page = page.replace("%%COUNT%%", str(total))
+    page = page.replace("%%WATCHLIST_CONTROLS%%", render_watchlist_controls(anime_list, pending_list))
+    page = page.replace("%%COUNT%%", watchlist_heading_count(anime_list, pending_list))
     page = page.replace("%%PREFS_OPEN%%", "open" if prefs_open else "")
     page = page.replace("%%AUDIO_GER%%", 'selected' if audio_pref == "german" else "")
     page = page.replace("%%AUDIO_JAP%%", 'selected' if audio_pref == "japanese" else "")

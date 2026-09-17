@@ -5857,5 +5857,78 @@ class PendingResolveErrorTest(unittest.TestCase):
         self.assertEqual(store["pending"][0]["resolve_error"]["reason"], "site timed out")
 
 
+class WatchlistFilterTest(unittest.TestCase):
+    TODAY = datetime(2026, 9, 17).date()
+    ENTRIES = [
+        {"name": "Paused One", "url": "https://x/p", "episodes": 3, "paused": True, "missing": [2]},
+        {"name": "Retry Two", "url": "https://x/r", "episodes": 5, "missing": [4], "tvdb_id": 7},
+        {"name": "Film", "url": "https://x/m", "media_type": "movie"},
+        {"name": "Done", "url": "https://x/c", "episodes": 12, "complete": True, "tvdb_id": 8},
+        {"name": "Brand New", "url": "https://x/n"},
+        {"name": "Airing <Show>", "url": "https://x/a", "episodes": 4, "tvdb_id": 9,
+         "skip_until": "2026-09-24", "skip_real_airdate": True},
+        {"name": "Watching", "url": "https://x/w", "episodes": 2, "al_status": "Laufend"},
+    ]
+
+    def test_filter_state_follows_status_precedence(self):
+        states = [app.watchlist_filter_state(e, self.TODAY) for e in self.ENTRIES]
+        self.assertEqual(states, ["paused", "retrying", "movie", "complete", "new",
+                                  "airing", "airing"])
+        movie_retry = {"name": "M", "media_type": "movie", "missing": [1]}
+        self.assertEqual(app.watchlist_filter_state(movie_retry, self.TODAY), "retrying")
+
+    def test_filter_attrs(self):
+        attrs = app.watchlist_filter_attrs(5, self.ENTRIES[5], self.TODAY)
+        self.assertEqual(attrs, 'data-state="airing" data-tvdb="1" '
+                                'data-name="airing &lt;show&gt;" data-added="5" '
+                                'data-next="2026-09-24"')
+        # next date only for an airing card
+        self.assertIn('data-next=""', app.watchlist_filter_attrs(0, self.ENTRIES[0], self.TODAY))
+        self.assertIn('data-tvdb="0"', app.watchlist_filter_attrs(0, self.ENTRIES[0], self.TODAY))
+
+    def test_cards_carry_attrs_and_pending_is_marked(self):
+        out = app.render_watchlist(self.ENTRIES, [{"name": "Queued", "url": "https://x/q"}])
+        self.assertIn('class="card card-accent wl-pending" data-state="pending" data-name="queued"', out)
+        self.assertEqual(out.count("<article "), len(self.ENTRIES))
+        self.assertIn('aria-labelledby="wl-name-3" data-state="complete" data-tvdb="1" '
+                      'data-name="done" data-added="3"', out)
+
+    def test_controls_counts_and_hidden_zero_chips(self):
+        out = app.render_watchlist_controls(self.ENTRIES, [{"name": "Q", "url": "https://x/q"}])
+        self.assertIn('<div class="wl-controls" id="wl-controls" hidden>', out)
+        self.assertIn('data-filter="all" aria-pressed="true">All<span class="wl-chip-n">8</span>', out)
+        for key, n in (("airing", 2), ("retrying", 1), ("complete", 1), ("paused", 1),
+                       ("pending", 1), ("no-tvdb", 4)):
+            self.assertIn('data-filter="{}" aria-pressed="false">'.format(key), out)
+            self.assertRegex(out, r'data-filter="{}"[^>]*>[^<]+<span class="wl-chip-n">{}</span>'.format(key, n))
+        self.assertIn('<label for="wl-q">', out)
+        self.assertIn('<label for="wl-sort">', out)
+        solo = app.render_watchlist_controls([self.ENTRIES[3]])
+        self.assertNotIn('data-filter="paused"', solo)
+        self.assertNotIn('data-filter="pending"', solo)
+        self.assertEqual(app.render_watchlist_controls([], []), "")
+
+    def test_failed_resolve_still_counts_as_pending(self):
+        pending = [{"name": "Stuck", "url": "https://x/s",
+                    "resolve_error": {"reason": "site timed out", "ts": 1789600000}}]
+        out = app.render_watchlist([], pending)
+        self.assertIn("Resolve failed", out)
+        self.assertIn('wl-pending" data-state="pending" data-name="stuck"', out)
+        controls = app.render_watchlist_controls([], pending)
+        self.assertRegex(controls, r'data-filter="pending"[^>]*>Pending<span class="wl-chip-n">1</span>')
+
+    def test_heading_counts_entries_and_pending_apart(self):
+        self.assertEqual(app.watchlist_heading_count([{}] * 3), "3 anime")
+        self.assertEqual(app.watchlist_heading_count([{}] * 3, [{}, {}]), "3 anime, 2 pending")
+
+    def test_page_wraps_watchlist_and_poll_leaves_it_alone(self):
+        t = app.HTML_TEMPLATE
+        self.assertIn('<div id="wl-list">%%WATCHLIST%%</div>', t)
+        self.assertLess(t.index("%%WATCHLIST_CONTROLS%%"), t.index('<div id="wl-list">'))
+        ids = re.search(r"var ids = \[([^\]]*)\]", t).group(1)
+        self.assertNotIn("wl-", ids)
+        self.assertIn("localStorage.getItem(KEY)", t)
+        self.assertRegex(t, r"try \{ localStorage\.setItem")
+
 if __name__ == "__main__":
     unittest.main()

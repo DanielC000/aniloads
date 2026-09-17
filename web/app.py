@@ -19,7 +19,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from html import escape
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote, urlencode
 
 import logging
@@ -711,6 +711,14 @@ def update_ani(fn):
 # Soft run-now / per-entry check-now
 # ---------------------------------------------------------------------------
 
+# Guards trigger_run_now's cooldown check + state write as one atomic step —
+# under the threaded server, two concurrent /run-now or /check-now POSTs
+# (e.g. two browser tabs, or a double-click) could otherwise both read the
+# cooldown as elapsed before either one's write lands, both passing a check
+# meant to allow only one.
+_run_now_lock = threading.Lock()
+
+
 def _load_run_now_last():
     try:
         with open(RUN_NOW_STATE_FILE, "r", encoding="utf-8") as f:
@@ -784,33 +792,37 @@ def trigger_run_now(entry_url=None):
     the bot actually wakes up to run that cycle.
 
     Returns (ok, message)."""
-    remaining = run_now_cooldown_remaining()
-    if remaining > 0:
-        return False, "Cooling down — try again in {}s".format(remaining)
+    # The cooldown check and its state write must happen as one atomic step
+    # — see _run_now_lock's comment for why (two concurrent callers under
+    # the threaded server could otherwise both pass the check).
+    with _run_now_lock:
+        remaining = run_now_cooldown_remaining()
+        if remaining > 0:
+            return False, "Cooling down — try again in {}s".format(remaining)
 
-    name = None
-    if entry_url:
-        outcome = {}
+        name = None
+        if entry_url:
+            outcome = {}
 
-        def _set_force_check(data):
-            anime_list = data.get("anime", [])
-            _, entry = find_entry_by_url(anime_list, entry_url)
-            if entry is None:
-                outcome["result"] = "not_found"
-                return
-            entry["force_check"] = True
-            outcome["result"] = "ok"
-            outcome["name"] = entry.get("name", "?")
+            def _set_force_check(data):
+                anime_list = data.get("anime", [])
+                _, entry = find_entry_by_url(anime_list, entry_url)
+                if entry is None:
+                    outcome["result"] = "not_found"
+                    return
+                entry["force_check"] = True
+                outcome["result"] = "ok"
+                outcome["name"] = entry.get("name", "?")
 
-        update_ani(_set_force_check)
-        if outcome.get("result") != "ok":
-            return False, "Entry not found"
-        name = outcome.get("name")
+            update_ani(_set_force_check)
+            if outcome.get("result") != "ok":
+                return False, "Entry not found"
+            name = outcome.get("name")
 
-    now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    if not _write_run_now_trigger(now_iso):
-        return False, "Failed to write run-now trigger"
-    _write_small_json(RUN_NOW_STATE_FILE, {"last_requested_at": now_iso})
+        now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        if not _write_run_now_trigger(now_iso):
+            return False, "Failed to write run-now trigger"
+        _write_small_json(RUN_NOW_STATE_FILE, {"last_requested_at": now_iso})
 
     if name:
         return True, "Check now queued for {} — starts within a few seconds".format(name)
@@ -864,8 +876,22 @@ def load_prefs():
 
 
 def save_prefs(prefs):
-    with open(PREFS_FILE, "w", encoding="utf-8") as f:
-        json.dump(prefs, f, indent=2)
+    """Write web-prefs.json atomically (tmp + os.replace) so two concurrent
+    /save-prefs POSTs (now possible under the threaded server) can't
+    interleave their writes into a half-written, corrupt file — the last one
+    to finish simply wins, same as before threading."""
+    d = os.path.dirname(PREFS_FILE) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=d, prefix=".web-prefs-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(prefs, f, indent=2)
+        os.replace(tmp_path, PREFS_FILE)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1240,6 +1266,63 @@ def get_releases(url):
                 anime._driver.quit()
             except Exception:
                 pass
+
+
+_MEDIA_TYPES = ("series", "movie")
+_MAX_SANE_EPISODE_COUNT = 100000
+
+
+def _resolve_release_selection(url, params):
+    """Validate the release_id / media_type / episode-count carried as
+    hidden fields from render_releases through the release -> TVDB ->
+    season forms, so /add-release and /tvdb-seasons never need their own
+    re-scrape to re-derive or double check them.
+
+    These are user-controlled POST fields, so they're trusted only when
+    they check out: release_id must be a member of the ``release_ids`` set
+    render_releases put on the page (every id actually offered for this
+    anime), and episodes must parse as a small non-negative int. Whenever
+    that can't be confirmed — a missing/malformed hidden field (an old page
+    from before this existed, or one stripped in transit) as much as an
+    outright tampered value — this falls back to exactly one fresh scrape
+    to establish the truth, rather than trusting or guessing at the posted
+    value either way.
+
+    Returns (release_id, media_type, episodes). release_id is "" when
+    nothing was selected, or when even a fresh scrape can't corroborate the
+    posted one (it genuinely isn't one of this anime's releases) — callers
+    must treat that as a rejected selection, not silently substitute a
+    default.
+    """
+    release_id = params.get("release_id", "")
+    media_type = params.get("media_type", "")
+    episodes_raw = params.get("episodes", "")
+
+    if not release_id:
+        return "", (media_type if media_type in _MEDIA_TYPES else "series"), 0
+
+    valid_ids = {tok for tok in
+                 (t.strip() for t in params.get("release_ids", "").split(","))
+                 if tok}
+    try:
+        episodes = int(episodes_raw)
+    except ValueError:
+        episodes = -1
+    episodes_ok = 0 <= episodes <= _MAX_SANE_EPISODE_COUNT
+
+    if release_id in valid_ids and media_type in _MEDIA_TYPES and episodes_ok:
+        return release_id, media_type, episodes
+
+    # Something didn't check out — re-derive from a fresh scrape instead of
+    # trusting (or blindly rejecting) the posted value.
+    info, _err = get_releases(url)
+    if not info:
+        return "", (media_type if media_type in _MEDIA_TYPES else "series"), 0
+    resolved_media_type = info.get("media_type", "series") or "series"
+    for rel in info.get("releases", []):
+        if str(rel.get("id")) == release_id:
+            return release_id, resolved_media_type, rel.get("episodes", 0) or 0
+    return "", resolved_media_type, 0
 
 
 # ---------------------------------------------------------------------------
@@ -2197,7 +2280,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <div class="section">
   <h2>Add Anime</h2>
   <div class="card">
-    <form method="POST" action="/add-url">
+    <form method="POST" action="/add-url" onsubmit="return scrapeBusy(this, 'Fetching releases… this can take up to a minute');">
       <label class="hint">Paste an anime-loads.org URL to see available releases:</label>
       <div class="form-row" style="margin-top:6px;">
         <input type="url" name="url" placeholder="https://www.anime-loads.org/media/..." required>
@@ -2206,7 +2289,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </form>
   </div>
   <div class="card">
-    <form method="POST" action="/search">
+    <form method="POST" action="/search" onsubmit="return scrapeBusy(this, 'Searching… this can take up to a minute');">
       <label class="hint">Or search by name:</label>
       <div class="form-row" style="margin-top:6px;">
         <input type="text" name="q" placeholder="Search anime..." required>
@@ -2224,6 +2307,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </div>
 
 <script>
+// Scrape-backed forms (add-url, search) hit Selenium server-side and can
+// take up to ~a minute — disable the button and relabel it on submit so the
+// page doesn't look hung while a normal (non-AJAX) form POST is in flight.
+// The threaded server keeps the /api/status poll below updating throughout.
+function scrapeBusy(form, label) {
+  var btn = form.querySelector('button[type=submit]');
+  if (btn && !btn.disabled) {
+    btn.disabled = true;
+    btn.textContent = label;
+  }
+  return true;
+}
+
 (function() {
   var ids = ['bot-status','last-run','next-run','run-history','health',
              'move-status','move-last-run','move-history','move-stuck'];
@@ -3103,6 +3199,11 @@ def render_releases(anime_info, best_id=None):
     </div>""".format(name=escape(anime_info["name"]))
 
     media_type = anime_info.get("media_type", "series") or "series"
+    # Every release id actually offered on this page — carried as a hidden
+    # field alongside the chosen release_id so /add-release and /tvdb-seasons
+    # can validate the selection is one the site really offered, without
+    # re-scraping to re-derive that set.
+    valid_ids = ",".join(str(rel["id"]) for rel in anime_info["releases"])
     for rel in anime_info["releases"]:
         dubs = escape(", ".join(rel["dubs"])) if rel["dubs"] else "&mdash;"
         subs = escape(", ".join(rel["subs"])) if rel["subs"] else "&mdash;"
@@ -3124,6 +3225,8 @@ def render_releases(anime_info, best_id=None):
               <input type="hidden" name="url" value="{url}">
               <input type="hidden" name="name" value="{name}">
               <input type="hidden" name="release_id" value="{rid}">
+              <input type="hidden" name="release_ids" value="{valid_ids}">
+              <input type="hidden" name="episodes" value="{eps}">
               <input type="hidden" name="custom_folder" value="">
               <input type="hidden" name="media_type" value="{mt}">
               <button type="submit" class="btn btn-primary btn-sm">Add this release</button>
@@ -3133,7 +3236,7 @@ def render_releases(anime_info, best_id=None):
             res=rel["resolution"], dubs=dubs, subs=subs, eps=rel["episodes"],
             size=rel["size_mb"], group=escape(rel["group"]), url=escape(anime_info["url"]),
             name=escape(anime_info["name"]), rid=rel["id"], highlight=highlight,
-            best_label=best_label, mt=escape(media_type),
+            best_label=best_label, mt=escape(media_type), valid_ids=escape(valid_ids),
         )
     html += "</div>"
     return html
@@ -3142,7 +3245,7 @@ def render_releases(anime_info, best_id=None):
 def render_tvdb_step(anime_name, url, release_id, custom_folder,
                      search_results=None, seasons=None, selected_tvdb_id="",
                      selected_tvdb_name="", ep_count=0, edit_key=None,
-                     media_type="series"):
+                     media_type="series", release_ids="", episodes=0):
     """Render the TVDB correlation page shown between release selection and saving.
 
     When edit_key is set (the existing entry's URL), this is editing an existing
@@ -3153,6 +3256,11 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
     When media_type == "movie", the UI searches TVDB's movie catalogue and
     drops the season picker (movies have no seasons). Clicking "Link" on a
     result saves the tvdb_id and returns to the watchlist.
+
+    ``release_ids``/``episodes`` are the same release-selection metadata
+    render_releases first put on the page, carried forward through every
+    form on this multi-step flow so /add-release and /tvdb-seasons never
+    need to re-scrape to validate or re-derive them.
     """
     is_movie = (media_type == "movie")
     save_action = "/tvdb-save" if edit_key is not None else "/add-release"
@@ -3162,11 +3270,14 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
         '<input type="hidden" name="url" value="{url}">'
         '<input type="hidden" name="name" value="{name}">'
         '<input type="hidden" name="release_id" value="{rid}">'
+        '<input type="hidden" name="release_ids" value="{valid_ids}">'
+        '<input type="hidden" name="episodes" value="{eps}">'
         '<input type="hidden" name="custom_folder" value="{folder}">'
         '<input type="hidden" name="media_type" value="{mt}">'
     ).format(url=escape(url), name=escape(anime_name),
              rid=escape(str(release_id)), folder=escape(custom_folder),
-             mt=escape(media_type))
+             mt=escape(media_type), valid_ids=escape(release_ids),
+             eps=int(episodes) if str(episodes).lstrip("-").isdigit() else 0)
     if edit_key is not None:
         hidden += '<input type="hidden" name="key" value="{}">'.format(escape(edit_key))
 
@@ -3529,22 +3640,45 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect_msg("Error: Invalid URL")
                 return
 
-            data = load_ani()
-            all_entries = data.get("anime", []) + data.get("pending", [])
-            for a in all_entries:
-                if a.get("url") == url:
-                    self._redirect_msg("Already in watchlist")
-                    return
+            # Cheap pre-check so re-adding something already present skips
+            # the scrape below entirely. Not the authoritative check — that
+            # happens inside update_ani's single lock hold further down, so
+            # a concurrent add (or a bot/resolver write landing while this
+            # request's scrape is in flight) is never missed or clobbered.
+            existing = load_ani()
+            all_entries = existing.get("anime", []) + existing.get("pending", [])
+            if any(a.get("url") == url for a in all_entries):
+                self._redirect_msg("Already in watchlist")
+                return
 
-            # Fetch releases from site so user can see what's available
+            # Fetch releases from site so user can see what's available. No
+            # anistore lock is held across this network/Selenium call — see
+            # update_ani's docstring for why that matters now the server is
+            # threaded.
             anime_info, err = get_releases(url)
             if err or not anime_info or not anime_info.get("releases"):
-                # Fallback: queue to pending if fetch fails
+                # Fallback: queue to pending if fetch fails. Dedupe + append
+                # happen in ONE lock hold so a write that landed during the
+                # multi-second scrape above (e.g. the bot, or another /add-url)
+                # can't be silently overwritten by this request's stale
+                # pre-scrape snapshot.
                 slug = url.rstrip("/").split("/")[-1]
                 name = slug.replace("-", " ").title()
-                entry = {"url": url, "name": name, "status": "pending"}
-                data.setdefault("pending", []).append(entry)
-                save_ani(data)
+                already_present = False
+
+                def _add_pending(data):
+                    nonlocal already_present
+                    all_entries = data.get("anime", []) + data.get("pending", [])
+                    if any(a.get("url") == url for a in all_entries):
+                        already_present = True
+                        return
+                    data.setdefault("pending", []).append(
+                        {"url": url, "name": name, "status": "pending"})
+
+                update_ani(_add_pending)
+                if already_present:
+                    self._redirect_msg("Already in watchlist")
+                    return
                 msg = "Could not fetch releases{}, added to pending queue".format(
                     ": " + err if err else "")
                 self._redirect_msg(msg)
@@ -3560,7 +3694,6 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/add-release":
             url = params.get("url", "").strip()
             name = params.get("name", "Unknown")
-            release_id = params.get("release_id", "")
             custom_folder = params.get("custom_folder", "").strip()
 
             data = load_ani()
@@ -3569,30 +3702,38 @@ class Handler(BaseHTTPRequestHandler):
                     self._redirect_msg("Already in watchlist")
                     return
 
+            # Validate the release_id / media_type / episode-count carried
+            # as hidden fields from the release-selection page (or the TVDB
+            # step that followed it) rather than trusting them outright —
+            # see _resolve_release_selection's docstring for the
+            # validate-or-rescrape rule this applies. No release_id at all
+            # is a legitimate call shape (adding without ever going through
+            # release selection) — only a *posted-but-unconfirmable* one
+            # (tampered, or stale beyond recovery) is rejected outright.
+            posted_release_id = params.get("release_id", "")
+            release_id, media_type, episodes = _resolve_release_selection(url, params)
+            if posted_release_id and not release_id:
+                self._redirect_msg(
+                    "Error: invalid release selection — please fetch releases again")
+                return
+
             # If TVDB is available and user hasn't been through the TVDB step yet,
             # show the correlation page instead of saving immediately.
             # For movies the "through the TVDB step" signal is either tvdb_skip
             # or a posted tvdb_id — there's no tvdb_season field to look for.
-            media_type = params.get("media_type", "")
             has_tvdb_data = (
                 "tvdb_season" in params
                 or "tvdb_skip" in params
                 or (media_type == "movie" and "tvdb_id" in params)
             )
             if tvdb.available and not has_tvdb_data:
-                # First time through — scrape to determine type, then search.
-                if not media_type:
-                    info, _err = get_releases(url)
-                    if info:
-                        media_type = info.get("media_type", "series")
-                    else:
-                        media_type = "series"
                 results = tvdb.search(
                     name,
                     content_type="movie" if media_type == "movie" else "series")
                 search_html = render_tvdb_step(
                     name, url, release_id, custom_folder,
-                    search_results=results, media_type=media_type)
+                    search_results=results, media_type=media_type,
+                    release_ids=params.get("release_ids", ""), episodes=episodes)
                 self._respond(200, render_page(search_html=search_html))
                 return
 
@@ -3680,17 +3821,17 @@ class Handler(BaseHTTPRequestHandler):
             search_html = render_tvdb_step(
                 name, url, release_id, custom_folder,
                 search_results=results, edit_key=edit_key,
-                media_type=media_type)
+                media_type=media_type,
+                release_ids=params.get("release_ids", ""),
+                episodes=params.get("episodes", 0))
             self._respond(200, render_page(search_html=search_html))
 
         elif parsed.path == "/tvdb-seasons":
             url = params.get("url", "").strip()
             name = params.get("name", "Unknown")
-            release_id = params.get("release_id", "")
             custom_folder = params.get("custom_folder", "").strip()
             tvdb_id = params.get("tvdb_id", "")
             tvdb_name = params.get("tvdb_name", "")
-            media_type = params.get("media_type", "series")
             edit_key = params.get("key")
 
             # Fetch seasons for the selected series
@@ -3699,18 +3840,14 @@ class Handler(BaseHTTPRequestHandler):
             # Re-run the search so results stay visible
             results = tvdb.search(name) if tvdb.available else []
 
-            # Determine ep count from the release (for auto-suggestion)
-            ep_count = 0
-            if release_id:
-                try:
-                    anime_info, _ = get_releases(url)
-                    if anime_info:
-                        for rel in anime_info.get("releases", []):
-                            if str(rel.get("id")) == str(release_id):
-                                ep_count = rel.get("episodes", 0)
-                                break
-                except Exception:
-                    pass
+            # Validate the release_id / media_type / episode-count carried
+            # from the release step (for the season auto-suggestion) rather
+            # than re-scraping to look them up — see
+            # _resolve_release_selection's docstring for the
+            # validate-or-rescrape rule this applies. An invalid/tampered
+            # release_id resolves to "" here (no auto-suggestion); the
+            # actual save at /add-release rejects it outright.
+            release_id, media_type, ep_count = _resolve_release_selection(url, params)
 
             # Editing an existing entry has no release_id, so fall back to the
             # entry's stored episode count — otherwise the "Likely match" season
@@ -3729,7 +3866,8 @@ class Handler(BaseHTTPRequestHandler):
                 search_results=results, seasons=seasons,
                 selected_tvdb_id=tvdb_id, selected_tvdb_name=tvdb_name or name,
                 ep_count=ep_count, edit_key=edit_key,
-                media_type=media_type)
+                media_type=media_type,
+                release_ids=params.get("release_ids", ""), episodes=ep_count)
             self._respond(200, render_page(search_html=search_html))
 
         elif parsed.path == "/search":
@@ -4159,5 +4297,9 @@ if __name__ == "__main__":
     mover = threading.Thread(target=move_completed_worker, daemon=True)
     mover.start()
 
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    # ThreadingHTTPServer (daemon_threads=True by default) so a slow
+    # Selenium-backed handler (add-anime's get_releases, up to ~a minute)
+    # can't freeze the whole dashboard, including the 10s /api/status poll,
+    # for every other concurrent request.
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.serve_forever()

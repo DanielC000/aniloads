@@ -3,8 +3,10 @@
 import collections
 import contextlib
 import html
+import http.client
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -3497,6 +3499,289 @@ class RunNowCheckNowPostTest(unittest.TestCase):
     def test_check_now_missing_key_errors(self):
         result = self._post("/check-now", {"key": "http://x/missing"})
         self.assertTrue(result["msg"].startswith("Error:"))
+
+
+class AddUrlClobberTest(unittest.TestCase):
+    """/add-url used to load ani.json, run the multi-second Selenium scrape,
+    then mutate/save that now-stale in-memory snapshot — a bot-cycle write
+    landing during the scrape got silently clobbered. It must scrape FIRST,
+    then read-modify-write inside ONE update_ani lock hold."""
+
+    def setUp(self):
+        fd, self._ani_path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        with open(self._ani_path, "w", encoding="utf-8") as f:
+            json.dump({"settings": {}, "anime": []}, f)
+        self._orig_ani = app.ANI_JSON
+        app.ANI_JSON = self._ani_path
+
+        self._orig_get_releases = app.get_releases
+        self._scrape_started = threading.Event()
+        self._release_scrape = threading.Event()
+
+        def blocking_get_releases(url):
+            self._scrape_started.set()
+            self._release_scrape.wait(timeout=5)
+            return None, "stubbed: unavailable"
+
+        app.get_releases = blocking_get_releases
+
+    def tearDown(self):
+        app.get_releases = self._orig_get_releases
+        app.ANI_JSON = self._orig_ani
+        try:
+            os.remove(self._ani_path)
+        except OSError:
+            pass
+
+    def _post(self, path, params):
+        captured = {}
+        h = app.Handler.__new__(app.Handler)
+        h.path = path
+        h._read_post = lambda: params
+        h._redirect_msg = lambda msg: captured.__setitem__("msg", msg)
+        h._redirect = lambda url: captured.__setitem__("url", url)
+        h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
+        h.do_POST()
+        return captured
+
+    def test_bot_write_during_scrape_survives_add_url_fallback_save(self):
+        url = "https://www.anime-loads.org/anime/new-show"
+        result = {}
+
+        def do_add_url():
+            result["captured"] = self._post("/add-url", {"url": url})
+
+        poster = threading.Thread(target=do_add_url)
+        poster.start()
+        self.assertTrue(self._scrape_started.wait(timeout=5), "scrape never started")
+
+        # A bot-cycle write landing while the scrape above is still in
+        # flight — this must survive /add-url's own save once the scrape
+        # (and its fallback-to-pending save) completes.
+        app.update_ani(lambda data: data.setdefault("anime", []).append(
+            {"url": "https://www.anime-loads.org/anime/existing", "name": "Existing"}))
+
+        self._release_scrape.set()
+        poster.join(timeout=5)
+
+        with open(self._ani_path, encoding="utf-8") as f:
+            saved = json.load(f)
+
+        anime_urls = {a.get("url") for a in saved.get("anime", [])}
+        pending_urls = {p.get("url") for p in saved.get("pending", [])}
+        self.assertIn("https://www.anime-loads.org/anime/existing", anime_urls,
+                       "bot's concurrent write was clobbered by /add-url's stale snapshot")
+        self.assertIn(url, pending_urls)
+
+
+class ThreadedServerConcurrencyTest(unittest.TestCase):
+    """The core fix: a slow scrape-backed handler must not block a
+    concurrent /api/status request. Runs a real ThreadingHTTPServer bound to
+    a real (ephemeral) socket — this only proves anything if the server
+    under test is actually multi-threaded."""
+
+    def setUp(self):
+        fd, self._ani_path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        with open(self._ani_path, "w", encoding="utf-8") as f:
+            json.dump({"settings": {}, "anime": []}, f)
+        self._orig_ani = app.ANI_JSON
+        app.ANI_JSON = self._ani_path
+
+        self._orig_get_releases = app.get_releases
+        self._scrape_started = threading.Event()
+
+        def slow_get_releases(url):
+            self._scrape_started.set()
+            time.sleep(1.0)
+            return None, "stubbed: unavailable"
+
+        app.get_releases = slow_get_releases
+
+        self.server = app.ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        self.port = self.server.server_address[1]
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.server_thread.join(timeout=5)
+        app.get_releases = self._orig_get_releases
+        app.ANI_JSON = self._orig_ani
+        try:
+            os.remove(self._ani_path)
+        except OSError:
+            pass
+
+    def _request(self, method, path, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        headers = {"Content-Type": "application/x-www-form-urlencoded"} if body else {}
+        conn.request(method, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        return resp.status
+
+    def test_slow_add_url_does_not_block_concurrent_status_poll(self):
+        results = {}
+
+        def do_slow_post():
+            results["post_status"] = self._request(
+                "POST", "/add-url", body="url=" + quote("https://www.anime-loads.org/anime/x"))
+
+        poster = threading.Thread(target=do_slow_post)
+        poster.start()
+        self.assertTrue(self._scrape_started.wait(timeout=5),
+                         "slow /add-url handler never started")
+
+        start = time.monotonic()
+        status_code = self._request("GET", "/api/status")
+        elapsed = time.monotonic() - start
+        poster.join(timeout=5)
+
+        self.assertEqual(status_code, 200)
+        # The stubbed scrape sleeps 1s while holding no lock — a concurrent
+        # /api/status answered in well under that proves it ran on its own
+        # thread instead of queuing behind a single-threaded accept loop.
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(results.get("post_status"), 303)
+
+
+class AddFlowHiddenFieldsTest(unittest.TestCase):
+    """The release -> TVDB -> season forms carry media_type/episode-count/
+    release-id metadata as hidden fields (render_releases onward) so
+    /add-release and /tvdb-seasons never need to re-scrape to re-derive or
+    double-check them — except to recover from a value that doesn't check
+    out (missing, or tampered)."""
+
+    def setUp(self):
+        fd, self._ani_path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        with open(self._ani_path, "w", encoding="utf-8") as f:
+            json.dump({"settings": {}, "anime": []}, f)
+        self._orig_ani = app.ANI_JSON
+        app.ANI_JSON = self._ani_path
+
+        self._orig_get_releases = app.get_releases
+        self.scrape_calls = []
+
+        def counting_get_releases(url):
+            self.scrape_calls.append(url)
+            return {
+                "name": "Test Anime",
+                "url": url,
+                "releases": [
+                    {"id": 111, "resolution": 1080, "dubs": ["german"], "subs": [],
+                     "episodes": 12, "size_mb": 4000, "group": "grp"},
+                ],
+                "media_type": "series",
+                "year": 2020,
+                "display_title": "Test Anime",
+            }, None
+
+        app.get_releases = counting_get_releases
+
+        self._orig_tvdb_available = app.tvdb.available
+        app.tvdb.available = False
+
+    def tearDown(self):
+        app.get_releases = self._orig_get_releases
+        app.tvdb.available = self._orig_tvdb_available
+        app.ANI_JSON = self._orig_ani
+        try:
+            os.remove(self._ani_path)
+        except OSError:
+            pass
+
+    def _post(self, path, params):
+        captured = {}
+        h = app.Handler.__new__(app.Handler)
+        h.path = path
+        h._read_post = lambda: params
+        h._redirect_msg = lambda msg: captured.__setitem__("msg", msg)
+        h._redirect = lambda url: captured.__setitem__("url", url)
+        h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
+        h.do_POST()
+        return captured
+
+    def _hidden_field(self, html_out, name):
+        m = re.search(r'name="{}" value="([^"]*)"'.format(re.escape(name)), html_out)
+        self.assertIsNotNone(m, "missing hidden field {!r} in:\n{}".format(name, html_out))
+        return html.unescape(m.group(1))
+
+    def test_add_flow_scrapes_at_most_once(self):
+        url = "https://www.anime-loads.org/anime/x"
+        add_url_result = self._post("/add-url", {"url": url})
+        self.assertEqual(len(self.scrape_calls), 1)
+        self.assertIn("Add this release", add_url_result["html"])
+
+        html_out = add_url_result["html"]
+        release_params = {
+            "url": self._hidden_field(html_out, "url"),
+            "name": self._hidden_field(html_out, "name"),
+            "release_id": self._hidden_field(html_out, "release_id"),
+            "release_ids": self._hidden_field(html_out, "release_ids"),
+            "episodes": self._hidden_field(html_out, "episodes"),
+            "custom_folder": "",
+            "media_type": self._hidden_field(html_out, "media_type"),
+        }
+
+        add_release_result = self._post("/add-release", release_params)
+        self.assertEqual(len(self.scrape_calls), 1, "add-release re-scraped")
+        self.assertTrue(add_release_result["msg"].startswith("Added:"))
+
+        with open(self._ani_path, encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertEqual(len(saved["anime"]), 1)
+        self.assertEqual(saved["anime"][0]["releaseID"], 111)
+
+    def test_add_release_rejects_tampered_release_id(self):
+        url = "https://www.anime-loads.org/anime/x"
+        self._post("/add-url", {"url": url})
+        self.assertEqual(len(self.scrape_calls), 1)
+
+        tampered_params = {
+            "url": url,
+            "name": "Test Anime",
+            "release_id": "999",  # never one of the ids actually offered
+            "release_ids": "111",
+            "episodes": "12",
+            "custom_folder": "",
+            "media_type": "series",
+        }
+        result = self._post("/add-release", tampered_params)
+        self.assertTrue(result["msg"].startswith("Error"))
+
+        with open(self._ani_path, encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertEqual(saved["anime"], [])
+
+    def test_add_release_rejects_tampered_episode_count(self):
+        url = "https://www.anime-loads.org/anime/x"
+        self._post("/add-url", {"url": url})
+        self.assertEqual(len(self.scrape_calls), 1)
+
+        # release_id/media_type check out, but episodes is out of range —
+        # the whole selection must still be re-derived from a fresh scrape
+        # rather than trusting the tampered episode count.
+        tampered_params = {
+            "url": url,
+            "name": "Test Anime",
+            "release_id": "111",
+            "release_ids": "111",
+            "episodes": "999999",
+            "custom_folder": "",
+            "media_type": "series",
+        }
+        result = self._post("/add-release", tampered_params)
+        self.assertEqual(len(self.scrape_calls), 2, "did not re-derive from a fresh scrape")
+        self.assertTrue(result["msg"].startswith("Added:"))
+
+        with open(self._ani_path, encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertEqual(saved["anime"][0]["releaseID"], 111)
 
 
 if __name__ == "__main__":

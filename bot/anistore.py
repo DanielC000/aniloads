@@ -62,13 +62,27 @@ def load(path, default=None):
         raise CorruptStoreError(path, e) from e
 
 
-def _umask():
-    """The process umask, read without side effects (there's no getter —
-    os.umask() only ever sets-and-returns-previous, so this sets it back
-    immediately)."""
+def _read_umask():
+    """The process umask, read without lasting side effects (there's no
+    getter — os.umask() only ever sets-and-returns-previous, so this sets it
+    back immediately).
+
+    Not safe to call once the process is multi-threaded: the brief window
+    between the set and the reset is a real (if momentary) process-wide
+    umask of 0, and a concurrent save on another thread creating a new file
+    in that window would get world-writable permissions. Call this once at
+    import time instead (see _PROCESS_UMASK below) and read the cached value
+    from then on.
+    """
     mask = os.umask(0)
     os.umask(mask)
     return mask
+
+
+# Read once at import time, while the process is still single-threaded — see
+# _read_umask's docstring for why this can't be done safely per-call once the
+# dashboard's threaded server is up.
+_PROCESS_UMASK = _read_umask()
 
 
 def _match_permissions(tmp_path, target_path):
@@ -89,7 +103,7 @@ def _match_permissions(tmp_path, target_path):
         # No existing file yet — give it what a plain open(path, "w") would
         # have produced (0666 minus umask), not mkstemp's restrictive 0600.
         try:
-            os.chmod(tmp_path, 0o666 & ~_umask())
+            os.chmod(tmp_path, 0o666 & ~_PROCESS_UMASK)
         except OSError:
             pass
         return

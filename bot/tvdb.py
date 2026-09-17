@@ -4,6 +4,7 @@ TVDB API v4 client — shared between bot (anibot.py) and web dashboard (app.py)
 
 import logging
 import os
+import threading
 import time
 
 _log = logging.getLogger("tvdb")
@@ -35,6 +36,11 @@ class TVDBClient:
         self.available = bool(api_key)
         self._token = None
         self._token_expiry = 0
+        # Shared across the dashboard's request-handling threads (this client
+        # is a single module-level instance, see web/app.py's `tvdb = ...`) —
+        # without it, two threads racing _ensure_token when the cached token
+        # is expired both see it as invalid and both fire a redundant login.
+        self._token_lock = threading.Lock()
 
     def _login(self):
         if not self.api_key:
@@ -59,9 +65,10 @@ class TVDBClient:
     def _ensure_token(self):
         if not self.available:
             return False
-        if self._token and time.time() < self._token_expiry:
-            return True
-        return self._login()
+        with self._token_lock:
+            if self._token and time.time() < self._token_expiry:
+                return True
+            return self._login()
 
     def check_health(self):
         """Verify the configured API key actually authenticates, not just that
@@ -87,7 +94,9 @@ class TVDBClient:
             )
             if resp.status_code == 401:
                 # Token expired, retry once
-                if self._login():
+                with self._token_lock:
+                    relogged_in = self._login()
+                if relogged_in:
                     resp = requests.get(
                         TVDB_BASE + path,
                         headers={"Authorization": "Bearer " + self._token},

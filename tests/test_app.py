@@ -2546,5 +2546,73 @@ class HandlerGetMsgBannerTest(unittest.TestCase):
         self.assertIn("status-err", html_out)
 
 
+class ApplyResolvedPendingTest(unittest.TestCase):
+    """Pure tests for app.apply_resolved_pending — resolve_pending()'s
+    field-level merge, replacing a whole-document save of the stale
+    "pending" snapshot loaded before the (multi-second, per-entry) scrape."""
+
+    def test_resolved_entry_moves_from_pending_to_anime(self):
+        data = {"pending": [{"url": "https://x/a", "name": "A"}], "anime": []}
+        resolved = [{"url": "https://x/a", "name": "A", "episodes": 0, "missing": []}]
+        app.apply_resolved_pending(data, resolved)
+        self.assertEqual(data["pending"], [])
+        self.assertEqual([e["url"] for e in data["anime"]], ["https://x/a"])
+
+    def test_user_removed_pending_entry_mid_scrape_stays_removed(self):
+        # The dashboard removed this pending entry (via its own single-lock
+        # update) while the resolver was mid-scrape on it — the fresh
+        # snapshot no longer has it, so the resolved result must NOT
+        # resurrect it into "anime".
+        data = {"pending": [], "anime": []}
+        resolved = [{"url": "https://x/a", "name": "A", "episodes": 0, "missing": []}]
+        app.apply_resolved_pending(data, resolved)
+        self.assertEqual(data["anime"], [])
+        self.assertEqual(data["pending"], [])
+
+    def test_user_added_pending_entry_mid_scrape_survives(self):
+        # A pending entry added by the dashboard after the scrape pass
+        # started — the resolver never saw it and named it in neither list —
+        # must be left completely untouched.
+        data = {"pending": [
+            {"url": "https://x/a", "name": "A"},
+            {"url": "https://x/new", "name": "New"},
+        ], "anime": []}
+        resolved = [{"url": "https://x/a", "name": "A", "episodes": 0, "missing": []}]
+        app.apply_resolved_pending(data, resolved)
+        self.assertEqual([e["url"] for e in data["pending"]], ["https://x/new"])
+
+    def test_no_duplicate_when_entry_already_migrated(self):
+        # A retried resolve for a URL already present in "anime" (e.g. a
+        # previous pass's merge succeeded but the loop retried) must not
+        # append a second copy.
+        data = {"pending": [{"url": "https://x/a", "name": "A"}],
+                "anime": [{"url": "https://x/a", "name": "A", "episodes": 3}]}
+        resolved = [{"url": "https://x/a", "name": "A", "episodes": 0, "missing": []}]
+        app.apply_resolved_pending(data, resolved)
+        self.assertEqual(len(data["anime"]), 1)
+        self.assertEqual(data["anime"][0]["episodes"], 3)  # untouched, not overwritten
+
+    def test_no_match_flag_applied_to_fresh_entry(self):
+        data = {"pending": [{"url": "https://x/a", "name": "A"}], "anime": []}
+        app.apply_resolved_pending(data, [], no_match_urls={"https://x/a"})
+        self.assertTrue(data["pending"][0]["no_match"])
+
+    def test_no_match_flag_skipped_if_entry_no_longer_pending(self):
+        data = {"pending": [], "anime": []}
+        # Must not raise or fabricate an entry for a URL that's already gone.
+        app.apply_resolved_pending(data, [], no_match_urls={"https://x/gone"})
+        self.assertEqual(data["pending"], [])
+
+    def test_other_pending_entries_untouched(self):
+        data = {"pending": [
+            {"url": "https://x/a", "name": "A"},
+            {"url": "https://x/b", "name": "B", "no_match": True},
+        ], "anime": []}
+        resolved = [{"url": "https://x/a", "name": "A", "episodes": 0, "missing": []}]
+        app.apply_resolved_pending(data, resolved)
+        self.assertEqual([e["url"] for e in data["pending"]], ["https://x/b"])
+        self.assertTrue(data["pending"][0]["no_match"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -291,5 +291,138 @@ class UpdateTest(unittest.TestCase):
             self.assertEqual(f.read(), "not json")
 
 
+class MergeEntryTest(unittest.TestCase):
+    """Pure tests for anistore.merge_entry — the field-level merge that
+    replaces a whole-document save (see bot/anibot.py's save_ani() and
+    web/app.py's resolve_pending())."""
+
+    def test_entry_not_found_returns_false(self):
+        data = {"anime": [{"url": "https://x/a", "episodes": 1}]}
+        found = anistore.merge_entry(data, "anime", "https://x/gone", fields={"episodes": 2})
+        self.assertFalse(found)
+        # Untouched — no phantom entry created, no other entry mutated.
+        self.assertEqual(data["anime"], [{"url": "https://x/a", "episodes": 1}])
+
+    def test_fields_overwrite_only_named_entry(self):
+        data = {"anime": [
+            {"url": "https://x/a", "episodes": 1, "customPackage": "A Folder"},
+            {"url": "https://x/b", "episodes": 5},
+        ]}
+        found = anistore.merge_entry(data, "anime", "https://x/a",
+                                      fields={"episodes": 2, "complete": True})
+        self.assertTrue(found)
+        self.assertEqual(data["anime"][0]["episodes"], 2)
+        self.assertTrue(data["anime"][0]["complete"])
+        # User-owned field on the SAME entry, untouched.
+        self.assertEqual(data["anime"][0]["customPackage"], "A Folder")
+        # Other entry untouched.
+        self.assertEqual(data["anime"][1]["episodes"], 5)
+
+    def test_unset_drops_field(self):
+        data = {"anime": [{"url": "https://x/a", "al_available_max": 3}]}
+        anistore.merge_entry(data, "anime", "https://x/a", unset=["al_available_max"])
+        self.assertNotIn("al_available_max", data["anime"][0])
+
+    def test_list_delta_applies_onto_fresh_list_not_replacement(self):
+        # Fresh on-disk list already has a dashboard-added episode (4) that
+        # the bot never saw — the delta must preserve it.
+        data = {"anime": [{"url": "https://x/a", "missing": [2, 3, 4]}]}
+        found = anistore.merge_entry(data, "anime", "https://x/a",
+                                      list_deltas={"missing": ({6}, {2})})
+        self.assertTrue(found)
+        self.assertEqual(data["anime"][0]["missing"], [3, 4, 6])
+
+    def test_list_delta_add_and_remove_together(self):
+        data = {"anime": [{"url": "https://x/a", "missing": [1, 2]}]}
+        anistore.merge_entry(data, "anime", "https://x/a",
+                              list_deltas={"missing": ({5}, {1})})
+        self.assertEqual(data["anime"][0]["missing"], [2, 5])
+
+    def test_missing_collection_returns_false(self):
+        data = {"settings": {}}
+        found = anistore.merge_entry(data, "anime", "https://x/a", fields={"episodes": 1})
+        self.assertFalse(found)
+
+
+class MergeEntryFieldsTest(unittest.TestCase):
+    """anistore.merge_entry_fields — the write-side wrapper that re-reads
+    ani.json fresh under the lock before merging (mirrors real bot/dashboard
+    concurrency instead of just exercising the pure merge_entry logic)."""
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp(prefix="anistore-tests-")
+        self._path = os.path.join(self._dir, "ani.json")
+
+    def tearDown(self):
+        for name in os.listdir(self._dir):
+            os.remove(os.path.join(self._dir, name))
+        os.rmdir(self._dir)
+
+    def test_concurrent_removal_between_two_bot_saves_is_honored(self):
+        anistore.save(self._path, {"anime": [{"url": "https://x/a", "episodes": 0}]})
+
+        found1 = anistore.merge_entry_fields(self._path, "anime", "https://x/a",
+                                              fields={"episodes": 1})
+        self.assertTrue(found1)
+
+        # Dashboard removes the entry mid-cycle (its own single-lock update).
+        data = anistore.load(self._path)
+        data["anime"] = [e for e in data["anime"] if e["url"] != "https://x/a"]
+        anistore.save(self._path, data)
+
+        # Bot's next save for the same (now-removed) entry must not resurrect it.
+        found2 = anistore.merge_entry_fields(self._path, "anime", "https://x/a",
+                                              fields={"episodes": 2})
+        self.assertFalse(found2)
+        self.assertEqual(anistore.load(self._path)["anime"], [])
+
+    def test_concurrent_addition_between_two_bot_saves_survives(self):
+        anistore.save(self._path, {"anime": [{"url": "https://x/a", "episodes": 0}]})
+        anistore.merge_entry_fields(self._path, "anime", "https://x/a", fields={"episodes": 1})
+
+        # Dashboard adds a brand new entry mid-cycle.
+        data = anistore.load(self._path)
+        data["anime"].append({"url": "https://x/new", "episodes": 0})
+        anistore.save(self._path, data)
+
+        anistore.merge_entry_fields(self._path, "anime", "https://x/a", fields={"episodes": 2})
+
+        urls = {e["url"] for e in anistore.load(self._path)["anime"]}
+        self.assertEqual(urls, {"https://x/a", "https://x/new"})
+
+    def test_concurrent_missing_edit_and_bot_download_both_reflected(self):
+        anistore.save(self._path, {"anime": [{"url": "https://x/a", "missing": [2, 3]}]})
+
+        # Dashboard adds episode 9 to the retry queue mid-cycle.
+        data = anistore.load(self._path)
+        data["anime"][0]["missing"] = [2, 3, 9]
+        anistore.save(self._path, data)
+
+        # Bot's own save reflects it having just downloaded episode 2.
+        anistore.merge_entry_fields(self._path, "anime", "https://x/a",
+                                     list_deltas={"missing": (set(), {2})})
+
+        self.assertEqual(anistore.load(self._path)["anime"][0]["missing"], [3, 9])
+
+    def test_concurrent_user_owned_field_edit_not_reverted(self):
+        anistore.save(self._path, {"anime": [
+            {"url": "https://x/a", "episodes": 0, "customPackage": "Old", "tvdb_id": 1},
+        ]})
+
+        # Dashboard edits customPackage/tvdb_id mid-cycle.
+        data = anistore.load(self._path)
+        data["anime"][0]["customPackage"] = "New Folder"
+        data["anime"][0]["tvdb_id"] = 99
+        anistore.save(self._path, data)
+
+        # Bot's save only ever names bot-owned fields — never customPackage/tvdb_id.
+        anistore.merge_entry_fields(self._path, "anime", "https://x/a", fields={"episodes": 1})
+
+        entry = anistore.load(self._path)["anime"][0]
+        self.assertEqual(entry["customPackage"], "New Folder")
+        self.assertEqual(entry["tvdb_id"], 99)
+        self.assertEqual(entry["episodes"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

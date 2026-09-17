@@ -196,6 +196,83 @@ def locked(path):
         os.close(fd)
 
 
+def merge_entry(data, collection, url, fields=None, unset=None, list_deltas=None):
+    """Apply a field-level merge to ONE entry inside ``data[collection]``,
+    matched by ``url``, in place.
+
+    This is the pure half of the fix for the bug where the bot (and the
+    dashboard's ``resolve_pending``) loaded ani.json once at the start of a
+    multi-minute cycle and then saved that whole stale snapshot back several
+    times, silently reverting any edit made through the other side in the
+    meantime. Callers must load ``data`` FRESH under the lock right before
+    calling this (see ``merge_entry_fields`` below, which does exactly that),
+    then pass only the handful of fields *this step* actually changed.
+
+    Ownership contract (enforced by the caller, not this function):
+      - ``fields``: {field: value} — plain overwrites. Only ever pass fields
+        the caller exclusively owns (e.g. the bot's own scrape/download
+        results); a field the OTHER side can also edit (e.g. the dashboard's
+        user-editable fields) must never appear here, or a stale value would
+        clobber a concurrent edit.
+      - ``unset``: field names to drop entirely (``dict.pop``) — for a field
+        the caller is retracting (e.g. clearing a stale cache value).
+      - ``list_deltas``: {field: (added, removed)} — for a list field BOTH
+        sides can mutate (e.g. ``missing``: the dashboard adds/skips
+        episodes, the bot removes downloaded ones and adds failed ones).
+        The caller's added/removed sets are applied onto the FRESH on-disk
+        list, never used to replace it wholesale, so a concurrent edit to
+        the same list from the other side survives.
+
+    Returns True if an entry with this ``url`` was found (and merged), False
+    if it was not (e.g. removed by the other side mid-cycle) — callers must
+    treat False as "stop processing this entry", never re-create it here.
+    """
+    items = data.get(collection)
+    if not isinstance(items, list):
+        return False
+    for entry in items:
+        if entry.get("url") != url:
+            continue
+        if fields:
+            entry.update(fields)
+        if unset:
+            for f in unset:
+                entry.pop(f, None)
+        if list_deltas:
+            for f, (added, removed) in list_deltas.items():
+                merged = [v for v in entry.get(f, []) if v not in removed]
+                for v in added:
+                    if v not in merged:
+                        merged.append(v)
+                merged.sort()
+                entry[f] = merged
+        return True
+    return False
+
+
+def merge_entry_fields(path, collection, url, fields=None, unset=None, list_deltas=None, default=None):
+    """Persist a field-level merge for one entry, under the lock shared with
+    the other process — the write-side counterpart to ``merge_entry``.
+
+    Re-reads ani.json fresh under the lock (via ``update``), applies the
+    merge to that fresh copy, and saves it — so a concurrent edit from the
+    other process (made after the caller's own stale in-memory copy was
+    loaded) is preserved instead of being overwritten by it. See
+    ``merge_entry``'s docstring for the field-ownership contract callers
+    must follow.
+
+    Returns True/False exactly as ``merge_entry`` does.
+    """
+    result = {}
+
+    def _apply(data):
+        result["found"] = merge_entry(data, collection, url, fields=fields,
+                                       unset=unset, list_deltas=list_deltas)
+
+    update(path, _apply, default=default)
+    return result["found"]
+
+
 def update(path, fn, default=None):
     """Load-modify-save under the lock.
 

@@ -222,6 +222,71 @@ def tvdb_skip_decision(series_status, tvdb_season, tvdb_ep_count, airdate, episo
 
     return no_change
 
+# Field-level merge ownership for ani.json anime entries (see
+# anistore.merge_entry_fields, used by startbot()'s per-entry save_ani()).
+#
+# Every field listed here is written ONLY by the bot — verified by grepping
+# every `animeentry[...] =` / `.update(` / `.pop(` in this module. A scalar
+# field is safe to overwrite wholesale on each save because nothing else
+# ever writes it. Fields the dashboard can also edit through its POST
+# handlers — customPackage, tvdb_id, tvdb_season, episode_offset, name, url,
+# releaseID, pref_* overrides, settings — must NEVER be added here: the
+# bot's stale per-cycle snapshot would otherwise silently revert a
+# concurrent dashboard edit on its next save.
+#
+# `missing` is the one field BOTH sides mutate (the dashboard adds/removes a
+# single retry episode; the bot removes a downloaded one and adds a failed
+# one on the same list), so it is handled as a DELTA against the fresh
+# on-disk list, never a wholesale replacement — see BOT_OWNED_LIST_FIELDS
+# and compute_entry_delta() below. `episodes` has no such conflict (the
+# dashboard never writes it), so the bot's value — even when it goes DOWN,
+# e.g. rolling back after an episode turns out unavailable — always wins.
+BOT_OWNED_SCALAR_FIELDS = (
+    "episodes", "skip_until", "skip_real_airdate", "skip_recheck_at",
+    "al_status", "al_max_episodes", "al_available_max", "al_available_max_set_at",
+    "complete", "media_type", "year", "display_title", "download_folder_pattern",
+    "tvdb_series_status",
+)
+BOT_OWNED_LIST_FIELDS = ("missing",)
+
+_UNSET = object()
+
+def compute_entry_delta(before, after, scalar_fields=BOT_OWNED_SCALAR_FIELDS,
+                         list_fields=BOT_OWNED_LIST_FIELDS):
+    """Pure diff between `before` (the entry as last persisted this cycle)
+    and `after` (the live in-memory entry the bot has since mutated).
+
+    Returns (fields, unset, list_deltas) shaped for
+    ``anistore.merge_entry_fields`` — only what actually changed since the
+    last save, never the whole entry. A scalar field that disappeared from
+    `after` (e.g. a popped `al_available_max` cap) goes into `unset` rather
+    than `fields`, so the merge drops it from the fresh on-disk entry too.
+    A list field (`missing`) is reduced to its added/removed sets so the
+    caller can apply the DELTA onto a fresh copy instead of replacing it.
+    """
+    fields = {}
+    unset = []
+    for f in scalar_fields:
+        cur = after.get(f, _UNSET)
+        prev = before.get(f, _UNSET)
+        if cur == prev:
+            continue
+        if cur is _UNSET:
+            unset.append(f)
+        else:
+            fields[f] = cur
+
+    list_deltas = {}
+    for f in list_fields:
+        prev_set = set(before.get(f) or [])
+        cur_set = set(after.get(f) or [])
+        added = cur_set - prev_set
+        removed = prev_set - cur_set
+        if added or removed:
+            list_deltas[f] = (added, removed)
+
+    return fields, unset, list_deltas
+
 def _boot_backoff(attempt, cap=300):
     """Capped exponential backoff (seconds) for in-process boot retries.
 
@@ -1123,11 +1188,6 @@ def startbot():
             time.sleep(recheck)
             continue
 
-        def save_ani():
-            os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-            with anistore.locked(botfile):
-                anistore.save(botfile, data)
-
         if(anidata != ""):
             run_counts["entries"] = len(anidata)
             for idx, animeentry in enumerate(anidata):
@@ -1153,6 +1213,36 @@ def startbot():
                 missingEpisodes = animeentry['missing']
                 episodes = animeentry['episodes']
 
+                # Baseline for this entry's field-level merge: what's been
+                # persisted so far this cycle (initially, what cycle-start
+                # load_ani_cycle_start() read). save_ani() below diffs the
+                # live `animeentry` against this on each call and writes only
+                # what changed, onto a FRESH re-read of ani.json under the
+                # lock — never the whole stale `data` snapshot.
+                saved_state = {f: animeentry[f] for f in BOT_OWNED_SCALAR_FIELDS if f in animeentry}
+                saved_state["missing"] = list(missingEpisodes)
+
+                def save_ani():
+                    """Persist only the bot-owned fields changed on
+                    `animeentry` since the last save this cycle. Returns
+                    False (and stops updating `saved_state`) if the
+                    dashboard removed this entry mid-cycle — callers must
+                    treat that as "stop processing this entry" for the rest
+                    of the cycle instead of resurrecting it."""
+                    nonlocal saved_state
+                    fields, unset, list_deltas = compute_entry_delta(saved_state, animeentry)
+                    if not fields and not unset and not list_deltas:
+                        return True
+                    found = anistore.merge_entry_fields(
+                        botfile, "anime", url, fields=fields, unset=unset, list_deltas=list_deltas)
+                    if found:
+                        saved_state.update(fields)
+                        for f in unset:
+                            saved_state.pop(f, None)
+                        for f in list_deltas:
+                            saved_state[f] = list(animeentry.get(f) or [])
+                    return found
+
                 # --- Smart skip logic -------------------------------------------
                 # Step 1: Already marked complete and no missing episodes
                 if animeentry.get('complete') and len(missingEpisodes) == 0:
@@ -1168,7 +1258,7 @@ def startbot():
                         and len(missingEpisodes) == 0:
                     _log.info("[COMPLETE] " + name + " — al_status: " + al_status + ", all " + str(al_max) + " episodes downloaded")
                     animeentry['complete'] = True
-                    save_ani()
+                    if not save_ani(): continue
                     run_counts["skipped"] += 1
                     continue
 
@@ -1224,7 +1314,7 @@ def startbot():
 
                         if decision["updates"]:
                             animeentry.update(decision["updates"])
-                            save_ani()
+                            if not save_ani(): continue
                         if decision["log"]:
                             level, message = decision["log"]
                             tag = {"complete": "COMPLETE", "skip": "SKIP",
@@ -1268,7 +1358,7 @@ def startbot():
                     animeentry.pop('al_available_max', None)
                     animeentry.pop('al_available_max_set_at', None)
                     al_available_max = None
-                    save_ani()
+                    if not save_ani(): continue
                 if al_available_max is not None and al_available_max < curEpisodes:
                     curEpisodes = al_available_max
                     # Self-heal: drop missing/episodes values that exceed the real max
@@ -1277,7 +1367,7 @@ def startbot():
                     if int(animeentry['episodes']) > al_available_max:
                         animeentry['episodes'] = al_available_max
                         episodes = al_available_max
-                    save_ani()
+                    if not save_ani(): continue
 
                 # Cache anime-loads.org status for dashboard
                 if anime.status:
@@ -1297,7 +1387,7 @@ def startbot():
                     animeentry['skip_until'] = throttle_date
                     # Synthetic throttle date — honored strictly, not early-scraped.
                     animeentry['skip_real_airdate'] = False
-                    save_ani()
+                    if not save_ani(): continue
                 # Cache media type + naming metadata (used by mover to route movies
                 # to a separate output folder with Plex "Title (Year)" convention).
                 if anime.type:
@@ -1356,7 +1446,7 @@ def startbot():
                                 release_pattern = batch_result.get("release_pattern") or getattr(anime, '_last_release_pattern', '')
                                 if release_pattern:
                                     animeentry['download_folder_pattern'] = release_pattern
-                                save_ani()
+                                if not save_ani(): continue
                                 if batch_result["episodes_not_found"]:
                                     _log.warning("[BATCH] Episoden nicht im Batch gefunden: %s — werden beim nächsten Lauf erneut versucht",
                                                  batch_result["episodes_not_found"])
@@ -1367,7 +1457,7 @@ def startbot():
                                 if handle_failed_batch(batch_result, all_wanted, animeentry,
                                                        run_counts, today_iso, name, pb,
                                                        events=events):
-                                    save_ani()
+                                    if not save_ani(): continue
                         except Exception as e:
                             printException(e)
                             run_counts["errors"] += 1
@@ -1405,8 +1495,8 @@ def startbot():
                         release_pattern = getattr(anime, '_last_release_pattern', '')
                         if release_pattern:
                             animeentry['download_folder_pattern'] = release_pattern
-                        save_ani()
                         _record_event(events, "download", name, episodes=[ep])
+                        if not save_ani(): continue
                     elif ep_unavailable:
                         log("[UNAVAILABLE] Episode " + str(ep) + " von " + name + " — keine Downloadlinks, markiere als nicht verfügbar", pb)
                         run_counts["unavailable"] += 1
@@ -1424,7 +1514,7 @@ def startbot():
                         # Roll back episodes counter if it was advanced into this unavailable ep
                         if int(animeentry['episodes']) >= ep:
                             animeentry['episodes'] = new_max
-                        save_ani()
+                        if not save_ani(): continue
                     elif isinstance(dl_ret, Exception):
                         run_counts["errors"] += 1
                         log("[ERROR] Episode " + str(ep) + " von " + name + ": " + str(dl_ret), pb)
@@ -1447,16 +1537,16 @@ def startbot():
                     if animeentry.get('episodes', 0) >= 1 and len(updated_missing) == 0:
                         _log.info("[COMPLETE] " + name + " — movie release downloaded")
                         animeentry['complete'] = True
-                        save_ani()
                         _record_event(events, "complete", name)
+                        save_ani()
                 elif anime.status in ("Abgeschlossen", "Completed") \
                         and anime.maxEpisodes != 999999 \
                         and animeentry['episodes'] >= anime.maxEpisodes \
                         and len(updated_missing) == 0:
                     _log.info("[COMPLETE] " + name + " — anime-loads status: " + anime.status)
                     animeentry['complete'] = True
-                    save_ani()
                     _record_event(events, "complete", name)
+                    save_ani()
             write_run_state(run_started, _utcnow_iso(), timedelay, run_counts, events)
             _log.info("Schlafe " + str(timedelay) + " Sekunden")
             time.sleep(timedelay)

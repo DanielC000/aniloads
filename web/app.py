@@ -3482,6 +3482,49 @@ class Handler(BaseHTTPRequestHandler):
             self._redirect("/")
 
 
+def apply_resolved_pending(data, resolved_entries, no_match_urls=()):
+    """Merge resolve_pending()'s per-cycle scrape results onto a FRESH
+    ani.json snapshot, instead of saving the whole stale "pending"/"anime"
+    snapshot the resolver started its (multi-second, per-entry) scrape pass
+    with. Callers must load `data` fresh under the lock right before calling
+    this (see resolve_pending(), which scrapes entirely OUTSIDE the lock and
+    only takes it for this merge) — mirrors anistore.merge_entry, but this
+    resolve step moves an entry between two collections rather than editing
+    fields on one.
+
+    `resolved_entries`: ready-to-insert anime-list entries (each with its
+    own "url"). For each one, the matching URL is dropped from the fresh
+    `pending` list — a no-op, not an error, if it's no longer there (the
+    dashboard already removed it, or a previous pass already migrated it) —
+    and the entry is appended to `anime`, unless one with that URL is
+    already present there (avoids a duplicate on a retried resolve).
+
+    `no_match_urls`: URLs whose fresh `pending` entry should be flagged
+    `no_match = True` (silently skipped if no longer pending).
+
+    A `pending` entry the dashboard added after the scrape started, and any
+    entry named in neither argument, is left untouched.
+    """
+    resolved_by_url = {e["url"]: e for e in resolved_entries}
+    fresh_pending = data.get("pending", [])
+    fresh_anime = data.setdefault("anime", [])
+    existing_urls = {e.get("url") for e in fresh_anime}
+
+    remaining = []
+    for p in fresh_pending:
+        url = p.get("url")
+        if url in resolved_by_url:
+            if url not in existing_urls:
+                fresh_anime.append(resolved_by_url[url])
+                existing_urls.add(url)
+            continue
+        if url in no_match_urls:
+            p["no_match"] = True
+        remaining.append(p)
+    data["pending"] = remaining
+    return data
+
+
 def resolve_pending():
     """Background thread: resolve pending entries and move to anime list."""
     time.sleep(RESOLVE_PENDING_STARTUP_DELAY)
@@ -3496,10 +3539,10 @@ def resolve_pending():
                 continue
 
             prefs = load_prefs()
-            resolved = []
-            changed = False
+            resolved_entries = []
+            no_match_urls = set()
 
-            for i, entry in enumerate(pending):
+            for entry in pending:
                 url = entry.get("url", "")
                 if not url:
                     continue
@@ -3530,32 +3573,24 @@ def resolve_pending():
                             "missing": [],
                             "customPackage": info["name"],
                         }
-                        data.setdefault("anime", []).append(anime_entry)
-                        resolved.append(i)
+                        resolved_entries.append(anime_entry)
                         _log.info("[resolver] Resolved %s -> release %d (%sp, %s)",
                             info["name"], best["id"], best["resolution"],
                             ", ".join(best.get("dubs", [])))
                     elif not entry.get("no_match"):
                         # Releases exist but none match the strict language prefs.
                         # Surface this so the entry doesn't sit unresolved forever.
-                        entry["no_match"] = True
-                        changed = True
+                        no_match_urls.add(url)
                         _log.info("[resolver] No release matches prefs for %s", info["name"])
                 except Exception as e:
                     _log.error("[resolver] Error resolving %s: %s", url, e)
 
                 time.sleep(RESOLVE_PENDING_PER_ENTRY_DELAY)
 
-            if resolved:
-                for i in sorted(resolved, reverse=True):
-                    pending.pop(i)
-                data["pending"] = pending
-                save_ani(data)
-                _log.info("[resolver] Moved %d entries to anime list", len(resolved))
-            elif changed:
-                # No entries resolved, but a no_match flag was set — persist it.
-                data["pending"] = pending
-                save_ani(data)
+            if resolved_entries or no_match_urls:
+                update_ani(lambda d: apply_resolved_pending(d, resolved_entries, no_match_urls))
+                if resolved_entries:
+                    _log.info("[resolver] Moved %d entries to anime list", len(resolved_entries))
 
         except Exception as e:
             _log.error("[resolver] Error: %s", e)

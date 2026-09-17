@@ -551,6 +551,77 @@ class HandleFailedBatchTest(unittest.TestCase):
         self.assertEqual(counts["errors"], 1)
 
 
+class ComputeEntryDeltaTest(unittest.TestCase):
+    """Pure tests for anibot.compute_entry_delta — the diff that drives
+    startbot()'s per-entry field-level save_ani(), replacing a whole-document
+    save with only what actually changed since the last save this cycle."""
+
+    def _delta(self, before, after):
+        return anibot.compute_entry_delta(before, after)
+
+    def test_no_change_yields_empty_delta(self):
+        entry = {"episodes": 3, "missing": [1, 2], "complete": False}
+        fields, unset, list_deltas = self._delta(dict(entry), dict(entry))
+        self.assertEqual(fields, {})
+        self.assertEqual(unset, [])
+        self.assertEqual(list_deltas, {})
+
+    def test_scalar_change_detected(self):
+        before = {"episodes": 3}
+        after = {"episodes": 4}
+        fields, unset, list_deltas = self._delta(before, after)
+        self.assertEqual(fields, {"episodes": 4})
+        self.assertEqual(unset, [])
+        self.assertEqual(list_deltas, {})
+
+    def test_scalar_decrease_is_still_a_plain_overwrite(self):
+        # episodes is fully bot-owned (the dashboard never writes it), so a
+        # rollback (e.g. an episode turned out unavailable) is just as valid
+        # a change as an increase — no "only rises" special-casing needed.
+        before = {"episodes": 5}
+        after = {"episodes": 3}
+        fields, _unset, _list_deltas = self._delta(before, after)
+        self.assertEqual(fields, {"episodes": 3})
+
+    def test_field_removed_goes_to_unset(self):
+        before = {"al_available_max": 12, "al_available_max_set_at": "2026-09-17"}
+        after = {}
+        fields, unset, _list_deltas = self._delta(before, after)
+        self.assertEqual(fields, {})
+        self.assertEqual(sorted(unset), ["al_available_max", "al_available_max_set_at"])
+
+    def test_field_newly_appearing_is_a_field_not_unset(self):
+        before = {}
+        after = {"tvdb_series_status": "Continuing"}
+        fields, unset, _list_deltas = self._delta(before, after)
+        self.assertEqual(fields, {"tvdb_series_status": "Continuing"})
+        self.assertEqual(unset, [])
+
+    def test_missing_add_and_remove_reported_as_delta(self):
+        before = {"missing": [1, 2, 3]}
+        after = {"missing": [1, 4]}  # 2, 3 removed (downloaded); 4 added (failed)
+        _fields, _unset, list_deltas = self._delta(before, after)
+        added, removed = list_deltas["missing"]
+        self.assertEqual(added, {4})
+        self.assertEqual(removed, {2, 3})
+
+    def test_missing_unchanged_produces_no_delta(self):
+        before = {"missing": [1, 2]}
+        after = {"missing": [2, 1]}  # same set, different order
+        _fields, _unset, list_deltas = self._delta(before, after)
+        self.assertEqual(list_deltas, {})
+
+    def test_user_owned_fields_never_appear_in_any_output(self):
+        before = {"customPackage": "Old", "tvdb_id": 1, "episodes": 1}
+        after = {"customPackage": "New", "tvdb_id": 2, "episodes": 2}
+        fields, unset, list_deltas = self._delta(before, after)
+        self.assertEqual(fields, {"episodes": 2})
+        self.assertEqual(unset, [])
+        self.assertEqual(list_deltas, {})
+        self.assertNotIn("customPackage", fields)
+        self.assertNotIn("tvdb_id", fields)
+
+
 class TvdbSkipDecisionTest(unittest.TestCase):
     """Step 4 TVDB skip/complete checks (anibot.tvdb_skip_decision).
 

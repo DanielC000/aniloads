@@ -7,11 +7,13 @@ Reads bot logs and triggers runs via Docker socket.
 
 import base64
 import collections
+import hashlib
 import hmac
 import http.client
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import struct
@@ -1438,6 +1440,107 @@ def _duplicate_msg(entry):
         entry.get("name") or entry.get("url") or "?")
 
 
+# ---------------------------------------------------------------------------
+# Landing anchors: where a redirect after an action puts the user back
+# ---------------------------------------------------------------------------
+
+# Page sections a redirect can land on (each has a matching id in
+# HTML_TEMPLATE). Entry cards use entry_anchor_id() instead.
+ANCHOR_BOT = "bot-activity"
+ANCHOR_MOVER = "file-mover"
+ANCHOR_PREFS = "preferences"
+ANCHOR_SETTINGS = "settings"
+ANCHOR_ADD_FLOW = "add-flow"
+ANCHOR_WATCHLIST = "watchlist"
+SECTION_ANCHORS = (ANCHOR_BOT, ANCHOR_MOVER, ANCHOR_PREFS, ANCHOR_SETTINGS,
+                   ANCHOR_ADD_FLOW, ANCHOR_WATCHLIST)
+
+# The disclosures on a watchlist card a redirect can re-open.
+CARD_PANELS = ("episodes", "edit")
+
+_ANCHOR_RE = re.compile(r"^[a-z][a-z0-9-]{0,80}$")
+
+
+def entry_anchor_id(url):
+    """Stable HTML id for a watchlist entry's card, shared by the card's
+    ``<article id>`` and every redirect that lands on it.
+
+    Derived from the entry URL (the unique key, see find_entry_by_url), never
+    the display name: a readable ASCII slug of the last path segment plus a
+    short hash of the normalized URL, so ``&``, quotes, slashes and unicode
+    can't produce an invalid id or a CSS-selector-hostile one, and two
+    spellings of the same URL (see normalize_anime_url) land on one card."""
+    key = normalize_anime_url(url)
+    tail = key.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+    slug = re.sub(r"[^a-z0-9]+", "-", tail.lower()).strip("-")[:40].strip("-")
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+    return "entry-{}-{}".format(slug, digest) if slug else "entry-" + digest
+
+
+def status_url(msg, level=None, anchor=None, panel=None, runs=None):
+    """``/?msg=...`` for a status banner, landing on ``anchor`` (a section
+    anchor or an entry_anchor_id) with the card disclosure ``panel`` open.
+    ``runs`` keeps the Run History depth the reader had paged to.
+
+    The anchor rides twice: as the ``#fragment`` the browser scrolls to, and
+    as ``at=`` so the server (which never sees a fragment) can render the
+    banner next to it and re-open the panel the action came from."""
+    params = {"msg": msg}
+    if level is not None:
+        params["level"] = level
+    if runs:
+        params["runs"] = runs
+    fragment = ""
+    if anchor and _ANCHOR_RE.match(anchor):
+        params["at"] = anchor
+        if panel in CARD_PANELS:
+            params["open"] = panel
+        fragment = "#" + anchor
+    return "/?" + urlencode(params) + fragment
+
+
+def render_status_banner(msg, level):
+    """The dismissable result banner. Success fades on its own (see the page
+    script); an error stays until closed."""
+    return (
+        '<div class="status-msg status-{tone}" id="status-msg" role="status" aria-live="polite">'
+        '<span class="status-text">{msg}</span>'
+        '<button type="button" class="status-close" aria-label="Dismiss message">'
+        '<span aria-hidden="true">&times;</span></button></div>').format(
+            tone="ok" if level == "ok" else "err", msg=escape(msg))
+
+
+# Add-flow steps (search results, release picker, TVDB step) are rendered by a
+# POST. Post/Redirect/Get: the POST stashes the rendered step here and
+# redirects to ``/?flow=<token>``, so reloading re-renders it instead of
+# re-submitting. Read-only on GET; bounded and short-lived, in memory only.
+FLOW_TTL_SECONDS = 3600
+FLOW_MAX = 32
+_flow_lock = threading.Lock()
+_flow_store = collections.OrderedDict()
+
+
+def stash_flow(search_html, search_query=""):
+    token = secrets.token_urlsafe(12)
+    now = time.monotonic()
+    with _flow_lock:
+        for t in [t for t, v in _flow_store.items() if now - v[0] > FLOW_TTL_SECONDS]:
+            del _flow_store[t]
+        _flow_store[token] = (now, search_html, search_query)
+        while len(_flow_store) > FLOW_MAX:
+            _flow_store.popitem(last=False)
+    return token
+
+
+def load_flow(token):
+    """``(search_html, search_query)`` for a live token, else None."""
+    with _flow_lock:
+        item = _flow_store.get(token)
+        if item is None or time.monotonic() - item[0] > FLOW_TTL_SECONDS:
+            return None
+        return item[1], item[2]
+
+
 def suggest_tvdb_season(seasons, ep_count):
     """Season number whose episode count is closest to ``ep_count``, or None.
 
@@ -2211,7 +2314,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   .release-row { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; padding: var(--s2) 0; border-bottom: 1px solid var(--border); }
   .release-row:last-child { border-bottom: none; }
-  .status-msg { padding: var(--s3); border-radius: var(--radius-sm); margin-bottom: var(--s4); }
+  .status-msg { display: flex; align-items: flex-start; gap: var(--s3); padding: var(--s3); border-radius: var(--radius-sm); margin-bottom: var(--s4); transition: opacity 0.18s cubic-bezier(0.2, 0, 0, 1); }
+  .status-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .status-close { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; margin: -4px -4px -4px 0; border: none; border-radius: var(--radius-sm); background: transparent; color: inherit; font-size: 1.25rem; line-height: 1; cursor: pointer; opacity: 0.75; }
+  .status-close:hover { opacity: 1; background: rgba(255, 255, 255, 0.06); }
+  .status-msg.status-leaving { opacity: 0; }
+  .wl-card .status-msg, .wl-pending .status-msg { margin: 0 0 var(--s3); font-size: var(--fs-sm); }
+
+  /* Landing after an action: anchors clear the top edge, and the card the
+     action touched gets a ring that fades once it has drawn the eye. */
+  [id] { scroll-margin-top: var(--s4); }
+  .wl-card, .wl-pending { position: relative; }
+  .wl-card:target::after, .wl-pending:target::after { content: ""; position: absolute; inset: -1px; border-radius: var(--radius); box-shadow: 0 0 0 2px var(--accent); pointer-events: none; opacity: 0; animation: wl-target 2.4s cubic-bezier(0.2, 0, 0, 1); }
+  @keyframes wl-target { 0%, 45% { opacity: 1; } 100% { opacity: 0; } }
   .status-ok { background: var(--ok-bg); color: var(--ok-text); }
   .status-err { background: var(--danger-bg); color: var(--danger-text); }
   .section { margin-bottom: var(--s6); }
@@ -2374,9 +2489,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .wl-card .folder-input { max-width: none; flex-basis: 100%; }
     .wl-chip, .wl-tool input, .wl-tool select { min-height: 44px; }
     .wl-tool, .wl-tool-q { flex: 1 1 100%; max-width: none; }
+    .status-close { width: 44px; height: 44px; margin: -12px -12px -12px 0; }
   }
   @media (prefers-reduced-motion: reduce) {
     * { transition: none !important; animation: none !important; }
+    .wl-card:target::after, .wl-pending:target::after { opacity: 1; }
   }
 </style>
 </head>
@@ -2388,8 +2505,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <main>
 %%STATUS_MSG%%
 
-<div class="section">
+<div class="section" id="bot-activity">
   <h2>Bot Activity</h2>
+  %%STATUS@bot-activity%%
   <div class="card">
     <div class="activity-grid">
       <div>
@@ -2436,8 +2554,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </script>
 </div>
 
-<div class="section">
+<div class="section" id="file-mover">
   <h2>File Mover</h2>
+  %%STATUS@file-mover%%
   <div class="card">
     <div class="activity-grid" style="grid-template-columns: 1fr 1fr auto;">
       <div>
@@ -2467,9 +2586,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </details>
 </div>
 
-<div class="section">
+<div class="section" id="preferences">
   <details %%PREFS_OPEN%%>
     <summary>Preferences</summary>
+    %%STATUS@preferences%%
     <div class="card">
       <form method="POST" action="/save-prefs">
         <div class="form-grid">
@@ -2518,17 +2638,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </details>
 </div>
 
-<div class="section">
-  <details>
+<div class="section" id="settings">
+  <details %%SETTINGS_OPEN%%>
     <summary>Settings</summary>
+    %%STATUS@settings%%
     <div class="card">
       %%SETTINGS_CARD%%
     </div>
   </details>
 </div>
 
+<div id="add-flow">
 <div class="section">
   <h2>Add Anime</h2>
+  %%STATUS@add-flow%%
   <div class="card">
     <form method="POST" action="/add-url" onsubmit="return scrapeBusy(this, 'Fetching releases… this can take up to a minute');">
       <label class="hint" for="add-url">Paste an anime-loads.org URL to see available releases:</label>
@@ -2550,9 +2673,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </div>
 
 %%SEARCH_RESULTS%%
+</div>
 
-<div class="section">
+<div class="section" id="watchlist">
   <h2>Watchlist (%%COUNT%%)</h2>
+  %%STATUS@watchlist%%
   %%WATCHLIST_CONTROLS%%
   <div id="wl-list">%%WATCHLIST%%</div>
 </div>
@@ -2587,6 +2712,38 @@ function scrapeBusy(form, label) {
   }
   return true;
 }
+
+// Result banner: strip msg from the address bar so reload/bookmark doesn't
+// re-show it (the #anchor stays), close on demand, and let a success fade on
+// its own. Errors stay until dismissed.
+(function() {
+  try {
+    var u = new URL(window.location.href);
+    if (u.searchParams.has('msg')) {
+      u.searchParams.delete('msg');
+      u.searchParams.delete('level');
+      var q = u.searchParams.toString();
+      history.replaceState(null, '', u.pathname + (q ? '?' + q : '') + u.hash);
+    }
+  } catch (e) {}
+  var msg = document.getElementById('status-msg');
+  if (!msg) return;
+  function dismiss() {
+    if (!msg.parentNode) return;
+    msg.classList.add('status-leaving');
+    setTimeout(function() { if (msg.parentNode) msg.remove(); }, 200);
+  }
+  var close = msg.querySelector('.status-close');
+  if (close) close.addEventListener('click', dismiss);
+  if (msg.classList.contains('status-ok')) {
+    var held = false;
+    msg.addEventListener('mouseenter', function() { held = true; });
+    msg.addEventListener('mouseleave', function() { held = false; });
+    msg.addEventListener('focusin', function() { held = true; });
+    msg.addEventListener('focusout', function() { held = false; });
+    (function wait() { setTimeout(function() { if (held) wait(); else dismiss(); }, 6000); })();
+  }
+})();
 
 // Watchlist filter + sort, client-side. Cards carry their state as data-*
 // from the server; the 10s poll never touches #wl-list, so this only runs
@@ -3360,11 +3517,15 @@ def pending_resolve_error(entry, now=None):
         head, " ".join(str(err["reason"]).split()).rstrip("."))
 
 
-def render_watchlist(anime_list, pending_list=None, entry_outcomes=None):
+def render_watchlist(anime_list, pending_list=None, entry_outcomes=None, focus=None):
     """``entry_outcomes`` is run_state.json's per-entry map, keyed by URL;
-    absent (an older bot) the cards simply carry no last-check line."""
+    absent (an older bot) the cards simply carry no last-check line.
+
+    ``focus`` (``{"anchor", "panel", "banner"}``, see render_page) marks the
+    card a redirect landed on: it carries the banner and re-opens the panel."""
     if not isinstance(entry_outcomes, dict):
         entry_outcomes = {}
+    focus = focus or {}
     if not anime_list and not pending_list:
         return '<div class="empty">No anime in watchlist. Add some above!</div>'
     html = ""
@@ -3399,8 +3560,10 @@ def render_watchlist(anime_list, pending_list=None, entry_outcomes=None):
                 status_badge = '<span class="badge badge-accent">Resolving</span>'
                 no_match_line = ""
 
+            anchor = entry_anchor_id(url)
             html += """
-            <div class="card card-accent wl-pending" data-state="pending" data-name="{fname}">
+            <div class="card card-accent wl-pending" data-state="pending" data-name="{fname}" id="{anchor}">
+              {banner}
               <div style="display:flex;justify-content:space-between;align-items:start;gap:12px;">
                 <div>
                   <div class="anime-name">{name} {status_badge}</div>
@@ -3415,10 +3578,17 @@ def render_watchlist(anime_list, pending_list=None, entry_outcomes=None):
               </div>
             </div>""".format(name=escape(name), url=escape(url), pref_badges=pref_badges,
                              status_badge=status_badge, no_match_line=no_match_line, key=escape(url),
-                             remove_confirm=remove_confirm, fname=escape(str(name).casefold()))
+                             remove_confirm=remove_confirm, fname=escape(str(name).casefold()),
+                             anchor=anchor,
+                             banner=focus.get("banner", "") if focus.get("anchor") == anchor else "")
 
     for i, a in enumerate(anime_list):
-        html += render_watchlist_card(i, a, entry_outcomes.get(a.get("url")))
+        outcome = entry_outcomes.get(a.get("url"))
+        if focus.get("anchor") == entry_anchor_id(a.get("url", "")):
+            html += render_watchlist_card(i, a, outcome, open_panel=focus.get("panel"),
+                                          banner=focus.get("banner", ""))
+        else:
+            html += render_watchlist_card(i, a, outcome)
     return html
 
 
@@ -3869,7 +4039,7 @@ def _watchlist_url_html(url):
     return '<span class="wl-url" title="{0}">{0}</span>'.format(escape(url))
 
 
-def _render_episode_panel(i, entry, key, name):
+def _render_episode_panel(i, entry, key, name, is_open=False):
     eps = _episode_count(entry)
     missing = sorted({m for m in (entry.get("missing") or []) if isinstance(m, int)})
     missing_set = set(missing)
@@ -3919,10 +4089,10 @@ def _render_episode_panel(i, entry, key, name):
         '</form>').format(key=_key_input(key), i=i, max=ep_add_max(entry),
                           sr=_sr(" for {}".format(name)))
 
-    return ('<details class="wl-panel ep-panel"><summary>Episodes'
+    return ('<details class="wl-panel ep-panel"{}><summary>Episodes'
             '<span class="wl-panel-detail">{}</span></summary>'
             '<div class="wl-panel-body">{}</div></details>').format(
-                escape(" · ".join(summary_bits)), body)
+                " open" if is_open else "", escape(" · ".join(summary_bits)), body)
 
 
 def _pref_select(field, i, label, options, current):
@@ -4002,7 +4172,7 @@ def _render_download_rows(i, entry, key, name):
     return rows
 
 
-def _render_edit_panel(i, entry, key, name):
+def _render_edit_panel(i, entry, key, name, is_open=False):
     folder = entry.get("customPackage", entry.get("name", "Unknown"))
     rows = _render_download_rows(i, entry, key, name)
     rows += (
@@ -4068,12 +4238,12 @@ def _render_edit_panel(i, entry, key, name):
         '</div></div></details>').format(
             sr=_sr(" " + name), name=escape(name), key=_key_input(key))
 
-    return ('<details class="wl-panel wl-edit"><summary>Edit{sr}</summary>'
+    return ('<details class="wl-panel wl-edit"{open}><summary>Edit{sr}</summary>'
             '<div class="wl-panel-body">{rows}</div></details>').format(
-                sr=_sr(" " + name), rows=rows)
+                open=" open" if is_open else "", sr=_sr(" " + name), rows=rows)
 
 
-def render_watchlist_card(i, a, outcome=None):
+def render_watchlist_card(i, a, outcome=None, open_panel=None, banner=""):
     name = a.get("name", "Unknown")
     url = a.get("url", "")
     # Mutations target this entry by its unique URL (see find_entry_by_url),
@@ -4128,7 +4298,8 @@ def render_watchlist_card(i, a, outcome=None):
                 _key_input(key), _sr(" for {}".format(name)))
 
     return """
-        <article class="card wl-card" aria-labelledby="wl-name-{i}" {filter_attrs}>
+        <article class="card wl-card" id="{anchor}" aria-labelledby="wl-name-{i}" {filter_attrs}>
+          {banner}
           <div class="wl-head">
             <div class="wl-title">
               <h3 class="anime-name" id="wl-name-{i}">{name}</h3>
@@ -4140,12 +4311,13 @@ def render_watchlist_card(i, a, outcome=None):
           {facts_html}
           <div class="wl-panels">{ep_panel}{edit_panel}</div>
         </article>""".format(
-        i=i, name=escape(name), url_html=_watchlist_url_html(url),
+        i=i, anchor=entry_anchor_id(url), banner=banner,
+        name=escape(name), url_html=_watchlist_url_html(url),
         head_action=head_action, filter_attrs=watchlist_filter_attrs(i, a),
         status_html=status_html,
         check_html="" if a.get("paused") else render_entry_check(outcome), facts_html=facts_html,
-        ep_panel=_render_episode_panel(i, a, key, name),
-        edit_panel=_render_edit_panel(i, a, key, name),
+        ep_panel=_render_episode_panel(i, a, key, name, is_open=open_panel == "episodes"),
+        edit_panel=_render_edit_panel(i, a, key, name, is_open=open_panel == "edit"),
     )
 
 _ADD_STEPS = ("Release", "TVDB", "Save")
@@ -4168,7 +4340,8 @@ def render_add_flow_head(current, anime_name, with_tvdb=True):
             state, aria = "todo", ""
         items += '<li class="step step-{}"{}><span class="step-num">{}</span>{}</li>'.format(
             state, aria, i + 1, label)
-    cancel_href = "/?" + urlencode({"msg": "Cancelled: {} was not added".format(anime_name)})
+    cancel_href = status_url("Cancelled: {} was not added".format(anime_name),
+                             level="ok", anchor=ANCHOR_ADD_FLOW)
     return (
         '<div class="flow-head">'
         '<ol class="steps" aria-label="Add anime progress">{}</ol>'
@@ -4318,7 +4491,8 @@ def render_entry_release_picker(entry, anime_info, best_id=None):
     current = entry.get("releaseID")
     media_type = anime_info.get("media_type", "series") or "series"
     valid_ids = ",".join(str(rel["id"]) for rel in anime_info["releases"])
-    cancel_href = "/?" + urlencode({"msg": "Cancelled: {} unchanged".format(name)})
+    cancel_href = status_url("Cancelled: {} unchanged".format(name), level="ok",
+                             anchor=entry_anchor_id(key), panel="edit")
 
     html = '<div class="section">'
     html += '<h2>Change release: {}</h2>'.format(escape(name))
@@ -4789,10 +4963,18 @@ def validate_settings_form(params, auth_enabled):
 
 
 def render_page(status="", search_html="", prefs_open=False, ani_data=None, search_query="",
-                max_runs=RUN_HISTORY_PAGE):
+                max_runs=RUN_HISTORY_PAGE, status_at=None, open_panel=None):
+    """``status_at`` is the anchor the action redirected to (see status_url):
+    the ``status`` banner renders next to it rather than at the page top, and
+    the section's disclosure (or the card's ``open_panel``) is open again. An
+    anchor that no longer exists (e.g. a removed entry) falls back to the top."""
     data = ani_data if ani_data is not None else load_ani()
     anime_list = data.get("anime", [])
     pending_list = data.get("pending", [])
+
+    entry_anchors = {entry_anchor_id(e.get("url", "")) for e in anime_list + pending_list}
+    if status_at not in SECTION_ANCHORS and status_at not in entry_anchors:
+        status_at = None
     prefs = load_prefs()
 
     activity = get_activity()
@@ -4814,7 +4996,11 @@ def render_page(status="", search_html="", prefs_open=False, ani_data=None, sear
     sub_display = lang_names.get(sub_pref, "Any")
 
     page = HTML_TEMPLATE
-    page = page.replace("%%STATUS_MSG%%", status)
+    page = page.replace("%%STATUS_MSG%%", "" if status_at else status)
+    for anchor in SECTION_ANCHORS:
+        page = page.replace("%%STATUS@{}%%".format(anchor), status if status_at == anchor else "")
+    page = page.replace("%%SETTINGS_OPEN%%", "open" if status_at == ANCHOR_SETTINGS else "")
+    prefs_open = prefs_open or status_at == ANCHOR_PREFS
     page = page.replace("%%BOT_STATUS%%", bot_status_html)
     page = page.replace("%%LAST_RUN%%", last_run_html)
     page = page.replace("%%NEXT_RUN%%", next_run_html)
@@ -4826,8 +5012,11 @@ def render_page(status="", search_html="", prefs_open=False, ani_data=None, sear
     page = page.replace("%%MOVE_HISTORY%%", move_history_html)
     page = page.replace("%%MOVE_STUCK%%", move_stuck_html)
     page = page.replace("%%SEARCH_RESULTS%%", search_html)
+    focus = None
+    if status_at in entry_anchors:
+        focus = {"anchor": status_at, "panel": open_panel, "banner": status}
     page = page.replace("%%WATCHLIST%%", render_watchlist(
-        anime_list, pending_list, run_state.get("entries")))
+        anime_list, pending_list, run_state.get("entries"), focus=focus))
     page = page.replace("%%SETTINGS_CARD%%", render_settings_card(data.get("settings"), AUTH_ENABLED))
     page = page.replace("%%WATCHLIST_CONTROLS%%", render_watchlist_controls(anime_list, pending_list))
     page = page.replace("%%COUNT%%", watchlist_heading_count(anime_list, pending_list))
@@ -4989,7 +5178,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Location", url)
         self.end_headers()
 
-    def _redirect_msg(self, msg, level=None):
+    def _redirect_msg(self, msg, level=None, anchor=None, panel=None):
         """Redirect home with a status banner message, URL-encoded so a name
         containing ``& = # %`` survives intact — parse_qs decodes it on the GET
         side. A raw ``/?msg=...`` truncated everything after the first ``&``.
@@ -4999,11 +5188,31 @@ class Handler(BaseHTTPRequestHandler):
         failure message that doesn't start with that word (e.g. "Could not
         fetch releases: ...") otherwise renders as a green success. Omitted,
         do_GET falls back to the old prefix sniff, so an un-migrated caller
-        keeps its previous behavior."""
-        params = {"msg": msg}
-        if level is not None:
-            params["level"] = level
-        self._redirect("/?" + urlencode(params))
+        keeps its previous behavior.
+
+        ``anchor`` lands the user back where they acted instead of at the page
+        top: a section anchor (ANCHOR_*) or entry_anchor_id(url) for a card,
+        with ``panel`` ("episodes"/"edit") re-opened. See status_url."""
+        self._redirect(status_url(msg, level=level, anchor=anchor, panel=panel,
+                                  runs=self._referer_runs()))
+
+    def _referer_runs(self):
+        """The ``?runs=`` Run History depth of the page the form was posted
+        from, so a redirect doesn't reset the reader's paging. None when the
+        page had none (or there is no Referer)."""
+        headers = getattr(self, "headers", None)
+        referer = headers.get("Referer", "") if headers is not None else ""
+        qs = parse_qs(urlparse(referer).query)
+        return parse_runs_param(qs) if "runs" in qs else None
+
+    def _show_flow(self, search_html, search_query=""):
+        """Post/Redirect/Get for an add-flow step: stash the rendered step and
+        redirect to it, so a reload re-renders instead of re-posting."""
+        params = {"flow": stash_flow(search_html, search_query)}
+        runs = self._referer_runs()
+        if runs:
+            params["runs"] = runs
+        self._redirect("/?" + urlencode(params) + "#" + ANCHOR_ADD_FLOW)
 
     def _read_post(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -5049,19 +5258,36 @@ class Handler(BaseHTTPRequestHandler):
 
         status = ""
 
+        qs = parse_qs(parsed.query)
+        # Only ever compared against known ids by render_page, never echoed.
+        status_at = qs.get("at", [None])[0]
+        open_panel = qs.get("open", [None])[0]
         if "msg" in qs:
             msg = qs["msg"][0]
             level = qs.get("level", [None])[0]
             if level not in ("ok", "err"):
                 level = "ok" if not msg.startswith("Error") else "err"
-            cls = "status-ok" if level == "ok" else "status-err"
-            status = '<div class="status-msg {}" id="status-msg">{}</div>'.format(cls, escape(msg))
+            status = render_status_banner(msg, level)
+
+        search_html, search_query = "", ""
+        if "flow" in qs:
+            flow = load_flow(qs["flow"][0])
+            if flow is not None:
+                search_html, search_query = flow
+            elif not status:
+                status = render_status_banner(
+                    "That step has expired. Search again or paste the URL again.", "err")
+                status_at = ANCHOR_ADD_FLOW
 
         try:
-            page = render_page(status=status, max_runs=parse_runs_param(qs))
+            page = render_page(status=status, search_html=search_html, search_query=search_query,
+                               max_runs=parse_runs_param(qs),
+                               status_at=status_at, open_panel=open_panel)
         except anistore.CorruptStoreError as e:
             _log.error("[watchlist] ani.json is corrupt, refusing to render it: %s", e)
-            status = '<div class="status-msg status-err" id="status-msg">Error: ani.json is corrupt — the watchlist can\'t be shown or edited until it is fixed or restored.</div>'
+            status = render_status_banner(
+                "Error: ani.json is corrupt — the watchlist can't be shown or edited until it is fixed or restored.",
+                "err")
             page = render_page(status=status, ani_data={"settings": {}, "anime": []})
 
         self._respond(200, page)
@@ -5090,7 +5316,8 @@ class Handler(BaseHTTPRequestHandler):
 
         duplicate = find_duplicate_entry(load_ani(), url)
         if duplicate is not None:
-            self._redirect_msg(_duplicate_msg(duplicate), level="err")
+            self._redirect_msg(_duplicate_msg(duplicate), level="err",
+                               anchor=entry_anchor_id(duplicate.get("url", "")))
             return
 
         # Validate the release_id / media_type / episode-count carried
@@ -5106,7 +5333,7 @@ class Handler(BaseHTTPRequestHandler):
         if posted_release_id and not release_id:
             self._redirect_msg(
                 "Error: invalid release selection — please fetch releases again",
-                level="err")
+                level="err", anchor=ANCHOR_ADD_FLOW)
             return
 
         # If TVDB is available and user hasn't been through the TVDB step yet,
@@ -5130,7 +5357,7 @@ class Handler(BaseHTTPRequestHandler):
                 display_title=params.get("display_title", ""),
                 auto_release=auto_release,
                 have_episodes=params.get("have_episodes", 0))
-            self._respond(200, render_page(search_html=search_html))
+            self._show_flow(search_html)
             return
 
         folder_name_raw = custom_folder if custom_folder else name
@@ -5144,7 +5371,7 @@ class Handler(BaseHTTPRequestHandler):
             have_episodes = 0
         folder_name = _safe_folder_segment(folder_name_raw)
         if not folder_name:
-            self._redirect_msg("Error: invalid folder name", level="err")
+            self._redirect_msg("Error: invalid folder name", level="err", anchor=ANCHOR_ADD_FLOW)
             return
 
         # New entries start with the global prefs as their per-entry prefs,
@@ -5213,7 +5440,8 @@ class Handler(BaseHTTPRequestHandler):
 
         update_ani(_append)
         if found:
-            self._redirect_msg(_duplicate_msg(found[0]), level="err")
+            self._redirect_msg(_duplicate_msg(found[0]), level="err",
+                               anchor=entry_anchor_id(found[0].get("url", "")))
             return
 
         season_info = ""
@@ -5231,7 +5459,8 @@ class Handler(BaseHTTPRequestHandler):
         if have_episodes:
             auto_info += "; downloads start at episode {}".format(have_episodes + 1)
         self._redirect_msg("Added: {} (folder: {}{}{})".format(
-            name, folder_display, season_info, auto_info), level="ok")
+            name, folder_display, season_info, auto_info), level="ok",
+            anchor=entry_anchor_id(url))
 
     def _entry_edit(self, params):
         """/entry-edit: one per-entry setting from a watchlist card's Edit
@@ -5243,21 +5472,25 @@ class Handler(BaseHTTPRequestHandler):
         if edit == "episodes":
             value = parse_have_episodes(params.get("episodes"))
             if value is None:
-                self._redirect_msg("Error: episodes must be a whole number, 0 or more", level="err")
+                self._redirect_msg("Error: episodes must be a whole number, 0 or more", level="err",
+                                   anchor=entry_anchor_id(entry_url), panel="edit")
                 return
         elif edit == "paused":
             if params.get("paused") not in ("0", "1"):
-                self._redirect_msg("Error: invalid pause request", level="err")
+                self._redirect_msg("Error: invalid pause request", level="err",
+                                   anchor=entry_anchor_id(entry_url), panel="edit")
                 return
             value = params.get("paused") == "1"
         elif edit == "prefs":
             value, err = parse_entry_prefs(params)
             if err:
-                self._redirect_msg("Error: {}".format(err), level="err")
+                self._redirect_msg("Error: {}".format(err), level="err",
+                                   anchor=entry_anchor_id(entry_url), panel="edit")
                 return
         elif edit == "release":
             if not params.get("release_id"):
-                self._redirect_msg("Error: no release selected", level="err")
+                self._redirect_msg("Error: no release selected", level="err",
+                                   anchor=entry_anchor_id(entry_url), panel="edit")
                 return
             value, _media_type, _eps = _resolve_release_selection(entry_url, {
                 "release_id": params.get("release_id", ""),
@@ -5267,10 +5500,12 @@ class Handler(BaseHTTPRequestHandler):
             })
             if not value:
                 self._redirect_msg(
-                    "Error: invalid release selection. Fetch releases again", level="err")
+                    "Error: invalid release selection. Fetch releases again", level="err",
+                                   anchor=entry_anchor_id(entry_url), panel="edit")
                 return
         else:
-            self._redirect_msg("Error: unknown edit", level="err")
+            self._redirect_msg("Error: unknown edit", level="err",
+                               anchor=entry_anchor_id(entry_url), panel="edit")
             return
 
         outcome = {}
@@ -5288,11 +5523,12 @@ class Handler(BaseHTTPRequestHandler):
         update_ani(_apply)
         result = outcome.get("result")
         if result == "not_found":
-            self._redirect_msg("Error: entry not found", level="err")
+            self._redirect_msg("Error: entry not found", level="err", anchor=ANCHOR_WATCHLIST)
             return
         name = outcome["name"]
         if result == "invalid":
-            self._redirect_msg("Error: {}: {}".format(name, outcome["detail"]), level="err")
+            self._redirect_msg("Error: {}: {}".format(name, outcome["detail"]), level="err",
+                               anchor=entry_anchor_id(entry_url), panel="edit")
             return
         _log.info("[watchlist] Edit %s (%s): %s", name, edit, result)
         changed = result == "saved"
@@ -5311,73 +5547,77 @@ class Handler(BaseHTTPRequestHandler):
         else:
             msg = "{} {} release #{}. {}".format(
                 name, "now uses" if changed else "already uses", outcome["release"], note)
-        self._redirect_msg(msg.strip(), level="ok")
+        self._redirect_msg(msg.strip(), level="ok",
+                           anchor=entry_anchor_id(entry_url), panel="edit")
 
     def _dispatch_post(self, parsed, params):
         if parsed.path == "/run-now":
             ok, msg = trigger_run_now()
             if ok:
                 _log.info("[bot] Run now requested via dashboard")
-                self._redirect_msg(msg)
+                self._redirect_msg(msg, anchor=ANCHOR_BOT)
             else:
                 _log.warning("[bot] Run now request rejected: %s", msg)
-                self._redirect_msg("Error: {}".format(msg), level="err")
+                self._redirect_msg("Error: {}".format(msg), level="err", anchor=ANCHOR_BOT)
 
         elif parsed.path == "/check-now":
             entry_url = params.get("key", "")
             ok, msg = trigger_run_now(entry_url=entry_url)
             if ok:
                 _log.info("[bot] Check now requested via dashboard: %s", entry_url)
-                self._redirect_msg(msg)
+                self._redirect_msg(msg, anchor=entry_anchor_id(entry_url))
             else:
                 _log.warning("[bot] Check now request rejected: %s", msg)
-                self._redirect_msg("Error: {}".format(msg), level="err")
+                self._redirect_msg("Error: {}".format(msg), level="err", anchor=entry_anchor_id(entry_url))
 
         elif parsed.path == "/move-now":
             if not os.path.isdir(DOWNLOAD_DIR):
                 _log.warning("[mover] Move Now rejected: download directory not mounted")
                 self._redirect_msg(
-                    "Error: download directory not mounted — nothing to move", level="err")
+                    "Error: download directory not mounted — nothing to move", level="err",
+                    anchor=ANCHOR_MOVER)
             else:
                 _log.info("[mover] Move Now triggered via dashboard")
                 _move_trigger.set()
-                self._redirect_msg("Move cycle triggered")
+                self._redirect_msg("Move cycle triggered", anchor=ANCHOR_MOVER)
 
         elif parsed.path == "/move-stuck-ignore":
             key = params.get("key", "")
             msg = stuck_ignore(key)
             if msg is not None:
                 _log.info("[mover] Ignoring stuck item: %s", msg)
-                self._redirect_msg("Ignoring: {}".format(msg))
+                self._redirect_msg("Ignoring: {}".format(msg), anchor=ANCHOR_MOVER)
             else:
-                self._redirect_msg("Error: stuck item not found", level="err")
+                self._redirect_msg("Error: stuck item not found", level="err", anchor=ANCHOR_MOVER)
 
         elif parsed.path == "/move-stuck-delete":
             key = params.get("key", "")
             result = stuck_delete_download(key)
             if result is None:
-                self._redirect_msg("Error: stuck item not found", level="err")
+                self._redirect_msg("Error: stuck item not found", level="err", anchor=ANCHOR_MOVER)
             elif result.startswith("error:"):
-                self._redirect_msg("Error: {}".format(result[len("error:"):]), level="err")
+                self._redirect_msg("Error: {}".format(result[len("error:"):]), level="err",
+                                   anchor=ANCHOR_MOVER)
             else:
                 _log.info("[mover] Deleted downloaded copy: %s", result)
-                self._redirect_msg("Deleted download copy: {}".format(result))
+                self._redirect_msg("Deleted download copy: {}".format(result), anchor=ANCHOR_MOVER)
 
         elif parsed.path == "/move-stuck-anyway":
             key = params.get("key", "")
             msg = stuck_move_anyway(key)
             if msg is not None:
                 _log.info("[mover] Will move anyway on next cycle: %s", msg)
-                self._redirect_msg("Will move on next cycle: {}".format(msg))
+                self._redirect_msg("Will move on next cycle: {}".format(msg), anchor=ANCHOR_MOVER)
             else:
-                self._redirect_msg("Error: stuck item not found", level="err")
+                self._redirect_msg("Error: stuck item not found", level="err", anchor=ANCHOR_MOVER)
 
         elif parsed.path == "/save-prefs":
             try:
                 min_resolution = int(params.get("min_resolution", "1080"))
             except ValueError:
                 self._redirect_msg(
-                    "Error: minimum resolution must be a number", level="err")
+                    "Error: minimum resolution must be a number", level="err",
+                    anchor=ANCHOR_PREFS)
                 return
             prefs = {
                 "audio_language": params.get("audio_language", "german"),
@@ -5386,12 +5626,13 @@ class Handler(BaseHTTPRequestHandler):
                 "auto_select": "auto_select" in params,
             }
             save_prefs(prefs)
-            self._redirect_msg("Preferences saved")
+            self._redirect_msg("Preferences saved", anchor=ANCHOR_PREFS)
 
         elif parsed.path == "/save-settings":
             updates, errors = validate_settings_form(params, AUTH_ENABLED)
             if errors:
-                self._redirect_msg("Error: {}".format("; ".join(errors)), level="err")
+                self._redirect_msg("Error: {}".format("; ".join(errors)), level="err",
+                                   anchor=ANCHOR_SETTINGS)
                 return
 
             def _apply(data):
@@ -5403,12 +5644,12 @@ class Handler(BaseHTTPRequestHandler):
                 return data
 
             update_ani(_apply)
-            self._redirect_msg("Saved — restart the bot container to apply")
+            self._redirect_msg("Saved — restart the bot container to apply", anchor=ANCHOR_SETTINGS)
 
         elif parsed.path == "/add-url":
             url = params.get("url", "").strip()
             if not url or "anime-loads.org" not in url.lower():
-                self._redirect_msg("Error: Invalid URL", level="err")
+                self._redirect_msg("Error: Invalid URL", level="err", anchor=ANCHOR_ADD_FLOW)
                 return
             # "Change release" from the TVDB step posts pick=1: show the
             # picker even when auto-select would otherwise skip it.
@@ -5421,7 +5662,8 @@ class Handler(BaseHTTPRequestHandler):
             # request's scrape is in flight) is never missed or clobbered.
             duplicate = find_duplicate_entry(load_ani(), url)
             if duplicate is not None:
-                self._redirect_msg(_duplicate_msg(duplicate), level="err")
+                self._redirect_msg(_duplicate_msg(duplicate), level="err",
+                                   anchor=entry_anchor_id(duplicate.get("url", "")))
                 return
 
             # Fetch releases from site so user can see what's available. No
@@ -5452,11 +5694,12 @@ class Handler(BaseHTTPRequestHandler):
 
                 update_ani(_add_pending)
                 if found:
-                    self._redirect_msg(_duplicate_msg(found[0]), level="err")
+                    self._redirect_msg(_duplicate_msg(found[0]), level="err",
+                                       anchor=entry_anchor_id(found[0].get("url", "")))
                     return
                 msg = "Could not fetch releases{}, added to pending queue".format(
                     ": " + err if err else "")
-                self._redirect_msg(msg, level="err")
+                self._redirect_msg(msg, level="err", anchor=entry_anchor_id(url))
                 return
 
             prefs = load_prefs()
@@ -5486,7 +5729,7 @@ class Handler(BaseHTTPRequestHandler):
                 anime_info, best["id"] if best else None,
                 with_tvdb=tvdb.available, note=note,
                 have_episodes=params.get("have_episodes", 0))
-            self._respond(200, render_page(search_html=search_html))
+            self._show_flow(search_html)
 
         elif parsed.path == "/add-release":
             self._add_release(params)
@@ -5511,7 +5754,7 @@ class Handler(BaseHTTPRequestHandler):
                 year=params.get("year", ""),
                 display_title=params.get("display_title", ""),
                 have_episodes=params.get("have_episodes", 0))
-            self._respond(200, render_page(search_html=search_html))
+            self._show_flow(search_html)
 
         elif parsed.path == "/tvdb-seasons":
             url = params.get("url", "").strip()
@@ -5562,12 +5805,12 @@ class Handler(BaseHTTPRequestHandler):
                 query=query, year=params.get("year", ""),
                 display_title=params.get("display_title", ""),
                 have_episodes=params.get("have_episodes", 0))
-            self._respond(200, render_page(search_html=search_html))
+            self._show_flow(search_html)
 
         elif parsed.path == "/search":
             query = params.get("q", "").strip()
             if not query:
-                self._redirect_msg("Error: Empty search", level="err")
+                self._redirect_msg("Error: Empty search", level="err", anchor=ANCHOR_ADD_FLOW)
                 return
 
             results, err = search_anime(query)
@@ -5579,7 +5822,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 search_html = render_search_results(results, load_ani())
 
-            self._respond(200, render_page(search_html=search_html, search_query=query))
+            self._show_flow(search_html, query)
 
         elif parsed.path == "/remove-pending":
             entry_url = params.get("key", "")
@@ -5597,9 +5840,10 @@ class Handler(BaseHTTPRequestHandler):
             update_ani(_remove_pending)
             if removed is not None:
                 _log.info("[watchlist] Removed pending: %s", removed.get("name") or removed.get("url", "?"))
-                self._redirect_msg("Removed: {}".format(removed.get("name", "?")))
+                self._redirect_msg("Removed: {}".format(removed.get("name", "?")),
+                                   anchor=ANCHOR_WATCHLIST)
             else:
-                self._redirect_msg("Error: entry not found", level="err")
+                self._redirect_msg("Error: entry not found", level="err", anchor=ANCHOR_WATCHLIST)
 
         elif parsed.path == "/remove":
             entry_url = params.get("key", "")
@@ -5616,9 +5860,10 @@ class Handler(BaseHTTPRequestHandler):
             update_ani(_remove)
             if removed is not None:
                 _log.info("[watchlist] Removed anime: %s", removed.get("name", "?"))
-                self._redirect_msg("Removed: {}".format(removed.get("name", "?")))
+                self._redirect_msg("Removed: {}".format(removed.get("name", "?")),
+                                   anchor=ANCHOR_WATCHLIST)
             else:
-                self._redirect_msg("Error: entry not found", level="err")
+                self._redirect_msg("Error: entry not found", level="err", anchor=ANCHOR_WATCHLIST)
 
         elif parsed.path == "/ep-add":
             entry_url = params.get("key", "")
@@ -5626,7 +5871,8 @@ class Handler(BaseHTTPRequestHandler):
                 ep = int(params.get("ep", -1))
             except ValueError:
                 self._redirect_msg(
-                    "Error: episode number must be numeric", level="err")
+                    "Error: episode number must be numeric", level="err",
+                    anchor=entry_anchor_id(entry_url), panel="episodes")
                 return
             outcome = {}
 
@@ -5652,11 +5898,14 @@ class Handler(BaseHTTPRequestHandler):
 
             update_ani(_ep_add)
             if outcome["result"] == "added":
-                self._redirect_msg("Added episode {} to retry queue for {}".format(ep, outcome["name"]))
+                self._redirect_msg("Added episode {} to retry queue for {}".format(ep, outcome["name"]),
+                                   anchor=entry_anchor_id(entry_url), panel="episodes")
             elif outcome["result"] == "already":
-                self._redirect_msg("Episode {} already in retry queue".format(ep))
+                self._redirect_msg("Episode {} already in retry queue".format(ep),
+                                   anchor=entry_anchor_id(entry_url), panel="episodes")
             else:
-                self._redirect_msg("Error: entry not found or invalid episode", level="err")
+                self._redirect_msg("Error: entry not found or invalid episode", level="err",
+                                   anchor=entry_anchor_id(entry_url), panel="episodes")
 
         elif parsed.path == "/ep-remove":
             entry_url = params.get("key", "")
@@ -5664,7 +5913,8 @@ class Handler(BaseHTTPRequestHandler):
                 ep = int(params.get("ep", -1))
             except ValueError:
                 self._redirect_msg(
-                    "Error: episode number must be numeric", level="err")
+                    "Error: episode number must be numeric", level="err",
+                    anchor=entry_anchor_id(entry_url), panel="episodes")
                 return
             outcome = {}
 
@@ -5685,11 +5935,14 @@ class Handler(BaseHTTPRequestHandler):
 
             update_ani(_ep_remove)
             if outcome["result"] == "removed":
-                self._redirect_msg("Removed episode {} from retry queue for {}".format(ep, outcome["name"]))
+                self._redirect_msg("Removed episode {} from retry queue for {}".format(ep, outcome["name"]),
+                                   anchor=entry_anchor_id(entry_url), panel="episodes")
             elif outcome["result"] == "not_queued":
-                self._redirect_msg("Episode {} not in retry queue".format(ep))
+                self._redirect_msg("Episode {} not in retry queue".format(ep),
+                                   anchor=entry_anchor_id(entry_url), panel="episodes")
             else:
-                self._redirect_msg("Error: entry not found or invalid episode", level="err")
+                self._redirect_msg("Error: entry not found or invalid episode", level="err",
+                                   anchor=entry_anchor_id(entry_url), panel="episodes")
 
         elif parsed.path == "/tvdb-link":
             entry_url = params.get("key", "")
@@ -5721,9 +5974,10 @@ class Handler(BaseHTTPRequestHandler):
                         name, url, "", "",
                         search_results=results, edit_key=url,
                         media_type=media_type)
-                self._respond(200, render_page(search_html=search_html))
+                self._show_flow(search_html)
             else:
-                self._redirect_msg("Error: entry not found or TVDB unavailable", level="err")
+                self._redirect_msg("Error: entry not found or TVDB unavailable", level="err",
+                                   anchor=entry_anchor_id(entry_url), panel="edit")
 
         elif parsed.path == "/tvdb-save":
             entry_url = params.get("key", "")
@@ -5735,9 +5989,9 @@ class Handler(BaseHTTPRequestHandler):
                 _, entry = find_entry_by_url(load_ani().get("anime", []), entry_url)
                 if entry is not None:
                     self._redirect_msg("Cancelled — {} unchanged".format(
-                        entry.get("name", "?")))
+                        entry.get("name", "?")), anchor=entry_anchor_id(entry_url), panel="edit")
                 else:
-                    self._redirect_msg("Cancelled")
+                    self._redirect_msg("Cancelled", anchor=ANCHOR_WATCHLIST)
                 return
 
             tvdb_id = params.get("tvdb_id", "")
@@ -5777,9 +6031,10 @@ class Handler(BaseHTTPRequestHandler):
 
             update_ani(_tvdb_save)
             if outcome.get("result") == "saved":
-                self._redirect_msg("TVDB linked: {}{}".format(outcome["name"], outcome["season_str"]))
+                self._redirect_msg("TVDB linked: {}{}".format(outcome["name"], outcome["season_str"]),
+                                   anchor=entry_anchor_id(entry_url), panel="edit")
             else:
-                self._redirect_msg("Error: entry not found", level="err")
+                self._redirect_msg("Error: entry not found", level="err", anchor=ANCHOR_WATCHLIST)
 
         elif parsed.path == "/tvdb-unlink":
             entry_url = params.get("key", "")
@@ -5798,27 +6053,29 @@ class Handler(BaseHTTPRequestHandler):
 
             update_ani(_tvdb_unlink)
             if outcome.get("result") == "unlinked":
-                self._redirect_msg("TVDB unlinked: {}".format(outcome["name"]))
+                self._redirect_msg("TVDB unlinked: {}".format(outcome["name"]),
+                                   anchor=entry_anchor_id(entry_url), panel="edit")
             else:
-                self._redirect_msg("Error: entry not found", level="err")
+                self._redirect_msg("Error: entry not found", level="err", anchor=ANCHOR_WATCHLIST)
 
         elif parsed.path == "/entry-releases":
             entry_url = params.get("key", "")
             _, entry = find_entry_by_url(load_ani().get("anime", []), entry_url)
             if entry is None:
-                self._redirect_msg("Error: entry not found", level="err")
+                self._redirect_msg("Error: entry not found", level="err", anchor=ANCHOR_WATCHLIST)
                 return
             # Scrape with no lock held (see update_ani).
             anime_info, err = get_releases(entry_url)
             if err or not anime_info or not anime_info.get("releases"):
                 self._redirect_msg("Error: could not fetch releases for {}{}".format(
-                    entry.get("name", "?"), ": " + err if err else ""), level="err")
+                    entry.get("name", "?"), ": " + err if err else ""), level="err",
+                    anchor=entry_anchor_id(entry_url), panel="edit")
                 return
             best = pick_best_release(anime_info["releases"],
                                      entry_effective_prefs(entry, load_prefs()))
             search_html = render_entry_release_picker(
                 entry, anime_info, best["id"] if best else None)
-            self._respond(200, render_page(search_html=search_html))
+            self._show_flow(search_html)
 
         elif parsed.path == "/entry-edit":
             self._entry_edit(params)
@@ -5842,9 +6099,11 @@ class Handler(BaseHTTPRequestHandler):
             update_ani(_update_folder)
             if outcome.get("result") == "updated":
                 shown = folder if folder == folder_raw else "{} (saved as '{}')".format(folder_raw, folder)
-                self._redirect_msg("Folder updated: {} -> {}".format(outcome["name"], shown))
+                self._redirect_msg("Folder updated: {} -> {}".format(outcome["name"], shown),
+                                   anchor=entry_anchor_id(entry_url), panel="edit")
             else:
-                self._redirect_msg("Error: entry not found or empty folder", level="err")
+                self._redirect_msg("Error: entry not found or empty folder", level="err",
+                                   anchor=entry_anchor_id(entry_url), panel="edit")
 
         elif parsed.path == "/mark-incomplete":
             entry_url = params.get("key", "")
@@ -5863,9 +6122,10 @@ class Handler(BaseHTTPRequestHandler):
 
             update_ani(_mark_incomplete)
             if outcome.get("result") == "marked":
-                self._redirect_msg("Marked incomplete: {}".format(outcome["name"]))
+                self._redirect_msg("Marked incomplete: {}".format(outcome["name"]),
+                                   anchor=entry_anchor_id(entry_url), panel="edit")
             else:
-                self._redirect_msg("Error: entry not found", level="err")
+                self._redirect_msg("Error: entry not found", level="err", anchor=ANCHOR_WATCHLIST)
 
         else:
             self._redirect("/")

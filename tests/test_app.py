@@ -37,6 +37,20 @@ def tearDownModule():
     app._display_tz = None
 
 
+def _capture_redirect(captured):
+    """Stub for Handler._redirect: records the URL and, for an add-flow step's
+    Post/Redirect/Get, follows it through do_GET so ``captured["html"]`` is
+    the page the browser lands on."""
+    def _redirect(url):
+        captured["url"] = url
+        if "flow=" in url:
+            follow = app.Handler.__new__(app.Handler)
+            follow.path = url.split("#", 1)[0]
+            follow._respond = lambda code, body: captured.__setitem__("html", body)
+            follow.do_GET()
+    return _redirect
+
+
 class LangInListTest(unittest.TestCase):
     def test_any_always_matches(self):
         self.assertTrue(app.lang_in_list("any", []))
@@ -1649,8 +1663,8 @@ class WatchlistMutationKeyByUrlTest(unittest.TestCase):
         handler = app.Handler.__new__(app.Handler)
         handler.path = path
         handler._read_post = lambda: params
-        handler._redirect_msg = lambda msg, level=None: captured.update(msg=msg, level=level)
-        handler._redirect = lambda url: captured.__setitem__("url", url)
+        handler._redirect_msg = lambda msg, level=None, **kw: captured.update(msg=msg, level=level, **kw)
+        handler._redirect = _capture_redirect(captured)
         handler._respond = lambda code, html: captured.__setitem__("html", html)
         handler.do_POST()
         return captured
@@ -1982,8 +1996,8 @@ class AniJsonCorruptTest(unittest.TestCase):
         h = app.Handler.__new__(app.Handler)
         h.path = path
         h._read_post = lambda: params
-        h._redirect_msg = lambda msg, level=None: captured.update(msg=msg, level=level)
-        h._redirect = lambda url: captured.__setitem__("url", url)
+        h._redirect_msg = lambda msg, level=None, **kw: captured.update(msg=msg, level=level, **kw)
+        h._redirect = _capture_redirect(captured)
         h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
         h.do_POST()
         return captured
@@ -2270,8 +2284,8 @@ class SaveSettingsPostTest(unittest.TestCase):
         h = app.Handler.__new__(app.Handler)
         h.path = "/save-settings"
         h._read_post = lambda: params
-        h._redirect_msg = lambda msg, level=None: captured.update(msg=msg, level=level)
-        h._redirect = lambda url: captured.__setitem__("url", url)
+        h._redirect_msg = lambda msg, level=None, **kw: captured.update(msg=msg, level=level, **kw)
+        h._redirect = _capture_redirect(captured)
         h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
         h.do_POST()
         return captured
@@ -3350,8 +3364,8 @@ class HandlerPostRoutingTest(unittest.TestCase):
         h = app.Handler.__new__(app.Handler)
         h.path = path
         h._read_post = lambda: params
-        h._redirect_msg = lambda msg, level=None: captured.update(msg=msg, level=level)
-        h._redirect = lambda url: captured.__setitem__("url", url)
+        h._redirect_msg = lambda msg, level=None, **kw: captured.update(msg=msg, level=level, **kw)
+        h._redirect = _capture_redirect(captured)
         h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
         h.do_POST()
         return captured
@@ -4065,8 +4079,8 @@ class RunNowCheckNowPostTest(unittest.TestCase):
         h = app.Handler.__new__(app.Handler)
         h.path = path
         h._read_post = lambda: params
-        h._redirect_msg = lambda msg, level=None: captured.update(msg=msg, level=level)
-        h._redirect = lambda url: captured.__setitem__("url", url)
+        h._redirect_msg = lambda msg, level=None, **kw: captured.update(msg=msg, level=level, **kw)
+        h._redirect = _capture_redirect(captured)
         h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
         h.do_POST()
         return captured
@@ -4132,8 +4146,8 @@ class AddUrlClobberTest(unittest.TestCase):
         h = app.Handler.__new__(app.Handler)
         h.path = path
         h._read_post = lambda: params
-        h._redirect_msg = lambda msg, level=None: captured.update(msg=msg, level=level)
-        h._redirect = lambda url: captured.__setitem__("url", url)
+        h._redirect_msg = lambda msg, level=None, **kw: captured.update(msg=msg, level=level, **kw)
+        h._redirect = _capture_redirect(captured)
         h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
         h.do_POST()
         return captured
@@ -4306,8 +4320,8 @@ class AddFlowHiddenFieldsTest(unittest.TestCase):
         h = app.Handler.__new__(app.Handler)
         h.path = path
         h._read_post = lambda: params
-        h._redirect_msg = lambda msg, level=None: captured.update(msg=msg, level=level)
-        h._redirect = lambda url: captured.__setitem__("url", url)
+        h._redirect_msg = lambda msg, level=None, **kw: captured.update(msg=msg, level=level, **kw)
+        h._redirect = _capture_redirect(captured)
         h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
         h.do_POST()
         return captured
@@ -4950,8 +4964,8 @@ class AddAnimeFlowTest(unittest.TestCase):
         h = app.Handler.__new__(app.Handler)
         h.path = path
         h._read_post = lambda: params
-        h._redirect_msg = lambda msg, level=None: captured.update(msg=msg, level=level)
-        h._redirect = lambda url: captured.__setitem__("url", url)
+        h._redirect_msg = lambda msg, level=None, **kw: captured.update(msg=msg, level=level, **kw)
+        h._redirect = _capture_redirect(captured)
         h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
         h.do_POST()
         return captured
@@ -5855,6 +5869,327 @@ class PendingResolveErrorTest(unittest.TestCase):
                 setattr(app, name, fn)
         self.assertEqual(len(calls), 1)
         self.assertEqual(store["pending"][0]["resolve_error"]["reason"], "site timed out")
+
+class EntryAnchorIdTest(unittest.TestCase):
+    """entry_anchor_id: one stable, valid HTML id per entry URL, shared by the
+    card and every redirect that lands on it."""
+
+    VALID = re.compile(r"^[a-z][a-z0-9-]*$")
+
+    def test_ids_are_valid_for_hostile_urls(self):
+        for url in (
+            "https://www.anime-loads.org/media/fate-stay-night-&-heaven's-feel",
+            "https://www.anime-loads.org/media/a/b/c/",
+            "https://www.anime-loads.org/media/進撃の巨人",
+            "https://www.anime-loads.org/media/x?y=1&z='2'",
+            "",
+            "not a url at all / <script>",
+        ):
+            anchor = app.entry_anchor_id(url)
+            self.assertRegex(anchor, self.VALID, url)
+            self.assertTrue(anchor.startswith("entry-"))
+
+    def test_readable_slug_from_last_path_segment(self):
+        self.assertTrue(app.entry_anchor_id(
+            "https://www.anime-loads.org/media/one-piece").startswith("entry-one-piece-"))
+
+    def test_stable_across_url_spellings(self):
+        a = app.entry_anchor_id("https://www.anime-loads.org/media/one-piece")
+        self.assertEqual(a, app.entry_anchor_id("http://anime-loads.org/media/one-piece/"))
+        self.assertEqual(a, app.entry_anchor_id("https://www.anime-loads.org/media/one-piece"))
+
+    def test_distinct_urls_get_distinct_ids(self):
+        # Unicode-only and punctuation-only tails slug to the same (or no) text;
+        # the URL hash keeps them apart.
+        urls = ["https://www.anime-loads.org/media/進撃",
+                "https://www.anime-loads.org/media/巨人",
+                "https://www.anime-loads.org/media/a&b",
+                "https://www.anime-loads.org/media/a-b"]
+        self.assertEqual(len({app.entry_anchor_id(u) for u in urls}), len(urls))
+
+    def test_card_id_matches_redirect_anchor_and_ignores_name(self):
+        url = "https://www.anime-loads.org/media/fate/zero"
+        card = app.render_watchlist_card(0, {"name": "Fate & 'Zero'", "url": url})
+        self.assertIn('id="{}"'.format(app.entry_anchor_id(url)), card)
+        renamed = app.render_watchlist_card(0, {"name": "Something else", "url": url})
+        self.assertIn('id="{}"'.format(app.entry_anchor_id(url)), renamed)
+
+
+class StatusUrlTest(unittest.TestCase):
+    def test_anchor_goes_to_fragment_and_query(self):
+        url = app.status_url("Saved & done", level="ok", anchor="entry-x-1234abcd", panel="edit")
+        parsed = urlparse(url)
+        self.assertEqual(parsed.fragment, "entry-x-1234abcd")
+        qs = parse_qs(parsed.query)
+        self.assertEqual(qs["msg"], ["Saved & done"])
+        self.assertEqual(qs["at"], ["entry-x-1234abcd"])
+        self.assertEqual(qs["open"], ["edit"])
+
+    def test_no_anchor_keeps_the_old_shape(self):
+        self.assertEqual(urlparse(app.status_url("Hi")).fragment, "")
+        self.assertNotIn("at", parse_qs(urlparse(app.status_url("Hi")).query))
+
+    def test_invalid_anchor_and_panel_are_dropped(self):
+        url = app.status_url("x", anchor='"><script>', panel="edit")
+        self.assertNotIn("#", url)
+        self.assertNotIn("open", parse_qs(urlparse(url).query))
+        url = app.status_url("x", anchor="settings", panel="bogus")
+        self.assertNotIn("open", parse_qs(urlparse(url).query))
+        self.assertTrue(url.endswith("#settings"))
+
+
+class ActionRedirectTargetTest(unittest.TestCase):
+    """Every dashboard action redirects to where the user acted: the entry's
+    card (with its panel re-opened), the section, or the add flow."""
+
+    URL = "https://www.anime-loads.org/media/fate-&-zero"
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="aniloads-anchor-")
+        self._orig = {name: getattr(app, name) for name in (
+            "ANI_JSON", "PREFS_FILE", "trigger_run_now", "DOWNLOAD_DIR", "search_anime")}
+        self._orig_tvdb = app.tvdb.available
+        app.ANI_JSON = os.path.join(self._tmp, "ani.json")
+        app.PREFS_FILE = os.path.join(self._tmp, "web-prefs.json")
+        app.DOWNLOAD_DIR = self._tmp
+        app.trigger_run_now = lambda entry_url=None: (True, "Check queued")
+        app.tvdb.available = False
+        app.save_ani({"settings": {}, "anime": [
+            {"name": "Other", "url": "https://www.anime-loads.org/media/other", "episodes": 3,
+             "missing": []},
+            {"name": "Fate & Zero", "url": self.URL, "episodes": 12, "missing": [4],
+             "complete": True, "tvdb_id": 5},
+        ]})
+        self.anchor = app.entry_anchor_id(self.URL)
+
+    def tearDown(self):
+        for name, value in self._orig.items():
+            setattr(app, name, value)
+        app.tvdb.available = self._orig_tvdb
+        app._move_trigger.clear()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _post(self, path, params):
+        captured = {}
+        h = app.Handler.__new__(app.Handler)
+        h.path = path
+        h._read_post = lambda: params
+        h._redirect = _capture_redirect(captured)
+        h._respond = lambda code, body: captured.__setitem__("html", body)
+        h.do_POST()
+        parsed = urlparse(captured["url"])
+        qs = parse_qs(parsed.query)
+        return parsed.fragment, qs.get("at", [None])[0], qs.get("open", [None])[0], captured
+
+    def assertLands(self, path, params, anchor, panel=None):
+        fragment, at, opened, _ = self._post(path, params)
+        self.assertEqual(fragment, anchor, path)
+        self.assertEqual(at, anchor, path)
+        self.assertEqual(opened, panel, path)
+
+    def test_card_actions_land_on_the_card(self):
+        key = {"key": self.URL}
+        self.assertLands("/check-now", key, self.anchor)
+        self.assertLands("/ep-add", dict(key, ep="2"), self.anchor, "episodes")
+        self.assertLands("/ep-remove", dict(key, ep="4"), self.anchor, "episodes")
+        self.assertLands("/ep-add", dict(key, ep="abc"), self.anchor, "episodes")
+        self.assertLands("/update-folder", dict(key, folder="Fate"), self.anchor, "edit")
+        self.assertLands("/mark-incomplete", key, self.anchor, "edit")
+        self.assertLands("/tvdb-save", dict(key, tvdb_id="9", tvdb_season="1"), self.anchor, "edit")
+        self.assertLands("/tvdb-save", dict(key, tvdb_skip="1"), self.anchor, "edit")
+        self.assertLands("/tvdb-unlink", key, self.anchor, "edit")
+
+    def test_entry_edits_land_on_the_card_with_edit_open(self):
+        key = {"key": self.URL}
+        self.assertLands("/entry-edit", dict(key, edit="paused", paused="1"), self.anchor, "edit")
+        self.assertLands("/entry-edit", dict(key, edit="paused", paused="0"), self.anchor, "edit")
+        self.assertLands("/entry-edit", dict(key, edit="episodes", episodes="5"), self.anchor, "edit")
+        self.assertLands("/entry-edit", dict(key, edit="episodes", episodes="abc"), self.anchor, "edit")
+        self.assertLands("/entry-edit", dict(key, edit="bogus"), self.anchor, "edit")
+        self.assertLands("/entry-edit", {"key": "https://nope", "edit": "paused", "paused": "1"},
+                         "watchlist")
+
+    def test_change_release_cancel_returns_to_the_card(self):
+        entry = app.load_ani()["anime"][1]
+        out = app.render_entry_release_picker(entry, {"url": self.URL, "releases": []})
+        href = html.unescape(re.search(r'<a class="btn btn-ghost" href="([^"]+)">Cancel</a>', out).group(1))
+        self.assertTrue(href.endswith("#" + self.anchor))
+        self.assertEqual(parse_qs(urlparse(href).query)["open"], ["edit"])
+
+    def test_run_history_depth_survives_the_redirect(self):
+        for path, params in (("/ep-add", {"key": self.URL, "ep": "2"}),
+                             ("/search", {"q": "x"})):
+            captured = {}
+            h = app.Handler.__new__(app.Handler)
+            h.path = path
+            h.headers = {"Referer": "http://dash/?runs=40&msg=old#run-history-panel"}
+            h._read_post = lambda: params
+            h._redirect = lambda url: captured.__setitem__("url", url)
+            app.search_anime = lambda q: ([], None)
+            h.do_POST()
+            qs = parse_qs(urlparse(captured["url"]).query)
+            self.assertEqual(qs["runs"], ["40"], path)
+        # No paging on the source page: no runs param is invented.
+        fragment, at, opened, captured = self._post("/ep-add", {"key": self.URL, "ep": "3"})
+        self.assertNotIn("runs", parse_qs(urlparse(captured["url"]).query))
+
+    def test_banner_script_strips_only_msg_and_level(self):
+        script = app.HTML_TEMPLATE
+        self.assertIn("searchParams.delete('msg')", script)
+        self.assertIn("searchParams.delete('level')", script)
+        self.assertNotIn("searchParams.delete('runs')", script)
+
+    def test_missing_entry_lands_on_the_watchlist(self):
+        self.assertLands("/tvdb-unlink", {"key": "https://nope"}, "watchlist")
+        self.assertLands("/remove", {"key": self.URL}, "watchlist")
+
+    def test_section_actions_land_on_their_section(self):
+        self.assertLands("/run-now", {}, "bot-activity")
+        self.assertLands("/move-now", {}, "file-mover")
+        self.assertLands("/move-stuck-ignore", {"key": "nope"}, "file-mover")
+        self.assertLands("/save-prefs", {"min_resolution": "720"}, "preferences")
+        self.assertLands("/save-settings", {"hoster": "x", "timedelay": "abc"}, "settings")
+
+    def test_add_flow_errors_land_on_the_add_flow(self):
+        self.assertLands("/add-url", {"url": "https://example.com/x"}, "add-flow")
+        self.assertLands("/search", {"q": "  "}, "add-flow")
+
+    def test_duplicate_add_lands_on_the_existing_card(self):
+        self.assertLands("/add-url", {"url": "http://anime-loads.org/media/fate-&-zero/"}, self.anchor)
+
+    def test_new_entry_lands_on_its_card(self):
+        new_url = "https://www.anime-loads.org/media/brand-new"
+        self.assertLands("/add-release", {"url": new_url, "name": "Brand New"},
+                         app.entry_anchor_id(new_url))
+
+    def test_landing_page_marks_the_card_and_reopens_the_panel(self):
+        _, _, _, captured = self._post("/update-folder", {"key": self.URL, "folder": "Fate Z"})
+        h = app.Handler.__new__(app.Handler)
+        h.path = captured["url"].split("#", 1)[0]
+        h._respond = lambda code, body: captured.__setitem__("page", body)
+        h.do_GET()
+        page = captured["page"]
+        card = page[page.index('id="{}"'.format(self.anchor)):]
+        card = card[:card.index("</article>")]
+        # The banner renders inside the card it's about, not at the page top.
+        self.assertIn('id="status-msg"', card)
+        self.assertIn("Folder updated", card)
+        self.assertEqual(page.count('id="status-msg"'), 1)
+        self.assertIn('<details class="wl-panel wl-edit" open>', card)
+        self.assertNotIn('<details class="wl-panel ep-panel" open>', card)
+        # The other card stays collapsed.
+        other = page[page.index('id="{}"'.format(
+            app.entry_anchor_id("https://www.anime-loads.org/media/other"))):]
+        self.assertNotIn(" open>", other[:other.index("</article>")])
+
+
+class StatusBannerPlacementTest(unittest.TestCase):
+    def setUp(self):
+        self.data = {"settings": {}, "anime": [
+            {"name": "A", "url": "https://www.anime-loads.org/media/a", "episodes": 1}]}
+        self.banner = app.render_status_banner("Hello", "ok")
+
+    def test_banner_is_an_accessible_dismissable_status(self):
+        self.assertIn('role="status"', self.banner)
+        self.assertIn('aria-live="polite"', self.banner)
+        self.assertIn('class="status-close"', self.banner)
+        self.assertIn('aria-label="Dismiss message"', self.banner)
+        self.assertIn("status-err", app.render_status_banner("<b>", "err"))
+        self.assertIn("&lt;b&gt;", app.render_status_banner("<b>", "err"))
+
+    def test_section_anchor_opens_settings_and_places_banner_there(self):
+        page = app.render_page(status=self.banner, ani_data=self.data, status_at="settings")
+        section = page[page.index('id="settings"'):]
+        section = section[:section.index("</summary>") + 200]
+        self.assertIn("<details open>", section)
+        self.assertIn('id="status-msg"', section)
+        self.assertEqual(page.count('id="status-msg"'), 1)
+
+    def test_unknown_anchor_falls_back_to_page_top(self):
+        page = app.render_page(status=self.banner, ani_data=self.data,
+                               status_at="entry-gone-00000000")
+        self.assertLess(page.index('id="status-msg"'), page.index('id="bot-activity"'))
+        self.assertNotIn("%%STATUS@", page)
+
+    def test_every_section_anchor_exists_in_the_template(self):
+        for anchor in app.SECTION_ANCHORS:
+            self.assertIn('id="{}"'.format(anchor), app.HTML_TEMPLATE)
+            self.assertIn("%%STATUS@{}%%".format(anchor), app.HTML_TEMPLATE)
+
+    def test_script_strips_msg_and_closes_banner(self):
+        self.assertIn("history.replaceState", app.HTML_TEMPLATE)
+        self.assertIn("searchParams.delete('msg')", app.HTML_TEMPLATE)
+        self.assertIn(".wl-card:target", app.HTML_TEMPLATE)
+
+
+class AddFlowPostRedirectGetTest(unittest.TestCase):
+    """Add-flow steps are Post/Redirect/Get: the POST stores the step and 303s
+    to ``/?flow=<token>#add-flow``; reloading that GET re-renders the step and
+    writes nothing. Borrows AddAnimeFlowTest's stubbed scrape/TVDB fixture
+    without inheriting (and so re-running) its tests."""
+
+    URL = AddAnimeFlowTest.URL
+    setUp = AddAnimeFlowTest.setUp
+    tearDown = AddAnimeFlowTest.tearDown
+    set_prefs = AddAnimeFlowTest.set_prefs
+
+    def _raw_post(self, path, params):
+        captured = {}
+        h = app.Handler.__new__(app.Handler)
+        h.path = path
+        h._read_post = lambda: params
+        h._redirect = lambda url: captured.__setitem__("url", url)
+        h._respond = lambda code, body: self.fail("step rendered as a POST response")
+        h.do_POST()
+        return captured["url"]
+
+    def _get(self, path):
+        captured = {}
+        h = app.Handler.__new__(app.Handler)
+        h.path = path
+        h._respond = lambda code, body: captured.__setitem__("resp", (code, body))
+        h.do_GET()
+        return captured["resp"]
+
+    def test_release_picker_redirects_and_reload_rerenders(self):
+        self.set_prefs(auto_select=False)
+        url = self._raw_post("/add-url", {"url": self.URL})
+        self.assertTrue(url.endswith("#add-flow"))
+        self.assertIn("flow=", url)
+        with open(app.ANI_JSON, encoding="utf-8") as f:
+            before = f.read()
+        first = self._get(url.split("#")[0])
+        again = self._get(url.split("#")[0])
+        self.assertEqual(first[0], 200)
+        self.assertIn("Add this release", first[1])
+        self.assertIn("Add this release", again[1])
+        self.assertEqual(len(self.scrapes), 1)
+        with open(app.ANI_JSON, encoding="utf-8") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_search_keeps_query_through_the_redirect(self):
+        app.search_anime = lambda q: ([{"name": "Hit", "url": "https://www.anime-loads.org/media/hit",
+                                        "type": "TV", "episodes": 1, "genre": "x"}], None)
+        url = self._raw_post("/search", {"q": "Fate & Zero"})
+        _, page = self._get(url.split("#")[0])
+        self.assertIn("Search Results", page)
+        self.assertIn('value="Fate &amp; Zero"', page)
+
+    def test_tvdb_step_redirects(self):
+        app.tvdb.available = True
+        url = self._raw_post("/add-url", {"url": self.URL})
+        self.assertIn("flow=", url)
+        self.assertIn("TVDB Correlation", self._get(url.split("#")[0])[1])
+
+    def test_unknown_token_shows_expired_banner_at_add_flow(self):
+        _, page = self._get("/?flow=not-a-real-token")
+        section = page[page.index('id="add-flow"'):]
+        self.assertIn("That step has expired", section[:section.index("</form>")])
+
+    def test_store_is_bounded(self):
+        tokens = [app.stash_flow("<p>{}</p>".format(i)) for i in range(app.FLOW_MAX + 5)]
+        self.assertIsNone(app.load_flow(tokens[0]))
+        self.assertEqual(app.load_flow(tokens[-1]), ("<p>{}</p>".format(app.FLOW_MAX + 4), ""))
 
 
 class WatchlistFilterTest(unittest.TestCase):

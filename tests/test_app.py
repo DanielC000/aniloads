@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 import unittest
 import zoneinfo
@@ -1980,9 +1981,19 @@ class RunMoveCycleTest(unittest.TestCase):
         app.ANI_JSON = self.ani_path
         self._write_ani([])
 
+        # Stuck-item state is module-global; isolate it per test so a "new"
+        # detection in one test doesn't look like a repeat in the next.
+        self._orig_stuck = dict(app._stuck_items)
+        app._stuck_items.clear()
+        self._orig_move_history_file = app.MOVE_HISTORY_FILE
+        app.MOVE_HISTORY_FILE = os.path.join(self.tmp, "move_history.json")
+
     def tearDown(self):
         for k, v in self._orig.items():
             setattr(app, k, v)
+        app._stuck_items.clear()
+        app._stuck_items.update(self._orig_stuck)
+        app.MOVE_HISTORY_FILE = self._orig_move_history_file
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _write_ani(self, anime):
@@ -2111,6 +2122,280 @@ class RunMoveCycleTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(
             os.path.join(self.media, "Naruto", "S01", "Naruto.S01E05.mkv")))
 
+    def test_subtitle_sidecar_moved_alongside_video_keeping_lang_suffix(self):
+        self._write_ani([{"name": "Naruto", "media_type": "series"}])
+        self._make_dl("Naruto.S01", ["Naruto.S01E05.mkv", "Naruto.S01E05.en.srt"])
+        app.run_move_cycle()
+        dest_dir = os.path.join(self.media, "Naruto", "S01")
+        self.assertTrue(os.path.isfile(os.path.join(dest_dir, "Naruto.S01E05.mkv")))
+        self.assertTrue(os.path.isfile(os.path.join(dest_dir, "Naruto.S01E05.en.srt")))
+
+    def test_subtitle_prefix_collision_not_wrongly_attached(self):
+        # "Show.S01E1" is a literal string-prefix of "Show.S01E10.en.srt"'s
+        # stem — the subtitle belongs to a (non-existent, in this fixture)
+        # E10 video, not E1, and must not be swept up by the prefix match.
+        self._write_ani([{"name": "Show", "media_type": "series"}])
+        self._make_dl("Show.S01", ["Show.S01E1.mkv", "Show.S01E10.en.srt"])
+        app.run_move_cycle()
+        dest_dir = os.path.join(self.media, "Show", "S01")
+        self.assertTrue(os.path.isfile(os.path.join(dest_dir, "Show.S01E1.mkv")))
+        self.assertFalse(os.path.isfile(os.path.join(dest_dir, "Show.S01E10.en.srt")))
+        # Left behind in the download dir — not claimed, and not junk either.
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.download, "Show.S01", "Show.S01E10.en.srt")))
+
+    def test_subtitle_sidecar_gets_same_episode_offset_rename_as_video(self):
+        self._write_ani([{"name": "Bleach", "media_type": "series", "episode_offset": 12}])
+        self._make_dl("Bleach.S01", ["Bleach.S01E05.mkv", "Bleach.S01E05.srt"])
+        app.run_move_cycle()
+        dest_dir = os.path.join(self.media, "Bleach", "S01")
+        self.assertTrue(os.path.isfile(os.path.join(dest_dir, "Bleach.S01E17.mkv")))
+        self.assertTrue(os.path.isfile(os.path.join(dest_dir, "Bleach.S01E17.srt")))
+
+    def test_junk_deleted_but_unknown_extension_kept(self):
+        self._write_ani([{"name": "Naruto", "media_type": "series"}])
+        self._make_dl("Naruto.S01", ["Naruto.S01E05.mkv", "Naruto.nfo", "Naruto.weird"])
+        app.run_move_cycle()
+        dl_dir = os.path.join(self.download, "Naruto.S01")
+        self.assertFalse(os.path.exists(os.path.join(dl_dir, "Naruto.nfo")))
+        self.assertTrue(os.path.isfile(os.path.join(dl_dir, "Naruto.weird")))
+        # An unrecognized leftover keeps the directory from being pruned too.
+        self.assertTrue(os.path.isdir(dl_dir))
+
+    def test_parse_failure_recorded_as_stuck_and_not_repeated(self):
+        self._write_ani([{"name": "Akira", "media_type": "series"}])
+        self._make_dl("Akira", ["Akira.Movie.1080p.mkv"])
+        events = app.run_move_cycle()
+        self.assertIn("error", self._types(events))
+        stuck = [v for v in app._stuck_items.values() if v["reason"] == "parse"]
+        self.assertEqual(len(stuck), 1)
+
+        # Second cycle: same unresolved file — no repeat event this time.
+        events2 = app.run_move_cycle()
+        self.assertEqual(events2, [])
+        self.assertTrue(os.path.isfile(os.path.join(self.download, "Akira", "Akira.Movie.1080p.mkv")))
+
+    def test_already_exists_stuck_delete_removes_only_the_download_copy(self):
+        self._write_ani([{"name": "Naruto", "media_type": "series"}])
+        dest_dir = os.path.join(self.media, "Naruto", "S01")
+        os.makedirs(dest_dir)
+        with open(os.path.join(dest_dir, "Naruto.S01E05.mkv"), "w") as f:
+            f.write("existing")
+        self._make_dl("Naruto.S01", ["Naruto.S01E05.mkv"])
+        events = app.run_move_cycle()
+        self.assertIn("skip", self._types(events))
+
+        stuck = [v for v in app._stuck_items.values() if v["reason"] == "exists"]
+        self.assertEqual(len(stuck), 1)
+        key = stuck[0]["key"]
+        dl_path = os.path.join(self.download, "Naruto.S01", "Naruto.S01E05.mkv")
+        self.assertTrue(os.path.isfile(dl_path))
+
+        result = app.stuck_delete_download(key)
+        self.assertIsNotNone(result)
+        self.assertFalse(result.startswith("error:"))
+        self.assertFalse(os.path.isfile(dl_path))
+        self.assertNotIn(key, app._stuck_items)
+        # The library copy is untouched.
+        with open(os.path.join(dest_dir, "Naruto.S01E05.mkv")) as f:
+            self.assertEqual(f.read(), "existing")
+
+    def test_unmatched_download_goes_stuck_instead_of_autocreating_folder(self):
+        self._write_ani([])
+        self._make_dl("Some.Anime.S01", ["Some.Anime.S01E01.mkv"])
+        events = app.run_move_cycle()
+        self.assertIn("error", self._types(events))
+        self.assertFalse(os.path.isdir(os.path.join(self.media, "Some Anime")))
+
+        stuck = [v for v in app._stuck_items.values() if v["reason"] == "unmatched"]
+        self.assertEqual(len(stuck), 1)
+        key = stuck[0]["key"]
+
+        msg = app.stuck_move_anyway(key)
+        self.assertIsNotNone(msg)
+        events2 = app.run_move_cycle()
+        self.assertIn("moved", self._types(events2))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.media, "Some Anime", "S01", "Some.Anime.S01E01.mkv")))
+        self.assertNotIn(key, app._stuck_items)
+
+    def test_unmatched_download_with_existing_library_folder_files_normally(self):
+        # No watchlist entry at all, but a folder for the parsed name already
+        # exists in the library (e.g. a show removed from the watchlist, or a
+        # manual JDownloader add of something already in Plex) — this must
+        # file normally, not go stuck, matching main's existing-folder lookup.
+        self._write_ani([])
+        os.makedirs(os.path.join(self.media, "Old Show"))
+        self._make_dl("Old.Show.S01", ["Old.Show.S01E01.mkv"])
+        events = app.run_move_cycle()
+        self.assertIn("moved", self._types(events))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.media, "Old Show", "S01", "Old.Show.S01E01.mkv")))
+        self.assertEqual(app._stuck_items, {})
+
+    def test_ignored_stuck_item_stops_repeating(self):
+        self._write_ani([{"name": "Akira", "media_type": "series"}])
+        self._make_dl("Akira", ["Akira.Movie.1080p.mkv"])
+        app.run_move_cycle()
+        key = next(iter(app._stuck_items))
+
+        msg = app.stuck_ignore(key)
+        self.assertIsNotNone(msg)
+        self.assertTrue(app._stuck_items[key]["ignored"])
+
+        events = app.run_move_cycle()
+        self.assertEqual(events, [])
+        # Still present (so it isn't rediscovered as "new"), just ignored.
+        self.assertIn(key, app._stuck_items)
+
+
+class MoveStatePersistenceTest(unittest.TestCase):
+    """save_move_state / load_move_state: atomic tmp+os.replace write, bounded
+    history, and stuck/ignored items surviving a simulated web restart."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-move-state-")
+        self._orig_file = app.MOVE_HISTORY_FILE
+        app.MOVE_HISTORY_FILE = os.path.join(self.tmp, "move_history.json")
+        self._orig_history = list(app._move_history)
+        self._orig_stuck = dict(app._stuck_items)
+        app._move_history.clear()
+        app._stuck_items.clear()
+
+    def tearDown(self):
+        app.MOVE_HISTORY_FILE = self._orig_file
+        app._move_history.clear()
+        app._move_history.extend(self._orig_history)
+        app._stuck_items.clear()
+        app._stuck_items.update(self._orig_stuck)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_save_then_load_round_trips_history_and_stuck(self):
+        for i in range(5):
+            app._move_history.append({"type": "moved", "msg": "m{}".format(i)})
+        app._stuck_items["k1"] = {
+            "key": "k1", "reason": "exists", "ignored": True, "msg": "x",
+            "path": "p", "dir": "d", "first_seen": "t", "last_seen": "t",
+        }
+        app.save_move_state()
+
+        self.assertTrue(os.path.isfile(app.MOVE_HISTORY_FILE))
+        # No leftover mkstemp tmp file (a fixed ".tmp" suffix used to be the
+        # collision risk; mkstemp's own name is collision-proof, but a failed
+        # cleanup after a write error would still leave one behind).
+        leftover = [f for f in os.listdir(self.tmp) if f != os.path.basename(app.MOVE_HISTORY_FILE)]
+        self.assertEqual(leftover, [])
+
+        loaded = app.load_move_state()
+        self.assertEqual(len(loaded["history"]), 5)
+        self.assertTrue(loaded["stuck"]["k1"]["ignored"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX file mode bits aren't meaningful on Windows")
+    def test_saved_file_mode_is_not_mkstemps_restrictive_default(self):
+        import stat
+        app.save_move_state()
+        mode = stat.S_IMODE(os.stat(app.MOVE_HISTORY_FILE).st_mode)
+        # mkstemp defaults to 0o600 (owner-only) — this file must be readable
+        # by the group/other bits too, since save_move_state fixes the mode
+        # up explicitly rather than leaving mkstemp's default in place.
+        self.assertEqual(mode, 0o644)
+
+    def test_concurrent_saves_do_not_corrupt_the_file(self):
+        app._stuck_items["k9"] = {
+            "key": "k9", "reason": "exists", "ignored": False, "msg": "x",
+            "path": "p", "dir": "d", "first_seen": "t", "last_seen": "t",
+        }
+        errors = []
+
+        def _save():
+            try:
+                for _ in range(10):
+                    app.save_move_state()
+            except Exception as e:  # pragma: no cover - surfaced via errors list
+                errors.append(e)
+
+        threads = [threading.Thread(target=_save) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        self.assertEqual(errors, [])
+        # The file must always be valid, complete JSON — never a partial or
+        # interleaved write from two concurrent savers.
+        loaded = app.load_move_state()
+        self.assertEqual(loaded["stuck"]["k9"]["reason"], "exists")
+
+    def test_history_persisted_is_bounded(self):
+        for i in range(app.MOVE_HISTORY_MAX + 20):
+            app._move_history.append({"type": "moved", "msg": "m{}".format(i)})
+        app.save_move_state()
+        loaded = app.load_move_state()
+        self.assertLessEqual(len(loaded["history"]), app.MOVE_HISTORY_MAX)
+
+    def test_load_missing_file_returns_empty(self):
+        self.assertEqual(app.load_move_state(), {})
+
+    def test_ignore_persists_across_simulated_restart(self):
+        app._stuck_items["k2"] = {
+            "key": "k2", "reason": "parse", "ignored": False, "msg": "y",
+            "path": "p2", "dir": "d2", "first_seen": "t", "last_seen": "t",
+        }
+        app.stuck_ignore("k2")
+        self.assertTrue(app._stuck_items["k2"]["ignored"])
+
+        # Simulate a web restart: drop in-memory state, reload from disk.
+        app._move_history.clear()
+        app._stuck_items.clear()
+        app._restore_move_state()
+
+        self.assertIn("k2", app._stuck_items)
+        self.assertTrue(app._stuck_items["k2"]["ignored"])
+
+
+class RenderMoveStuckTest(unittest.TestCase):
+    """render_move_stuck: reason-specific actions, and ignored items hidden."""
+
+    def setUp(self):
+        self._orig_stuck = dict(app._stuck_items)
+        app._stuck_items.clear()
+
+    def tearDown(self):
+        app._stuck_items.clear()
+        app._stuck_items.update(self._orig_stuck)
+
+    def test_no_stuck_items_shows_empty_state(self):
+        self.assertIn("No stuck downloads", app.render_move_stuck())
+
+    def test_exists_reason_offers_delete_action(self):
+        app._stuck_items["k1"] = {
+            "key": "k1", "reason": "exists", "ignored": False,
+            "msg": "Show.S01E01.mkv — already exists", "path": "d/Show.S01E01.mkv",
+            "dir": "d", "first_seen": "t", "last_seen": "t",
+        }
+        html_out = app.render_move_stuck()
+        self.assertIn("/move-stuck-delete", html_out)
+        self.assertIn("/move-stuck-ignore", html_out)
+        self.assertNotIn("/move-stuck-anyway", html_out)
+
+    def test_unmatched_reason_offers_move_anyway_action(self):
+        app._stuck_items["k2"] = {
+            "key": "k2", "reason": "unmatched", "ignored": False,
+            "msg": "no watchlist match", "path": "d/Show.S01E01.mkv",
+            "dir": "d", "first_seen": "t", "last_seen": "t",
+        }
+        html_out = app.render_move_stuck()
+        self.assertIn("/move-stuck-anyway", html_out)
+        self.assertNotIn("/move-stuck-delete", html_out)
+
+    def test_ignored_items_are_hidden(self):
+        app._stuck_items["k3"] = {
+            "key": "k3", "reason": "parse", "ignored": True,
+            "msg": "hidden", "path": "d/x.mkv", "dir": "d",
+            "first_seen": "t", "last_seen": "t",
+        }
+        self.assertIn("No stuck downloads", app.render_move_stuck())
+
 
 class HandlerPostRoutingTest(unittest.TestCase):
     """Light do_POST integration coverage for the non-network routes, using the
@@ -2122,6 +2407,12 @@ class HandlerPostRoutingTest(unittest.TestCase):
         self._orig_prefs = app.PREFS_FILE
         app.PREFS_FILE = self._prefs
 
+        self._tmp = tempfile.mkdtemp(prefix="aniloads-post-")
+        self._orig_move_history_file = app.MOVE_HISTORY_FILE
+        app.MOVE_HISTORY_FILE = os.path.join(self._tmp, "move_history.json")
+        self._orig_stuck = dict(app._stuck_items)
+        app._stuck_items.clear()
+
     def tearDown(self):
         app.PREFS_FILE = self._orig_prefs
         try:
@@ -2129,6 +2420,10 @@ class HandlerPostRoutingTest(unittest.TestCase):
         except OSError:
             pass
         app._move_trigger.clear()
+        app.MOVE_HISTORY_FILE = self._orig_move_history_file
+        app._stuck_items.clear()
+        app._stuck_items.update(self._orig_stuck)
+        shutil.rmtree(self._tmp, ignore_errors=True)
 
     def _post(self, path, params):
         captured = {}
@@ -2168,6 +2463,59 @@ class HandlerPostRoutingTest(unittest.TestCase):
     def test_search_empty_query_errors(self):
         result = self._post("/search", {"q": "  "})
         self.assertTrue(result["msg"].startswith("Error: Empty search"))
+
+    def test_move_stuck_ignore_marks_item_and_redirects(self):
+        app._stuck_items["k1"] = {
+            "key": "k1", "reason": "parse", "ignored": False, "msg": "boom",
+            "path": "d/x.mkv", "dir": "d", "first_seen": "t", "last_seen": "t",
+        }
+        result = self._post("/move-stuck-ignore", {"key": "k1"})
+        self.assertEqual(result["msg"], "Ignoring: boom")
+        self.assertTrue(app._stuck_items["k1"]["ignored"])
+
+    def test_move_stuck_ignore_missing_key_errors(self):
+        result = self._post("/move-stuck-ignore", {"key": "nope"})
+        self.assertEqual(result["msg"], "Error: stuck item not found")
+
+    def test_move_stuck_delete_removes_download_copy(self):
+        dl_dir = os.path.join(self._tmp, "downloads", "d")
+        os.makedirs(dl_dir)
+        dl_file = os.path.join(dl_dir, "x.mkv")
+        with open(dl_file, "w") as f:
+            f.write("x")
+        self._orig_dl = app.DOWNLOAD_DIR
+        app.DOWNLOAD_DIR = os.path.join(self._tmp, "downloads")
+        try:
+            app._stuck_items["k2"] = {
+                "key": "k2", "reason": "exists", "ignored": False, "msg": "x.mkv exists",
+                "path": "d/x.mkv", "dir": "d", "first_seen": "t", "last_seen": "t",
+            }
+            result = self._post("/move-stuck-delete", {"key": "k2"})
+            self.assertEqual(result["msg"], "Deleted download copy: x.mkv exists")
+            self.assertFalse(os.path.isfile(dl_file))
+            self.assertNotIn("k2", app._stuck_items)
+        finally:
+            app.DOWNLOAD_DIR = self._orig_dl
+
+    def test_move_stuck_delete_wrong_reason_errors(self):
+        app._stuck_items["k3"] = {
+            "key": "k3", "reason": "parse", "ignored": False, "msg": "boom",
+            "path": "d/x.mkv", "dir": "d", "first_seen": "t", "last_seen": "t",
+        }
+        result = self._post("/move-stuck-delete", {"key": "k3"})
+        self.assertEqual(result["msg"], "Error: stuck item not found")
+        self.assertIn("k3", app._stuck_items)
+
+    def test_move_stuck_anyway_flags_item_and_triggers_cycle(self):
+        app._move_trigger.clear()
+        app._stuck_items["k4"] = {
+            "key": "k4", "reason": "unmatched", "ignored": False, "msg": "no match",
+            "path": "d/x.mkv", "dir": "d", "first_seen": "t", "last_seen": "t",
+        }
+        result = self._post("/move-stuck-anyway", {"key": "k4"})
+        self.assertEqual(result["msg"], "Will move on next cycle: no match")
+        self.assertTrue(app._stuck_items["k4"]["move_anyway"])
+        self.assertTrue(app._move_trigger.is_set())
 
 
 class HandlerGetMsgBannerTest(unittest.TestCase):

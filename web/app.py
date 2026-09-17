@@ -14,6 +14,7 @@ import shutil
 import socket
 import struct
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -50,6 +51,7 @@ CONFIG_DIR = os.environ.get("CONFIG_DIR", "/config")
 ANI_JSON = os.path.join(CONFIG_DIR, "ani.json")
 PREFS_FILE = os.path.join(CONFIG_DIR, "web-prefs.json")
 RUN_STATE_FILE = os.path.join(CONFIG_DIR, "run_state.json")
+MOVE_HISTORY_FILE = os.path.join(CONFIG_DIR, "move_history.json")
 PORT = int(os.environ.get("PORT", "8080"))
 BOT_CONTAINER = os.environ.get("BOT_CONTAINER", "anime-loads")
 DOCKER_SOCK = "/var/run/docker.sock"
@@ -172,11 +174,80 @@ class DockerAPI:
 docker = DockerAPI()
 
 # Move-completed state (thread-safe)
+MOVE_HISTORY_MAX = 100
+STUCK_ITEMS_MAX = 200
+
 _move_lock = threading.Lock()
-_move_history = collections.deque(maxlen=100)
+_move_history = collections.deque(maxlen=MOVE_HISTORY_MAX)
 _move_last_run = None
 _move_running = False
 _move_trigger = threading.Event()
+# Serializes save_move_state's tmp-write + replace — called from both the
+# mover worker thread and POST handlers, so two concurrent saves must not
+# race on the same tmp path (the dashboard is moving to a threading server).
+_move_state_write_lock = threading.Lock()
+# Downloads the mover can't resolve on its own (parse failure, already-exists,
+# no watchlist match) keyed by a path+reason string — see _stuck_key. Persisted
+# alongside history so "Ignore" and history both survive a web restart.
+_stuck_items = {}
+
+
+def load_move_state():
+    """Read the persisted move history + stuck/ignored items. Returns {} when
+    absent or unreadable, so callers fall back to the empty in-memory state."""
+    try:
+        with open(MOVE_HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    # ValueError also covers UnicodeDecodeError (a corrupt/non-UTF-8 file);
+    # see load_run_state's comment for why this is a deliberate widening.
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_move_state():
+    """Persist move history + stuck/ignored items atomically (tmp + os.replace)
+    so a web restart doesn't lose them (history was previously an in-memory
+    deque only) and a crash mid-write can't corrupt the file.
+
+    Called from both the mover worker thread and POST handlers, so the
+    tmp-write + replace is serialized by its own lock (a fixed tmp path shared
+    across concurrent callers could otherwise interleave). Uses mkstemp for a
+    collision-proof tmp name in the same directory (so os.replace stays an
+    atomic rename on the same filesystem), with its mode fixed to 0o644 since
+    mkstemp defaults to the more restrictive 0o600.
+    """
+    with _move_lock:
+        payload = {
+            "history": list(_move_history)[-MOVE_HISTORY_MAX:],
+            "stuck": dict(list(_stuck_items.items())[-STUCK_ITEMS_MAX:]),
+        }
+    with _move_state_write_lock:
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=os.path.dirname(MOVE_HISTORY_FILE) or ".", prefix=".move_history-")
+            os.chmod(tmp_path, 0o644)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+            os.replace(tmp_path, MOVE_HISTORY_FILE)
+        except OSError as e:
+            _log.error("[mover] Failed to persist move history: %s", e)
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+
+def _restore_move_state():
+    state = load_move_state()
+    for ev in state.get("history", [])[-MOVE_HISTORY_MAX:]:
+        _move_history.append(ev)
+    _stuck_items.update(state.get("stuck") or {})
+
+
+_restore_move_state()
 
 
 # ---------------------------------------------------------------------------
@@ -817,6 +888,13 @@ def get_releases(url):
 _SEASON_EP_RE = re.compile(r'(.*?)[._][Ss](\d+)[Ee](\d+)')
 _VIDEO_EXTS = {'.mkv', '.mp4', '.avi'}
 _ARCHIVE_RE = re.compile(r'\.(rar|r\d\d)$')
+# External subtitle sidecars: moved alongside their video, never deleted.
+_SUBTITLE_EXTS = {'.srt', '.ass', '.ssa', '.sup', '.vtt'}
+# Known-junk leftovers safe to delete after a move (release nfo/readme,
+# NZB/torrent leftovers, poster thumbnails). Archives are handled separately,
+# earlier in the cycle. Anything else (an unrecognized extension) is left in
+# place rather than guessed at.
+_JUNK_EXTS = {'.nfo', '.txt', '.url', '.jpg', '.jpeg', '.png'}
 
 
 def parse_season_episode(filename):
@@ -844,6 +922,7 @@ def _entry_to_match(entry, folder_name):
         "media_type": entry.get("media_type", "series"),
         "year": entry.get("year"),
         "display_title": entry.get("display_title") or entry.get("name", ""),
+        "matched": True,
     }
 
 
@@ -915,6 +994,7 @@ def match_anime_entry(parsed_name, dir_basename, anime_list, parsed_season=None)
         "media_type": "series",
         "year": None,
         "display_title": parsed_name,
+        "matched": False,
     }
 
 
@@ -981,6 +1061,140 @@ def _find_files(directory, predicate):
     return results
 
 
+def _stuck_key(rel_path, reason):
+    return "{}::{}".format(rel_path, reason)
+
+
+def _stuck_touch(rel_path, reason, entry_name, msg):
+    """Record (or refresh) a stuck item, keyed by its path under DOWNLOAD_DIR
+    and the reason it's stuck. Returns (is_new, ignored, move_anyway) —
+    move_anyway is a one-shot flag consumed here, so clicking "Move anyway"
+    only applies to the very next cycle."""
+    key = _stuck_key(rel_path, reason)
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    with _move_lock:
+        rec = _stuck_items.get(key)
+        is_new = rec is None
+        if is_new:
+            rec = {
+                "key": key,
+                "reason": reason,
+                "dir": entry_name,
+                "path": rel_path,
+                "ignored": False,
+                "first_seen": now_iso,
+            }
+            _stuck_items[key] = rec
+        rec["msg"] = msg
+        rec["last_seen"] = now_iso
+        move_anyway = rec.pop("move_anyway", False)
+        ignored = rec.get("ignored", False)
+    return is_new, ignored, move_anyway
+
+
+def _stuck_resolve(rel_path, reason):
+    """Drop a stuck record once it's been resolved by the mover itself
+    (e.g. a "Move anyway" that succeeded)."""
+    key = _stuck_key(rel_path, reason)
+    with _move_lock:
+        _stuck_items.pop(key, None)
+
+
+def _prune_stuck_items():
+    """Drop stuck records whose file no longer exists under DOWNLOAD_DIR —
+    resolved some other way (a manual delete, a renamed file)."""
+    with _move_lock:
+        stale = [k for k, rec in _stuck_items.items()
+                 if not os.path.exists(os.path.join(DOWNLOAD_DIR, rec["path"]))]
+        for k in stale:
+            del _stuck_items[k]
+
+
+def _safe_download_path(rel_path):
+    """Resolve a stuck item's stored relative path to an absolute path,
+    refusing to return anything outside DOWNLOAD_DIR (defense in depth: the
+    path is one this process computed itself via os.path.relpath, but any
+    web action that deletes a file confirms containment first)."""
+    root = os.path.realpath(DOWNLOAD_DIR)
+    candidate = os.path.realpath(os.path.join(DOWNLOAD_DIR, rel_path))
+    if candidate != root and not candidate.startswith(root + os.sep):
+        return None
+    return candidate
+
+
+def stuck_ignore(key):
+    """Mark a stuck item ignored: it stops being surfaced/re-logged each
+    cycle, but the file itself is left untouched in the download dir."""
+    with _move_lock:
+        rec = _stuck_items.get(key)
+        if rec is None:
+            return None
+        rec["ignored"] = True
+        msg = rec.get("msg", key)
+    save_move_state()
+    return msg
+
+
+def stuck_delete_download(key):
+    """Delete the downloaded copy behind an 'already exists' stuck item.
+    Refuses anything not confined to DOWNLOAD_DIR, and any reason other than
+    'exists' (this is a destructive action, not a general-purpose delete)."""
+    with _move_lock:
+        rec = _stuck_items.get(key)
+    if rec is None or rec.get("reason") != "exists":
+        return None
+    path = _safe_download_path(rec["path"])
+    if path is None:
+        return None
+    try:
+        os.unlink(path)
+    except OSError as e:
+        return "error:{}".format(e)
+    with _move_lock:
+        _stuck_items.pop(key, None)
+    save_move_state()
+    return rec.get("msg", key)
+
+
+def stuck_move_anyway(key):
+    """Flag an 'unmatched' stuck item so the next move cycle moves it using
+    the parsed (auto-created folder) name instead of skipping it."""
+    with _move_lock:
+        rec = _stuck_items.get(key)
+        if rec is None or rec.get("reason") != "unmatched":
+            return None
+        rec["move_anyway"] = True
+        msg = rec.get("msg", key)
+    save_move_state()
+    _move_trigger.set()
+    return msg
+
+
+def _move_subtitles(dir_path, video_stem, target_dir, new_stem):
+    """Move subtitle sidecars sharing the video's base filename alongside it
+    in target_dir, keeping any language suffix (e.g. '.en') and applying the
+    same rename the video itself just got."""
+    stem_lower = video_stem.lower()
+    for sub_path in _find_files(dir_path, lambda f: os.path.splitext(f)[1].lower() in _SUBTITLE_EXTS):
+        sub_name = os.path.basename(sub_path)
+        sub_stem, ext = os.path.splitext(sub_name)
+        if not sub_stem.lower().startswith(stem_lower):
+            continue
+        # The stem match must land on a whole-name boundary — otherwise
+        # "Show.S01E1" (a prefix of "Show.S01E10") would wrongly claim
+        # "Show.S01E10.en.srt" as its own subtitle.
+        suffix = sub_stem[len(video_stem):]
+        if suffix and not suffix.startswith('.'):
+            continue
+        dest_path = os.path.join(target_dir, new_stem + suffix + ext)
+        if os.path.exists(dest_path):
+            continue
+        try:
+            shutil.move(sub_path, dest_path)
+        except OSError:
+            pass
+
+
 def run_move_cycle():
     """Scan download directory and move completed anime to media library.
 
@@ -990,6 +1204,8 @@ def run_move_cycle():
 
     if not os.path.isdir(DOWNLOAD_DIR):
         return events
+
+    _prune_stuck_items()
 
     anime_list = _lookup_anime_entries()
     now = time.time()
@@ -1063,23 +1279,36 @@ def run_move_cycle():
                 else:
                     dest_name = src_name
                 target_path = os.path.join(target_dir, dest_name)
+                rel_path = os.path.relpath(filepath, DOWNLOAD_DIR)
                 if os.path.exists(target_path):
-                    events.append({"type": "skip", "msg": "{} \u2014 already exists".format(dest_name)})
+                    msg = "{} \u2014 already exists".format(dest_name)
+                    is_new, ignored, _ = _stuck_touch(rel_path, "exists", entry_name, msg)
+                    if is_new and not ignored:
+                        events.append({"type": "skip", "msg": msg})
                     continue
                 try:
                     os.makedirs(target_dir, exist_ok=True)
                     shutil.move(filepath, target_path)
+                    video_stem = os.path.splitext(src_name)[0]
+                    new_stem = os.path.splitext(dest_name)[0]
+                    _move_subtitles(dir_path, video_stem, target_dir, new_stem)
                     events.append({"type": "moved", "msg": "{} \u2192 {}/{}".format(src_name, movie_folder, dest_name)})
+                    _stuck_resolve(rel_path, "exists")
                 except Exception as e:
                     events.append({"type": "error", "msg": "Failed to move {}: {}".format(src_name, e)})
 
         else:
             # --- Series path: parse SxxExx per video and route into AnimeName/SXX/ ---
             for filepath in video_files:
-                filename = os.path.basename(filepath)
+                orig_filename = os.path.basename(filepath)
+                filename = orig_filename
+                rel_path = os.path.relpath(filepath, DOWNLOAD_DIR)
                 parsed = parse_season_episode(filename)
                 if not parsed:
-                    events.append({"type": "error", "msg": "Cannot parse season/episode: {}".format(filename)})
+                    msg = "Cannot parse season/episode: {}".format(filename)
+                    is_new, ignored, _ = _stuck_touch(rel_path, "parse", entry_name, msg)
+                    if is_new and not ignored:
+                        events.append({"type": "error", "msg": msg})
                     continue
 
                 name_part, season, episode = parsed
@@ -1091,12 +1320,26 @@ def run_move_cycle():
                 # Pass parsed season so multiple entries sharing one generic dir prefix
                 # (e.g. S01/S02/S03 of the same show) are tiebroken by tvdb_season.
                 match = match_anime_entry(parsed_name, entry_name, anime_list, parsed_season=season)
-                anime_name = match["folder_name"]
 
-                # Check for existing folder in media library (case-insensitive)
-                existing = find_existing_media_folder(anime_name)
-                if existing:
-                    anime_name = existing
+                # Check for existing folder in media library (case-insensitive).
+                # An unmatched download whose parsed name already has a folder
+                # in the library (a show removed from the watchlist, a manual
+                # JDownloader add of something already in Plex) still files
+                # normally — the stuck/unmatched path is only for a download
+                # that would otherwise SILENTLY CREATE a brand-new folder.
+                existing = find_existing_media_folder(match["folder_name"])
+
+                move_anyway = False
+                if not match.get("matched", True) and not existing:
+                    msg = "{} — no watchlist match (would create '{}')".format(
+                        filename, match["folder_name"])
+                    is_new, ignored, move_anyway = _stuck_touch(rel_path, "unmatched", entry_name, msg)
+                    if not move_anyway:
+                        if is_new and not ignored:
+                            events.append({"type": "error", "msg": msg})
+                        continue
+
+                anime_name = existing or match["folder_name"]
 
                 # TVDB season override
                 if match["tvdb_season"] is not None:
@@ -1117,22 +1360,32 @@ def run_move_cycle():
                 target_path = os.path.join(target_dir, filename)
 
                 if os.path.exists(target_path):
-                    events.append({"type": "skip", "msg": "{} \u2014 already exists".format(filename)})
+                    msg = "{} \u2014 already exists".format(filename)
+                    is_new, ignored, _ = _stuck_touch(rel_path, "exists", entry_name, msg)
+                    if is_new and not ignored:
+                        events.append({"type": "skip", "msg": msg})
                     continue
 
                 try:
                     os.makedirs(target_dir, exist_ok=True)
                     shutil.move(filepath, target_path)
+                    video_stem = os.path.splitext(orig_filename)[0]
+                    new_stem = os.path.splitext(filename)[0]
+                    _move_subtitles(dir_path, video_stem, target_dir, new_stem)
                     dest_short = "{}/{}".format(anime_name, season_dir)
                     events.append({"type": "moved", "msg": "{} \u2192 {}".format(filename, dest_short)})
+                    _stuck_resolve(rel_path, "exists")
+                    _stuck_resolve(rel_path, "unmatched")
                 except Exception as e:
                     events.append({"type": "error", "msg": "Failed to move {}: {}".format(filename, e)})
 
         # --- Cleanup download directory ---
-        # Remove leftover non-video files
+        # Delete only known junk (release nfo/readme, thumbnails, ...); leave
+        # subtitles (already moved above, if matched) and any unrecognized
+        # extension in place rather than destroying something we don't know.
         for root, _dirs, files in os.walk(dir_path):
             for f in files:
-                if os.path.splitext(f)[1].lower() not in _VIDEO_EXTS:
+                if os.path.splitext(f)[1].lower() in _JUNK_EXTS:
                     try:
                         os.unlink(os.path.join(root, f))
                     except OSError:
@@ -1401,6 +1654,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
     </div>
   </div>
+  <details open>
+    <summary>Stuck Downloads</summary>
+    <div class="card" id="move-stuck">
+      %%MOVE_STUCK%%
+    </div>
+  </details>
   <details>
     <summary>Move History</summary>
     <div class="card" id="move-history">
@@ -1492,7 +1751,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <script>
 (function() {
   var ids = ['bot-status','last-run','next-run','run-history',
-             'move-status','move-last-run','move-history'];
+             'move-status','move-last-run','move-history','move-stuck'];
   function refresh() {
     fetch('/api/status')
       .then(function(r) { return r.json(); })
@@ -2011,6 +2270,68 @@ def render_move_history(max_entries=30):
     return html
 
 
+_STUCK_REASON_LABELS = {
+    "parse": "Can't parse season/episode",
+    "exists": "Already exists in library",
+    "unmatched": "No watchlist match",
+}
+
+
+def render_move_stuck():
+    """Render the stuck-downloads list: parse failures, already-exists
+    conflicts, and unmatched downloads the mover won't touch again on its
+    own until a user picks an action."""
+    with _move_lock:
+        items = [dict(v) for v in _stuck_items.values() if not v.get("ignored")]
+
+    if not items:
+        return '<div class="empty">No stuck downloads</div>'
+
+    items.sort(key=lambda r: r.get("first_seen", ""))
+
+    html = ""
+    for rec in items:
+        key = rec.get("key", "")
+        reason = rec.get("reason", "")
+        label = _STUCK_REASON_LABELS.get(reason, "Stuck")
+        msg = rec.get("msg", "")
+        key_input = '<input type="hidden" name="key" value="{}">'.format(escape(key))
+
+        actions = """
+              <form method="POST" action="/move-stuck-ignore" style="display:inline;margin:0;">
+                {key_input}
+                <button type="submit" class="btn btn-sm">Ignore</button>
+              </form>""".format(key_input=key_input)
+
+        if reason == "exists":
+            delete_confirm = confirm_attr(
+                "Delete the downloaded copy of {}? This cannot be undone.".format(rec.get("path", "")))
+            actions += """
+              <form method="POST" action="/move-stuck-delete" style="display:inline;margin:0;">
+                {key_input}
+                <button type="submit" class="btn btn-danger btn-sm" onclick="{confirm}">Delete download copy</button>
+              </form>""".format(key_input=key_input, confirm=delete_confirm)
+        elif reason == "unmatched":
+            actions += """
+              <form method="POST" action="/move-stuck-anyway" style="display:inline;margin:0;">
+                {key_input}
+                <button type="submit" class="btn btn-warning btn-sm">Move anyway</button>
+              </form>""".format(key_input=key_input)
+
+        html += """
+        <div class="card card-accent">
+          <div style="display:flex;justify-content:space-between;align-items:start;gap:12px;">
+            <div>
+              <div class="anime-name">{label}</div>
+              <div class="anime-meta">{msg}</div>
+            </div>
+            <div>{actions}</div>
+          </div>
+        </div>""".format(label=escape(label), msg=escape(msg), actions=actions)
+
+    return html
+
+
 def confirm_attr(message):
     """Build a safe ``onclick="return confirm(...)"`` attribute value.
 
@@ -2515,6 +2836,7 @@ def render_page(status="", search_html="", prefs_open=False, ani_data=None):
 
     move_status_html, move_last_html = render_move_status()
     move_history_html = render_move_history()
+    move_stuck_html = render_move_stuck()
 
     lang_names = {"german": "German", "japanese": "Japanese", "english": "English", "any": "Any"}
     audio_pref = prefs.get("audio_language", "german")
@@ -2531,6 +2853,7 @@ def render_page(status="", search_html="", prefs_open=False, ani_data=None):
     page = page.replace("%%MOVE_STATUS%%", move_status_html)
     page = page.replace("%%MOVE_LAST_RUN%%", move_last_html)
     page = page.replace("%%MOVE_HISTORY%%", move_history_html)
+    page = page.replace("%%MOVE_STUCK%%", move_stuck_html)
     page = page.replace("%%SEARCH_RESULTS%%", search_html)
     page = page.replace("%%WATCHLIST%%", render_watchlist(anime_list, pending_list))
     page = page.replace("%%COUNT%%", str(total))
@@ -2601,6 +2924,7 @@ class Handler(BaseHTTPRequestHandler):
                 activity["runs"], activity.get("run_state", {}).get("runs"))
             move_status_html, move_last_html = render_move_status()
             move_history_html = render_move_history()
+            move_stuck_html = render_move_stuck()
             payload = json.dumps({
                 "bot_status": bot_status_html,
                 "last_run": last_run_html,
@@ -2609,6 +2933,7 @@ class Handler(BaseHTTPRequestHandler):
                 "move_status": move_status_html,
                 "move_last_run": move_last_html,
                 "move_history": move_history_html,
+                "move_stuck": move_stuck_html,
                 "bot_running": activity["status"].get("running", False),
             })
             self.send_response(200)
@@ -2661,6 +2986,35 @@ class Handler(BaseHTTPRequestHandler):
             _log.info("[mover] Move Now triggered via dashboard")
             _move_trigger.set()
             self._redirect_msg("Move cycle triggered")
+
+        elif parsed.path == "/move-stuck-ignore":
+            key = params.get("key", "")
+            msg = stuck_ignore(key)
+            if msg is not None:
+                _log.info("[mover] Ignoring stuck item: %s", msg)
+                self._redirect_msg("Ignoring: {}".format(msg))
+            else:
+                self._redirect_msg("Error: stuck item not found")
+
+        elif parsed.path == "/move-stuck-delete":
+            key = params.get("key", "")
+            result = stuck_delete_download(key)
+            if result is None:
+                self._redirect_msg("Error: stuck item not found")
+            elif result.startswith("error:"):
+                self._redirect_msg("Error: {}".format(result[len("error:"):]))
+            else:
+                _log.info("[mover] Deleted downloaded copy: %s", result)
+                self._redirect_msg("Deleted download copy: {}".format(result))
+
+        elif parsed.path == "/move-stuck-anyway":
+            key = params.get("key", "")
+            msg = stuck_move_anyway(key)
+            if msg is not None:
+                _log.info("[mover] Will move anyway on next cycle: %s", msg)
+                self._redirect_msg("Will move on next cycle: {}".format(msg))
+            else:
+                self._redirect_msg("Error: stuck item not found")
 
         elif parsed.path == "/save-prefs":
             prefs = {
@@ -3225,6 +3579,7 @@ def move_completed_worker():
                     _move_history.append(ev)
                 _move_last_run = datetime.now(timezone.utc)
             _move_running = False
+            save_move_state()
 
             if events:
                 counts = {"moved": 0, "error": 0, "skip": 0, "wait": 0, "cleanup": 0}

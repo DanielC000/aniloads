@@ -1358,6 +1358,78 @@ def _resolve_release_selection(url, params):
     return "", resolved_media_type, 0
 
 
+def normalize_anime_url(url):
+    """Comparison key for an anime-loads URL, used only for duplicate checks
+    (the entry keeps the URL exactly as submitted).
+
+    Folds the variants that point at the same show: scheme and host case,
+    http vs https, a leading ``www.``, and a trailing slash. The path itself
+    stays case-sensitive and the query string is kept."""
+    raw = (url or "").strip()
+    try:
+        p = urlparse(raw)
+        port = p.port
+    except ValueError:
+        return raw
+    host = (p.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    scheme = p.scheme.lower()
+    if scheme == "http":
+        scheme = "https"
+    return "{}://{}{}{}{}".format(
+        scheme, host, ":{}".format(port) if port else "",
+        p.path.rstrip("/"), "?" + p.query if p.query else "")
+
+
+def find_duplicate_entry(data, url):
+    """First entry in ``anime`` or ``pending`` whose URL normalizes to the
+    same key as ``url`` (see normalize_anime_url), else None."""
+    key = normalize_anime_url(url)
+    if not key:
+        return None
+    for entry in data.get("anime", []) + data.get("pending", []):
+        if normalize_anime_url(entry.get("url", "")) == key:
+            return entry
+    return None
+
+
+def _duplicate_msg(entry):
+    return "Already in watchlist: {}".format(
+        entry.get("name") or entry.get("url") or "?")
+
+
+def suggest_tvdb_season(seasons, ep_count):
+    """Season number whose episode count is closest to ``ep_count``, or None.
+
+    Season 0 (TVDB specials) is only a candidate when it is the only season
+    listed. When two or more seasons are equally close there is no honest
+    "likely match", so this returns None rather than picking one silently."""
+    if not ep_count or not seasons:
+        return None
+    candidates = [s for s in seasons if s.get("season_number") != 0] or list(seasons)
+    best, best_diff, tied = None, None, False
+    for s in candidates:
+        try:
+            diff = abs(int(s.get("episode_count") or 0) - ep_count)
+        except (ValueError, TypeError):
+            continue
+        if best_diff is None or diff < best_diff:
+            best, best_diff, tied = s.get("season_number"), diff, False
+        elif diff == best_diff:
+            tied = True
+    return None if tied else best
+
+
+def _parse_year(raw):
+    """A posted/scraped release year, or None unless it's a plausible one."""
+    try:
+        year = int(raw)
+    except (ValueError, TypeError):
+        return None
+    return year if 1900 <= year <= 2100 else None
+
+
 # ---------------------------------------------------------------------------
 # Move-completed logic
 # ---------------------------------------------------------------------------
@@ -2082,6 +2154,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .badge-danger, .badge-retry { background: var(--danger-bg); color: var(--danger-text); }
   .badge-accent, .badge-auto { background: var(--accent-soft-bg); color: var(--accent-soft-text); }
 
+  /* Add-anime flow: step indicator + Cancel above each step's heading */
+  .flow-head { display: flex; justify-content: space-between; align-items: center; gap: var(--s3); flex-wrap: wrap; margin: var(--s5) 0 var(--s3); }
+  .flow-head + h2 { margin-top: 0; }
+  .steps { list-style: none; display: flex; align-items: center; flex-wrap: wrap; gap: var(--s2); font-size: var(--fs-xs); color: var(--text-faint); }
+  .step { display: inline-flex; align-items: center; gap: 6px; }
+  .step + .step::before { content: ""; width: 20px; height: 1px; background: var(--border-light); margin-right: var(--s1); }
+  .step-num { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; border: 1px solid var(--border-light); font-size: 0.7rem; font-weight: 600; }
+  .step-done { color: var(--text-muted); }
+  .step-done .step-num { background: var(--accent-soft-bg); border-color: transparent; color: var(--accent-soft-text); }
+  .step-current { color: var(--text-heading); font-weight: 600; }
+  .step-current .step-num { background: var(--accent-bg); border-color: var(--accent-bg); color: #fff; }
+  .flow-note { margin: var(--s2) 0 0; }
+  .flow-actions { display: flex; gap: var(--s2); flex-wrap: wrap; margin: var(--s3) 0 var(--s4); }
+  .flow-actions form { margin: 0; }
+
   .release-row { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; padding: var(--s2) 0; border-bottom: 1px solid var(--border); }
   .release-row:last-child { border-bottom: none; }
   .status-msg { padding: var(--s3); border-radius: var(--radius-sm); margin-bottom: var(--s4); }
@@ -2325,7 +2412,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <form method="POST" action="/search" onsubmit="return scrapeBusy(this, 'Searching… this can take up to a minute');">
       <label class="hint">Or search by name:</label>
       <div class="form-row" style="margin-top:6px;">
-        <input type="text" name="q" placeholder="Search anime..." required>
+        <input type="text" name="q" value="%%SEARCH_QUERY%%" placeholder="Search anime..." aria-label="Search anime by name" required>
         <button type="submit" class="btn btn-primary">Search anime</button>
       </div>
     </form>
@@ -3218,9 +3305,43 @@ def render_watchlist(anime_list, pending_list=None):
     return html
 
 
-def render_search_results(results):
+_ADD_STEPS = ("Release", "TVDB", "Save")
+
+
+def render_add_flow_head(current, anime_name, with_tvdb=True):
+    """Step indicator (Release -> TVDB -> Save) plus a Cancel link for the
+    add-anime flow. Nothing is written until the Save step, so Cancel is a
+    plain link home that says so. ``with_tvdb`` drops the TVDB step when no
+    TVDB client is configured, since that step then never appears."""
+    steps = [s for s in _ADD_STEPS if with_tvdb or s != "TVDB"]
+    current_idx = steps.index(current) if current in steps else 0
+    items = ""
+    for i, label in enumerate(steps):
+        if i < current_idx:
+            state, aria = "done", ""
+        elif i == current_idx:
+            state, aria = "current", ' aria-current="step"'
+        else:
+            state, aria = "todo", ""
+        items += '<li class="step step-{}"{}><span class="step-num">{}</span>{}</li>'.format(
+            state, aria, i + 1, label)
+    cancel_href = "/?" + urlencode({"msg": "Cancelled: {} was not added".format(anime_name)})
+    return (
+        '<div class="flow-head">'
+        '<ol class="steps" aria-label="Add anime progress">{}</ol>'
+        '<a class="btn btn-ghost btn-sm" href="{}">Cancel</a>'
+        '</div>'
+    ).format(items, escape(cancel_href))
+
+
+def render_search_results(results, ani_data=None):
+    """Search hits, each tagged "In watchlist" / "Pending" when its URL
+    (normalized, see normalize_anime_url) is already tracked. Those get no
+    Add button, since /add-url would only refuse them."""
     if not results:
         return ""
+    data = ani_data or {}
+    pending_list = data.get("pending", [])
     html = '<div class="section"><h2>Search Results</h2>'
     for r in results:
         lang_bits = []
@@ -3232,36 +3353,55 @@ def render_search_results(results):
 
         fields = {k: escape(str(v)) for k, v in r.items()}
         fields["lang_line"] = lang_line
+
+        existing = find_duplicate_entry(data, r.get("url", ""))
+        if existing is None:
+            fields["tag"] = ""
+            fields["action"] = """
+            <form method="POST" action="/add-url" style="margin:0;" onsubmit="return scrapeBusy(this, 'Fetching releases…');">
+              <input type="hidden" name="url" value="{url}">
+              <button type="submit" class="btn btn-primary btn-sm">Add to watchlist</button>
+            </form>""".format(url=fields["url"])
+        elif any(existing is p for p in pending_list):
+            fields["tag"] = ' <span class="badge badge-accent">Pending</span>'
+            fields["action"] = ""
+        else:
+            fields["tag"] = ' <span class="badge badge-ok">In watchlist</span>'
+            fields["action"] = ""
         html += """
         <div class="card">
           <div style="display:flex;justify-content:space-between;align-items:start;gap:12px;">
             <div>
-              <div class="anime-name">{name}</div>
+              <div class="anime-name">{name}{tag}</div>
               <div class="anime-meta">{type} &middot; {episodes} episodes &middot; {genre}</div>
               {lang_line}
               <div class="anime-url">{url}</div>
-            </div>
-            <form method="POST" action="/add-url" style="margin:0;">
-              <input type="hidden" name="url" value="{url}">
-              <button type="submit" class="btn btn-primary btn-sm">Add to watchlist</button>
-            </form>
+            </div>{action}
           </div>
         </div>""".format(**fields)
     html += "</div>"
     return html
 
 
-def render_releases(anime_info, best_id=None):
+def render_releases(anime_info, best_id=None, with_tvdb=True, note=""):
+    """Release picker, step 1 of the add flow. ``note`` is an optional hint
+    shown above the list (e.g. why auto-select didn't skip this step)."""
     if not anime_info:
         return ""
-    html = '<div class="section"><h2>Select Release for: {}</h2>'.format(escape(anime_info["name"]))
+    html = '<div class="section">'
+    html += render_add_flow_head("Release", anime_info["name"], with_tvdb=with_tvdb)
+    html += '<h2>Select Release for: {}</h2>'.format(escape(anime_info["name"]))
+    if note:
+        html += '<p class="hint flow-note">{}</p>'.format(escape(note))
     html += """
     <div class="card" style="margin-bottom:16px;">
-      <label class="hint">Folder name in /anime library:</label>
+      <label class="hint" for="release-folder">Folder name in /anime library:</label>
       <input type="text" id="release-folder" value="{name}" style="margin-top:4px;margin-bottom:0;">
     </div>""".format(name=escape(anime_info["name"]))
 
     media_type = anime_info.get("media_type", "series") or "series"
+    year = _parse_year(anime_info.get("year"))
+    display_title = anime_info.get("display_title") or ""
     # Every release id actually offered on this page — carried as a hidden
     # field alongside the chosen release_id so /add-release and /tvdb-seasons
     # can validate the selection is one the site really offered, without
@@ -3292,6 +3432,8 @@ def render_releases(anime_info, best_id=None):
               <input type="hidden" name="episodes" value="{eps}">
               <input type="hidden" name="custom_folder" value="">
               <input type="hidden" name="media_type" value="{mt}">
+              <input type="hidden" name="year" value="{year}">
+              <input type="hidden" name="display_title" value="{display_title}">
               <button type="submit" class="btn btn-primary btn-sm">Add this release</button>
             </form>
           </div>
@@ -3300,15 +3442,30 @@ def render_releases(anime_info, best_id=None):
             size=rel["size_mb"], group=escape(rel["group"]), url=escape(anime_info["url"]),
             name=escape(anime_info["name"]), rid=rel["id"], highlight=highlight,
             best_label=best_label, mt=escape(media_type), valid_ids=escape(valid_ids),
+            year=year or "", display_title=escape(display_title),
         )
     html += "</div>"
     return html
 
 
+def _release_summary(rel):
+    """One-line description of a release for the auto-select note."""
+    bits = ["{}p".format(rel.get("resolution", "?"))]
+    if rel.get("dubs"):
+        bits.append("Dub: " + ", ".join(rel["dubs"]))
+    if rel.get("subs"):
+        bits.append("Sub: " + ", ".join(rel["subs"]))
+    bits.append("{} eps".format(rel.get("episodes", 0)))
+    if rel.get("group"):
+        bits.append(str(rel["group"]))
+    return " · ".join(bits)
+
+
 def render_tvdb_step(anime_name, url, release_id, custom_folder,
                      search_results=None, seasons=None, selected_tvdb_id="",
                      selected_tvdb_name="", ep_count=0, edit_key=None,
-                     media_type="series", release_ids="", episodes=0):
+                     media_type="series", release_ids="", episodes=0,
+                     query=None, year="", display_title="", auto_release=None):
     """Render the TVDB correlation page shown between release selection and saving.
 
     When edit_key is set (the existing entry's URL), this is editing an existing
@@ -3320,13 +3477,21 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
     drops the season picker (movies have no seasons). Clicking "Link" on a
     result saves the tvdb_id and returns to the watchlist.
 
-    ``release_ids``/``episodes`` are the same release-selection metadata
-    render_releases first put on the page, carried forward through every
-    form on this multi-step flow so /add-release and /tvdb-seasons never
-    need to re-scrape to validate or re-derive them.
+    ``release_ids``/``episodes``/``year``/``display_title`` are the same
+    release-selection metadata render_releases first put on the page, carried
+    forward through every form on this multi-step flow so /add-release and
+    /tvdb-seasons never need to re-scrape to validate or re-derive them.
+
+    ``query`` is the TVDB search text last used (defaults to the anime name).
+    It stays in the search box and rides along to /tvdb-seasons, so picking a
+    series doesn't silently re-run the search under a different query.
+    ``auto_release`` is the release auto-select picked when it skipped the
+    picker, so the page can say what was chosen.
     """
     is_movie = (media_type == "movie")
-    save_action = "/tvdb-save" if edit_key is not None else "/add-release"
+    is_add = edit_key is None
+    save_action = "/add-release" if is_add else "/tvdb-save"
+    query = anime_name if query is None else query
 
     # Hidden fields carried through every form on this page
     hidden = (
@@ -3341,26 +3506,51 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
              rid=escape(str(release_id)), folder=escape(custom_folder),
              mt=escape(media_type), valid_ids=escape(release_ids),
              eps=int(episodes) if str(episodes).lstrip("-").isdigit() else 0)
-    if edit_key is not None:
+    if is_add:
+        hidden += (
+            '<input type="hidden" name="year" value="{year}">'
+            '<input type="hidden" name="display_title" value="{dt}">'
+        ).format(year=_parse_year(year) or "", dt=escape(display_title or ""))
+    else:
         hidden += '<input type="hidden" name="key" value="{}">'.format(escape(edit_key))
 
-    html = '<div class="section"><h2>TVDB Correlation: {}</h2>'.format(escape(anime_name))
+    html = '<div class="section">'
+    if is_add:
+        html += render_add_flow_head("TVDB", anime_name)
+    html += '<h2>TVDB Correlation: {}</h2>'.format(escape(anime_name))
     if is_movie:
-        html += '<p class="hint">Detected as <strong>Anime Movie</strong> — searching TVDB movies. No season selection needed.</p>'
+        html += '<p class="hint">Detected as <strong>Anime Movie</strong>, searching TVDB movies. No season selection needed.</p>'
     else:
         html += '<p class="hint">Link this anime to a TVDB series and season so downloads are placed in the correct season folder.</p>'
+    if auto_release:
+        html += '<p class="hint flow-note">Auto-selected the release that best matches your preferences: <strong>{}</strong></p>'.format(
+            escape(_release_summary(auto_release)))
 
-    # Skip button — save without TVDB
-    skip_label = (
-        "save without TVDB link" if is_movie
-        else ("save without season mapping" if edit_key is None else "cancel")
-    )
-    html += """
-    <form method="POST" action="{action}" style="margin-bottom:16px;">
-      {hidden}
-      <input type="hidden" name="tvdb_skip" value="1">
-      <button type="submit" class="btn btn-ghost">Skip TVDB &mdash; {skip_label}</button>
-    </form>""".format(hidden=hidden, action=save_action, skip_label=skip_label)
+    if is_add:
+        # Leave the TVDB step without linking: save as-is, or go back to the
+        # release picker (a fresh fetch, so it gets the scrape busy label).
+        html += """
+    <div class="flow-actions">
+      <form method="POST" action="{action}">
+        {hidden}
+        <input type="hidden" name="tvdb_skip" value="1">
+        <button type="submit" class="btn btn-ghost">Save without TVDB</button>
+      </form>
+      <form method="POST" action="/add-url" onsubmit="return scrapeBusy(this, 'Fetching releases…');">
+        <input type="hidden" name="url" value="{url}">
+        <input type="hidden" name="pick" value="1">
+        <button type="submit" class="btn btn-ghost">Change release</button>
+      </form>
+    </div>""".format(hidden=hidden, action=save_action, url=escape(url))
+    else:
+        html += """
+    <div class="flow-actions">
+      <form method="POST" action="{action}">
+        {hidden}
+        <input type="hidden" name="tvdb_skip" value="1">
+        <button type="submit" class="btn btn-ghost">Cancel</button>
+      </form>
+    </div>""".format(hidden=hidden, action=save_action)
 
     # Search box
     search_placeholder = "Search TVDB movies..." if is_movie else "Search TVDB..."
@@ -3369,10 +3559,10 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
     <div class="card" style="margin-bottom:16px;">
       <form method="POST" action="/tvdb-search" style="display:flex;gap:8px;align-items:center;margin:0;">
         {hidden}
-        <input type="text" name="query" value="{query}" placeholder="{placeholder}" style="flex:1;margin:0;">
+        <input type="text" name="query" value="{query}" placeholder="{placeholder}" aria-label="TVDB search" style="flex:1;margin:0;">
         <button type="submit" class="btn btn-primary">{button}</button>
       </form>
-    </div>""".format(hidden=hidden, query=escape(anime_name),
+    </div>""".format(hidden=hidden, query=escape(query),
                       placeholder=search_placeholder, button=search_button)
 
     # Search results
@@ -3384,6 +3574,7 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
             # series post to /tvdb-seasons to pick a season first.
             result_action = save_action if is_movie else "/tvdb-seasons"
             result_button = "Link Movie" if is_movie else "Select"
+            query_field = '<input type="hidden" name="tvdb_query" value="{}">'.format(escape(query))
             for r in search_results[:8]:
                 year_str = " ({})".format(r["year"]) if r.get("year") else ""
                 overview = r.get("overview", "")
@@ -3399,16 +3590,16 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
                       <div class="hint" style="margin-top:2px;">{overview}</div>
                     </div>
                     <form method="POST" action="{action}" style="margin:0;">
-                      {hidden}
+                      {hidden}{query_field}
                       <input type="hidden" name="tvdb_id" value="{tid}">
                       <input type="hidden" name="tvdb_name" value="{name}">
                       <button type="submit" class="btn btn-primary btn-sm">{button}</button>
                     </form>
                   </div>
                 </div>""".format(
-                    name=escape(r["name"]), year=year_str,
-                    overview=escape(overview), tid=r["tvdb_id"],
-                    hidden=hidden, border=border,
+                    name=escape(r["name"]), year=escape(year_str),
+                    overview=escape(overview), tid=escape(str(r["tvdb_id"])),
+                    hidden=hidden, query_field=query_field, border=border,
                     action=result_action, button=result_button)
 
     # Season picker (shown after selecting a series — never for movies)
@@ -3416,24 +3607,17 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
         html += '<div class="card card-accent" style="margin-top:16px;">'
         html += '<h3 style="margin:0 0 8px;">Seasons for: {}</h3>'.format(escape(selected_tvdb_name))
 
-        # Auto-suggest: pick the season whose ep count is closest to the release ep count
-        best_season = None
-        if ep_count > 0:
-            best_diff = float("inf")
-            for s in seasons:
-                diff = abs(s["episode_count"] - ep_count)
-                if diff < best_diff:
-                    best_diff = diff
-                    best_season = s["season_number"]
+        best_season = suggest_tvdb_season(seasons, ep_count)
 
         for s in seasons:
-            is_suggested = s["season_number"] == best_season
+            is_suggested = best_season is not None and s["season_number"] == best_season
             suggest_label = ' <span class="badge badge-accent">Likely match ({} eps)</span>'.format(ep_count) if is_suggested else ""
+            special_label = ' <span class="hint">Specials</span>' if s["season_number"] == 0 else ""
             highlight = "background:var(--accent-soft-bg);border-radius:6px;padding-left:8px;padding-right:8px;" if is_suggested else ""
             html += """
             <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;{highlight}">
               <span>
-                <strong>Season {snum}</strong>
+                <strong>Season {snum}</strong>{special}
                 <span class="badge badge-ep">{eps} eps</span>
                 {suggest}
               </span>
@@ -3446,11 +3630,17 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
               </form>
             </div>""".format(
                 snum=s["season_number"], eps=s["episode_count"],
-                suggest=suggest_label, hidden=hidden,
-                tid=selected_tvdb_id, highlight=highlight,
+                suggest=suggest_label, special=special_label, hidden=hidden,
+                tid=escape(str(selected_tvdb_id)), highlight=highlight,
                 save_action=save_action)
 
-        # Advanced: manual offset input
+        # Advanced: manual offset input. Defaults to the suggested season,
+        # or with no suggestion to the first regular (non-specials) season.
+        if best_season is not None:
+            default_season = best_season
+        else:
+            regular = [s["season_number"] for s in seasons if s["season_number"] != 0]
+            default_season = min(regular) if regular else (seasons[0]["season_number"] if seasons else 1)
         html += """
         <details style="margin-top:12px;">
           <summary class="hint" style="cursor:pointer;">Advanced: episode offset</summary>
@@ -3462,15 +3652,15 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
             <form method="POST" action="{save_action}" style="display:flex;gap:8px;align-items:center;margin:0;">
               {hidden}
               <input type="hidden" name="tvdb_id" value="{tid}">
-              <label>Season:</label>
-              <input type="number" name="tvdb_season" min="1" value="{suggested}" style="width:60px;margin:0;" required>
-              <label>Offset:</label>
-              <input type="number" name="episode_offset" value="0" style="width:60px;margin:0;">
+              <label for="adv-season">Season:</label>
+              <input type="number" id="adv-season" name="tvdb_season" min="0" value="{suggested}" style="width:60px;margin:0;" required>
+              <label for="adv-offset">Offset:</label>
+              <input type="number" id="adv-offset" name="episode_offset" value="0" style="width:60px;margin:0;">
               <button type="submit" class="btn btn-primary btn-sm">Save season</button>
             </form>
           </div>
-        </details>""".format(hidden=hidden, tid=selected_tvdb_id,
-                             suggested=best_season or 1,
+        </details>""".format(hidden=hidden, tid=escape(str(selected_tvdb_id)),
+                             suggested=default_season,
                              save_action=save_action)
         html += '</div>'
 
@@ -3478,7 +3668,7 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
     return html
 
 
-def render_page(status="", search_html="", prefs_open=False, ani_data=None):
+def render_page(status="", search_html="", prefs_open=False, ani_data=None, search_query=""):
     data = ani_data if ani_data is not None else load_ani()
     anime_list = data.get("anime", [])
     pending_list = data.get("pending", [])
@@ -3534,6 +3724,8 @@ def render_page(status="", search_html="", prefs_open=False, ani_data=None):
     page = page.replace("%%PREF_RES%%", str(prefs["min_resolution"]))
     page = page.replace("%%AUTO_BADGE%%",
         '<span class="badge badge-auto">Auto-select ON</span>' if prefs.get("auto_select") else "")
+    # Last, so the user's query text can't be re-read as another %%TOKEN%%.
+    page = page.replace("%%SEARCH_QUERY%%", escape(search_query))
 
     return page
 
@@ -3762,6 +3954,148 @@ class Handler(BaseHTTPRequestHandler):
                 "Error: ani.json is corrupt — refused to save. Fix or restore the file, then reload.",
                 level="err")
 
+    def _add_release(self, params, auto_release=None):
+        """/add-release: the TVDB step, then the save. Also entered straight
+        from /add-url when auto-select picked ``auto_release`` for the user,
+        with ``params`` shaped like the picker form's."""
+        url = params.get("url", "").strip()
+        name = params.get("name", "Unknown")
+        custom_folder = params.get("custom_folder", "").strip()
+
+        duplicate = find_duplicate_entry(load_ani(), url)
+        if duplicate is not None:
+            self._redirect_msg(_duplicate_msg(duplicate), level="err")
+            return
+
+        # Validate the release_id / media_type / episode-count carried
+        # as hidden fields from the release-selection page (or the TVDB
+        # step that followed it) rather than trusting them outright —
+        # see _resolve_release_selection's docstring for the
+        # validate-or-rescrape rule this applies. No release_id at all
+        # is a legitimate call shape (adding without ever going through
+        # release selection) — only a *posted-but-unconfirmable* one
+        # (tampered, or stale beyond recovery) is rejected outright.
+        posted_release_id = params.get("release_id", "")
+        release_id, media_type, episodes = _resolve_release_selection(url, params)
+        if posted_release_id and not release_id:
+            self._redirect_msg(
+                "Error: invalid release selection — please fetch releases again",
+                level="err")
+            return
+
+        # If TVDB is available and user hasn't been through the TVDB step yet,
+        # show the correlation page instead of saving immediately.
+        # For movies the "through the TVDB step" signal is either tvdb_skip
+        # or a posted tvdb_id — there's no tvdb_season field to look for.
+        has_tvdb_data = (
+            "tvdb_season" in params
+            or "tvdb_skip" in params
+            or (media_type == "movie" and "tvdb_id" in params)
+        )
+        if tvdb.available and not has_tvdb_data:
+            results = tvdb.search(
+                name,
+                content_type="movie" if media_type == "movie" else "series")
+            search_html = render_tvdb_step(
+                name, url, release_id, custom_folder,
+                search_results=results, media_type=media_type,
+                release_ids=params.get("release_ids", ""), episodes=episodes,
+                year=params.get("year", ""),
+                display_title=params.get("display_title", ""),
+                auto_release=auto_release)
+            self._respond(200, render_page(search_html=search_html))
+            return
+
+        folder_name_raw = custom_folder if custom_folder else name
+        folder_name = _safe_folder_segment(folder_name_raw)
+        if not folder_name:
+            self._redirect_msg("Error: invalid folder name", level="err")
+            return
+
+        # New entries start with the global prefs as their per-entry prefs,
+        # the same badges an entry resolved earlier carries.
+        prefs = load_prefs()
+        entry = {
+            "url": url,
+            "name": name,
+            "episodes": 0,
+            "missing": [],
+            "customPackage": folder_name,
+            "pref_audio_language": prefs.get("audio_language", "german"),
+            "pref_sub_language": prefs.get("sub_language", "any"),
+            "pref_resolution": prefs.get("min_resolution", 1080),
+            # Bot-owned scalars, known from the release fetch already: set
+            # now so e.g. a movie shows its Movie badge before the bot's
+            # first cycle (the bot's delta save overwrites them only when
+            # its own value differs).
+            "media_type": media_type,
+        }
+        year = _parse_year(params.get("year"))
+        if year:
+            entry["year"] = year
+        display_title = params.get("display_title", "").strip()[:200]
+        if display_title:
+            entry["display_title"] = display_title
+        if release_id:
+            try:
+                entry["releaseID"] = int(release_id)
+            except ValueError:
+                entry["releaseID"] = release_id
+
+        # Add TVDB fields if provided
+        tvdb_id = params.get("tvdb_id", "")
+        tvdb_season = params.get("tvdb_season", "")
+        episode_offset = params.get("episode_offset", "")
+        if tvdb_id:
+            try:
+                entry["tvdb_id"] = int(tvdb_id)
+            except ValueError:
+                pass
+        if tvdb_season:
+            try:
+                entry["tvdb_season"] = int(tvdb_season)
+            except ValueError:
+                pass
+        if episode_offset:
+            try:
+                offset = int(episode_offset)
+                if offset != 0:
+                    entry["episode_offset"] = offset
+            except ValueError:
+                pass
+
+        # No scraping happens below this point in this request (the TVDB
+        # correlation branch above already returned) — safe to do the
+        # final duplicate re-check + append inside one lock hold.
+        found = []
+
+        def _append(data):
+            dup = find_duplicate_entry(data, url)
+            if dup is not None:
+                found.append(dup)
+                return
+            data.setdefault("anime", []).append(entry)
+
+        update_ani(_append)
+        if found:
+            self._redirect_msg(_duplicate_msg(found[0]), level="err")
+            return
+
+        season_info = ""
+        if entry.get("tvdb_season") is not None:
+            season_info = ", season {}".format(entry["tvdb_season"])
+        _log.info("[watchlist] Added: %s (folder=%s, tvdb_id=%s%s)",
+                  name, folder_name, entry.get("tvdb_id", "-"), season_info)
+        folder_display = (
+            folder_name if folder_name == folder_name_raw
+            else "{} (saved as '{}')".format(folder_name_raw, folder_name))
+        auto_info = ""
+        if auto_release:
+            auto_info = "; auto-selected the {}p release".format(
+                auto_release.get("resolution", "?"))
+        self._redirect_msg("Added: {} (folder: {}{}{})".format(
+            name, folder_display, season_info, auto_info), level="ok")
+
     def _dispatch_post(self, parsed, params):
         if parsed.path == "/run-now":
             ok, msg = trigger_run_now()
@@ -3834,19 +4168,21 @@ class Handler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/add-url":
             url = params.get("url", "").strip()
-            if not url or "anime-loads.org" not in url:
-                self._redirect_msg("Error: Invalid URL")
+            if not url or "anime-loads.org" not in url.lower():
+                self._redirect_msg("Error: Invalid URL", level="err")
                 return
+            # "Change release" from the TVDB step posts pick=1: show the
+            # picker even when auto-select would otherwise skip it.
+            force_pick = "pick" in params
 
             # Cheap pre-check so re-adding something already present skips
             # the scrape below entirely. Not the authoritative check — that
-            # happens inside update_ani's single lock hold further down, so
+            # happens inside update_ani's single lock hold at save time, so
             # a concurrent add (or a bot/resolver write landing while this
             # request's scrape is in flight) is never missed or clobbered.
-            existing = load_ani()
-            all_entries = existing.get("anime", []) + existing.get("pending", [])
-            if any(a.get("url") == url for a in all_entries):
-                self._redirect_msg("Already in watchlist")
+            duplicate = find_duplicate_entry(load_ani(), url)
+            if duplicate is not None:
+                self._redirect_msg(_duplicate_msg(duplicate), level="err")
                 return
 
             # Fetch releases from site so user can see what's available. No
@@ -3859,151 +4195,61 @@ class Handler(BaseHTTPRequestHandler):
                 # happen in ONE lock hold so a write that landed during the
                 # multi-second scrape above (e.g. the bot, or another /add-url)
                 # can't be silently overwritten by this request's stale
-                # pre-scrape snapshot.
+                # pre-scrape snapshot. Pending entries get no per-entry prefs
+                # preset: the resolver applies the global prefs current at
+                # resolve time, which is what its "adjust Preferences" hint
+                # promises.
                 slug = url.rstrip("/").split("/")[-1]
                 name = slug.replace("-", " ").title()
-                already_present = False
+                found = []
 
                 def _add_pending(data):
-                    nonlocal already_present
-                    all_entries = data.get("anime", []) + data.get("pending", [])
-                    if any(a.get("url") == url for a in all_entries):
-                        already_present = True
+                    dup = find_duplicate_entry(data, url)
+                    if dup is not None:
+                        found.append(dup)
                         return
                     data.setdefault("pending", []).append(
                         {"url": url, "name": name, "status": "pending"})
 
                 update_ani(_add_pending)
-                if already_present:
-                    self._redirect_msg("Already in watchlist")
+                if found:
+                    self._redirect_msg(_duplicate_msg(found[0]), level="err")
                     return
                 msg = "Could not fetch releases{}, added to pending queue".format(
                     ": " + err if err else "")
-                self._redirect_msg(msg)
+                self._redirect_msg(msg, level="err")
                 return
 
-            # Show release selection page
             prefs = load_prefs()
             best = pick_best_release(anime_info["releases"], prefs)
-            best_id = best["id"] if best else None
-            search_html = render_releases(anime_info, best_id)
+
+            if prefs.get("auto_select") and best and not force_pick:
+                # Honor auto-select: take the best match straight to the TVDB
+                # step (or save, with no TVDB), exactly as if it had been
+                # clicked on the picker below.
+                self._add_release({
+                    "url": anime_info["url"],
+                    "name": anime_info["name"],
+                    "release_id": str(best["id"]),
+                    "release_ids": ",".join(str(rel["id"]) for rel in anime_info["releases"]),
+                    "episodes": str(best.get("episodes", 0) or 0),
+                    "custom_folder": "",
+                    "media_type": anime_info.get("media_type", "series") or "series",
+                    "year": str(anime_info.get("year") or ""),
+                    "display_title": anime_info.get("display_title") or "",
+                }, auto_release=best)
+                return
+
+            note = ""
+            if prefs.get("auto_select") and not best:
+                note = "No release matches your preferences, so auto-select was skipped. Pick one below."
+            search_html = render_releases(
+                anime_info, best["id"] if best else None,
+                with_tvdb=tvdb.available, note=note)
             self._respond(200, render_page(search_html=search_html))
 
         elif parsed.path == "/add-release":
-            url = params.get("url", "").strip()
-            name = params.get("name", "Unknown")
-            custom_folder = params.get("custom_folder", "").strip()
-
-            data = load_ani()
-            for a in data.get("anime", []):
-                if a.get("url") == url:
-                    self._redirect_msg("Already in watchlist")
-                    return
-
-            # Validate the release_id / media_type / episode-count carried
-            # as hidden fields from the release-selection page (or the TVDB
-            # step that followed it) rather than trusting them outright —
-            # see _resolve_release_selection's docstring for the
-            # validate-or-rescrape rule this applies. No release_id at all
-            # is a legitimate call shape (adding without ever going through
-            # release selection) — only a *posted-but-unconfirmable* one
-            # (tampered, or stale beyond recovery) is rejected outright.
-            posted_release_id = params.get("release_id", "")
-            release_id, media_type, episodes = _resolve_release_selection(url, params)
-            if posted_release_id and not release_id:
-                self._redirect_msg(
-                    "Error: invalid release selection — please fetch releases again")
-                return
-
-            # If TVDB is available and user hasn't been through the TVDB step yet,
-            # show the correlation page instead of saving immediately.
-            # For movies the "through the TVDB step" signal is either tvdb_skip
-            # or a posted tvdb_id — there's no tvdb_season field to look for.
-            has_tvdb_data = (
-                "tvdb_season" in params
-                or "tvdb_skip" in params
-                or (media_type == "movie" and "tvdb_id" in params)
-            )
-            if tvdb.available and not has_tvdb_data:
-                results = tvdb.search(
-                    name,
-                    content_type="movie" if media_type == "movie" else "series")
-                search_html = render_tvdb_step(
-                    name, url, release_id, custom_folder,
-                    search_results=results, media_type=media_type,
-                    release_ids=params.get("release_ids", ""), episodes=episodes)
-                self._respond(200, render_page(search_html=search_html))
-                return
-
-            folder_name_raw = custom_folder if custom_folder else name
-            folder_name = _safe_folder_segment(folder_name_raw)
-            if not folder_name:
-                self._redirect_msg("Error: invalid folder name")
-                return
-
-            entry = {
-                "url": url,
-                "name": name,
-                "episodes": 0,
-                "missing": [],
-                "customPackage": folder_name,
-            }
-            if release_id:
-                try:
-                    entry["releaseID"] = int(release_id)
-                except ValueError:
-                    entry["releaseID"] = release_id
-
-            # Add TVDB fields if provided
-            tvdb_id = params.get("tvdb_id", "")
-            tvdb_season = params.get("tvdb_season", "")
-            episode_offset = params.get("episode_offset", "")
-            if tvdb_id:
-                try:
-                    entry["tvdb_id"] = int(tvdb_id)
-                except ValueError:
-                    pass
-            if tvdb_season:
-                try:
-                    entry["tvdb_season"] = int(tvdb_season)
-                except ValueError:
-                    pass
-            if episode_offset:
-                try:
-                    offset = int(episode_offset)
-                    if offset != 0:
-                        entry["episode_offset"] = offset
-                except ValueError:
-                    pass
-
-            # No scraping happens below this point in this request (the TVDB
-            # correlation branch above already returned) — safe to do the
-            # final duplicate re-check + append inside one lock hold.
-            already_present = False
-
-            def _add_release(data):
-                nonlocal already_present
-                for a in data.get("anime", []):
-                    if a.get("url") == url:
-                        already_present = True
-                        return
-                data.setdefault("anime", []).append(entry)
-
-            update_ani(_add_release)
-            if already_present:
-                self._redirect_msg("Already in watchlist")
-                return
-
-            season_info = ""
-            if entry.get("tvdb_season"):
-                season_info = ", season {}".format(entry["tvdb_season"])
-            _log.info("[watchlist] Added: %s (folder=%s, tvdb_id=%s%s)",
-                      name, folder_name, entry.get("tvdb_id", "-"), season_info)
-            folder_display = (
-                folder_name if folder_name == folder_name_raw
-                else "{} (saved as '{}')".format(folder_name_raw, folder_name))
-            self._redirect_msg("Added: {} (folder: {}{})".format(
-                name, folder_display, season_info))
+            self._add_release(params)
 
         elif parsed.path == "/tvdb-search":
             url = params.get("url", "").strip()
@@ -4021,7 +4267,9 @@ class Handler(BaseHTTPRequestHandler):
                 search_results=results, edit_key=edit_key,
                 media_type=media_type,
                 release_ids=params.get("release_ids", ""),
-                episodes=params.get("episodes", 0))
+                episodes=params.get("episodes", 0), query=query,
+                year=params.get("year", ""),
+                display_title=params.get("display_title", ""))
             self._respond(200, render_page(search_html=search_html))
 
         elif parsed.path == "/tvdb-seasons":
@@ -4031,12 +4279,12 @@ class Handler(BaseHTTPRequestHandler):
             tvdb_id = params.get("tvdb_id", "")
             tvdb_name = params.get("tvdb_name", "")
             edit_key = params.get("key")
+            # The query that produced the result the user just picked, so the
+            # list stays the one they were looking at.
+            query = params.get("tvdb_query", "").strip() or name
 
             # Fetch seasons for the selected series
             seasons = tvdb.get_seasons(tvdb_id) if tvdb.available and tvdb_id else []
-
-            # Re-run the search so results stay visible
-            results = tvdb.search(name) if tvdb.available else []
 
             # Validate the release_id / media_type / episode-count carried
             # from the release step (for the season auto-suggestion) rather
@@ -4046,6 +4294,10 @@ class Handler(BaseHTTPRequestHandler):
             # release_id resolves to "" here (no auto-suggestion); the
             # actual save at /add-release rejects it outright.
             release_id, media_type, ep_count = _resolve_release_selection(url, params)
+
+            # Re-run the search so results stay visible
+            content_type = "movie" if media_type == "movie" else "series"
+            results = tvdb.search(query, content_type=content_type) if tvdb.available else []
 
             # Editing an existing entry has no release_id, so fall back to the
             # entry's stored episode count — otherwise the "Likely match" season
@@ -4065,7 +4317,9 @@ class Handler(BaseHTTPRequestHandler):
                 selected_tvdb_id=tvdb_id, selected_tvdb_name=tvdb_name or name,
                 ep_count=ep_count, edit_key=edit_key,
                 media_type=media_type,
-                release_ids=params.get("release_ids", ""), episodes=ep_count)
+                release_ids=params.get("release_ids", ""), episodes=ep_count,
+                query=query, year=params.get("year", ""),
+                display_title=params.get("display_title", ""))
             self._respond(200, render_page(search_html=search_html))
 
         elif parsed.path == "/search":
@@ -4081,9 +4335,9 @@ class Handler(BaseHTTPRequestHandler):
             elif not results:
                 search_html = '<div class="section"><div class="status-msg status-err">No results for &quot;{}&quot;</div></div>'.format(escape(query))
             else:
-                search_html = render_search_results(results)
+                search_html = render_search_results(results, load_ani())
 
-            self._respond(200, render_page(search_html=search_html))
+            self._respond(200, render_page(search_html=search_html, search_query=query))
 
         elif parsed.path == "/remove-pending":
             entry_url = params.get("key", "")

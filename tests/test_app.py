@@ -3723,7 +3723,7 @@ class AddUrlClobberTest(unittest.TestCase):
         h = app.Handler.__new__(app.Handler)
         h.path = path
         h._read_post = lambda: params
-        h._redirect_msg = lambda msg: captured.__setitem__("msg", msg)
+        h._redirect_msg = lambda msg, level=None: captured.update(msg=msg, level=level)
         h._redirect = lambda url: captured.__setitem__("url", url)
         h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
         h.do_POST()
@@ -3870,9 +3870,22 @@ class AddFlowHiddenFieldsTest(unittest.TestCase):
         self._orig_tvdb_available = app.tvdb.available
         app.tvdb.available = False
 
+        # These walk the release picker by hand, so auto-select stays off.
+        fd, self._prefs_path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self._orig_prefs = app.PREFS_FILE
+        app.PREFS_FILE = self._prefs_path
+        app.save_prefs({"audio_language": "german", "sub_language": "any",
+                        "min_resolution": 1080, "auto_select": False})
+
     def tearDown(self):
         app.get_releases = self._orig_get_releases
         app.tvdb.available = self._orig_tvdb_available
+        app.PREFS_FILE = self._orig_prefs
+        try:
+            os.remove(self._prefs_path)
+        except OSError:
+            pass
         app.ANI_JSON = self._orig_ani
         try:
             os.remove(self._ani_path)
@@ -3884,7 +3897,7 @@ class AddFlowHiddenFieldsTest(unittest.TestCase):
         h = app.Handler.__new__(app.Handler)
         h.path = path
         h._read_post = lambda: params
-        h._redirect_msg = lambda msg: captured.__setitem__("msg", msg)
+        h._redirect_msg = lambda msg, level=None: captured.update(msg=msg, level=level)
         h._redirect = lambda url: captured.__setitem__("url", url)
         h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
         h.do_POST()
@@ -4354,6 +4367,339 @@ class ReverseProxyCSRFTest(_DashboardServerTestBase):
         text = body.decode("utf-8")
         self.assertIn("X-Forwarded-Host", text)
         self.assertIn("DASHBOARD_ALLOWED_ORIGINS", text)
+
+
+class NormalizeAnimeUrlTest(unittest.TestCase):
+    def test_folds_scheme_host_case_www_and_trailing_slash(self):
+        base = app.normalize_anime_url("https://www.anime-loads.org/media/frieren")
+        for variant in (
+            "https://anime-loads.org/media/frieren/",
+            "HTTPS://WWW.Anime-Loads.org/media/frieren",
+            "http://anime-loads.org/media/frieren",
+            "  https://www.anime-loads.org/media/frieren/  ",
+        ):
+            self.assertEqual(app.normalize_anime_url(variant), base, variant)
+
+    def test_path_case_and_different_slug_stay_distinct(self):
+        base = app.normalize_anime_url("https://anime-loads.org/media/frieren")
+        self.assertNotEqual(app.normalize_anime_url("https://anime-loads.org/media/Frieren"), base)
+        self.assertNotEqual(app.normalize_anime_url("https://anime-loads.org/media/frieren-2"), base)
+
+    def test_find_duplicate_entry_checks_anime_and_pending(self):
+        data = {
+            "anime": [{"url": "https://www.anime-loads.org/media/a", "name": "A"}],
+            "pending": [{"url": "https://www.anime-loads.org/media/b", "name": "B"}],
+        }
+        self.assertEqual(app.find_duplicate_entry(data, "https://anime-loads.org/media/a/")["name"], "A")
+        self.assertEqual(app.find_duplicate_entry(data, "https://anime-loads.org/media/b/")["name"], "B")
+        self.assertIsNone(app.find_duplicate_entry(data, "https://anime-loads.org/media/c"))
+        self.assertIsNone(app.find_duplicate_entry(data, ""))
+
+
+class SuggestTvdbSeasonTest(unittest.TestCase):
+    def _s(self, *pairs):
+        return [{"season_number": n, "episode_count": c} for n, c in pairs]
+
+    def test_closest_regular_season_wins(self):
+        self.assertEqual(app.suggest_tvdb_season(self._s((1, 12), (2, 24)), 23), 2)
+
+    def test_specials_excluded_even_when_exact(self):
+        self.assertEqual(app.suggest_tvdb_season(self._s((0, 12), (1, 10), (2, 20)), 12), 1)
+
+    def test_specials_used_when_only_season(self):
+        self.assertEqual(app.suggest_tvdb_season(self._s((0, 3)), 12), 0)
+
+    def test_tie_gives_no_suggestion(self):
+        self.assertIsNone(app.suggest_tvdb_season(self._s((0, 12), (1, 10), (2, 14)), 12))
+
+    def test_unknown_episode_count_gives_no_suggestion(self):
+        self.assertIsNone(app.suggest_tvdb_season(self._s((1, 12)), 0))
+
+
+class RenderTvdbStepFlowTest(unittest.TestCase):
+    SEASONS = [{"season_number": 0, "episode_count": 12},
+               {"season_number": 1, "episode_count": 10},
+               {"season_number": 2, "episode_count": 14},
+               {"season_number": 3, "episode_count": 30}]
+
+    def _advanced_season(self, out):
+        m = re.search(r'id="adv-season" name="tvdb_season" min="0" value="(\d+)"', out)
+        self.assertIsNotNone(m)
+        return int(m.group(1))
+
+    def test_add_mode_has_steps_cancel_and_save_without_tvdb(self):
+        out = app.render_tvdb_step("Show", "https://anime-loads.org/media/show", "1", "")
+        self.assertIn('class="steps"', out)
+        self.assertIn('<li class="step step-current" aria-current="step"><span class="step-num">2</span>TVDB</li>', out)
+        self.assertIn(">Cancel</a>", out)
+        self.assertIn(">Save without TVDB</button>", out)
+        self.assertIn(">Change release</button>", out)
+        self.assertNotIn("Skip TVDB", out)
+
+    def test_edit_mode_has_no_steps_and_a_cancel_button(self):
+        out = app.render_tvdb_step("Show", "u", "", "", edit_key="u")
+        self.assertNotIn('class="steps"', out)
+        self.assertIn(">Cancel</button>", out)
+        self.assertNotIn("Save without TVDB", out)
+        self.assertNotIn("Change release", out)
+
+    def test_tie_has_no_likely_match_and_advanced_defaults_to_first_regular(self):
+        out = app.render_tvdb_step("Show", "u", "1", "", seasons=self.SEASONS,
+                                   selected_tvdb_id="9", ep_count=12)
+        self.assertNotIn("Likely match", out)
+        self.assertEqual(self._advanced_season(out), 1)
+
+    def test_advanced_defaults_to_suggested_season(self):
+        out = app.render_tvdb_step("Show", "u", "1", "", seasons=self.SEASONS,
+                                   selected_tvdb_id="9", ep_count=29)
+        self.assertEqual(out.count("Likely match"), 1)
+        self.assertEqual(self._advanced_season(out), 3)
+
+    def test_results_carry_the_search_query(self):
+        out = app.render_tvdb_step("Show", "u", "1", "", query="Custom & Query",
+                                   search_results=[{"tvdb_id": 5, "name": "X"}])
+        self.assertIn('name="query" value="Custom &amp; Query"', out)
+        self.assertIn('name="tvdb_query" value="Custom &amp; Query"', out)
+
+
+class AddAnimeFlowTest(unittest.TestCase):
+    """End-to-end handler behaviour of the add flow with scrapes and TVDB
+    stubbed: auto-select, duplicates, per-entry prefs, carried metadata."""
+
+    URL = "https://www.anime-loads.org/media/test-anime"
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="aniloads-addflow-")
+        self._orig = {
+            "ANI_JSON": app.ANI_JSON, "PREFS_FILE": app.PREFS_FILE,
+            "get_releases": app.get_releases, "search_anime": app.search_anime,
+        }
+        self._orig_tvdb = (app.tvdb.available, app.tvdb.__dict__.get("search"),
+                           app.tvdb.__dict__.get("get_seasons"))
+        app.ANI_JSON = os.path.join(self._tmp, "ani.json")
+        app.PREFS_FILE = os.path.join(self._tmp, "web-prefs.json")
+        app.save_ani({"settings": {}, "anime": []})
+        self.set_prefs(auto_select=True)
+
+        self.scrapes = []
+        self.releases = [
+            {"id": 11, "resolution": 1080, "dubs": ["German"], "subs": [],
+             "episodes": 12, "size_mb": 9000, "group": "g1"},
+            {"id": 12, "resolution": 720, "dubs": ["Japanese"], "subs": ["German"],
+             "episodes": 12, "size_mb": 4000, "group": "g2"},
+        ]
+
+        def fake_get_releases(url):
+            self.scrapes.append(url)
+            return {"name": "Test Anime", "url": url, "releases": self.releases,
+                    "media_type": "movie" if "movie" in url else "series",
+                    "year": 2021, "display_title": "Test Anime DE"}, None
+
+        app.get_releases = fake_get_releases
+
+        self.tvdb_searches = []
+
+        def fake_search(query, content_type="series"):
+            self.tvdb_searches.append((query, content_type))
+            return [{"tvdb_id": 77, "name": "Result", "year": 2021, "overview": ""}]
+
+        app.tvdb.available = False
+        app.tvdb.search = fake_search
+        app.tvdb.get_seasons = lambda tvdb_id: [{"season_number": 1, "episode_count": 12}]
+
+    def tearDown(self):
+        app.ANI_JSON = self._orig["ANI_JSON"]
+        app.PREFS_FILE = self._orig["PREFS_FILE"]
+        app.get_releases = self._orig["get_releases"]
+        app.search_anime = self._orig["search_anime"]
+        available, search, get_seasons = self._orig_tvdb
+        app.tvdb.available = available
+        for name, value in (("search", search), ("get_seasons", get_seasons)):
+            if value is None:
+                app.tvdb.__dict__.pop(name, None)
+            else:
+                setattr(app.tvdb, name, value)
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def set_prefs(self, **overrides):
+        prefs = {"audio_language": "german", "sub_language": "any",
+                 "min_resolution": 1080, "auto_select": True}
+        prefs.update(overrides)
+        app.save_prefs(prefs)
+
+    def _post(self, path, params):
+        captured = {}
+        h = app.Handler.__new__(app.Handler)
+        h.path = path
+        h._read_post = lambda: params
+        h._redirect_msg = lambda msg, level=None: captured.update(msg=msg, level=level)
+        h._redirect = lambda url: captured.__setitem__("url", url)
+        h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
+        h.do_POST()
+        return captured
+
+    def _form_fields(self, out, action, index=0):
+        forms = re.findall(r'<form method="POST" action="{}"[^>]*>(.*?)</form>'.format(
+            re.escape(action)), out, re.S)
+        self.assertGreater(len(forms), index, "no form posting to {}".format(action))
+        return {html.unescape(k): html.unescape(v) for k, v in
+                re.findall(r'name="([^"]+)" value="([^"]*)"', forms[index])}
+
+    # -- auto-select --------------------------------------------------------
+
+    def test_auto_select_skips_picker_to_tvdb_step(self):
+        app.tvdb.available = True
+        result = self._post("/add-url", {"url": self.URL})
+        out = result["html"]
+        self.assertNotIn("Add this release", out)
+        self.assertIn("TVDB Correlation: Test Anime", out)
+        self.assertIn("Auto-selected the release", out)
+        self.assertIn(">Change release</button>", out)
+        self.assertEqual(self._form_fields(out, "/tvdb-seasons")["release_id"], "11")
+        self.assertEqual(len(self.scrapes), 1)
+
+    def test_auto_select_without_tvdb_saves_best_release(self):
+        result = self._post("/add-url", {"url": self.URL})
+        self.assertEqual(result["level"], "ok")
+        self.assertIn("auto-selected the 1080p release", result["msg"])
+        entry = app.load_ani()["anime"][0]
+        self.assertEqual(entry["releaseID"], 11)
+
+    def test_auto_select_no_match_falls_back_to_picker(self):
+        self.set_prefs(audio_language="english")
+        out = self._post("/add-url", {"url": self.URL})["html"]
+        self.assertIn("Add this release", out)
+        self.assertIn("auto-select was skipped", out)
+        self.assertEqual(app.load_ani()["anime"], [])
+
+    def test_auto_select_off_shows_picker(self):
+        self.set_prefs(auto_select=False)
+        out = self._post("/add-url", {"url": self.URL})["html"]
+        self.assertIn("Add this release", out)
+        self.assertIn('<li class="step step-current" aria-current="step"><span class="step-num">1</span>Release</li>', out)
+        self.assertNotIn("auto-select was skipped", out)
+
+    def test_change_release_forces_picker(self):
+        app.tvdb.available = True
+        out = self._post("/add-url", {"url": self.URL, "pick": "1"})["html"]
+        self.assertIn("Add this release", out)
+        self.assertNotIn("TVDB Correlation", out)
+
+    # -- duplicates ---------------------------------------------------------
+
+    def test_add_url_rejects_normalized_duplicate_without_scraping(self):
+        app.save_ani({"anime": [{"url": self.URL, "name": "Test Anime"}]})
+        for variant in ("https://anime-loads.org/media/test-anime/",
+                        "HTTPS://Anime-Loads.org/media/test-anime"):
+            result = self._post("/add-url", {"url": variant})
+            self.assertEqual(result["msg"], "Already in watchlist: Test Anime")
+            self.assertEqual(result["level"], "err")
+        self.assertEqual(self.scrapes, [])
+
+    def test_add_release_rejects_url_already_pending(self):
+        app.save_ani({"anime": [], "pending": [{"url": self.URL + "/", "name": "Pend"}]})
+        result = self._post("/add-release", {"url": self.URL, "name": "Test Anime", "tvdb_skip": "1"})
+        self.assertEqual(result["msg"], "Already in watchlist: Pend")
+        self.assertEqual(result["level"], "err")
+        self.assertEqual(app.load_ani()["anime"], [])
+
+    def test_add_release_dedupes_inside_the_lock(self):
+        # A duplicate that lands between the pre-check and the save (e.g. a
+        # concurrent add) is still caught by the in-lock re-check.
+        real_update = app.update_ani
+
+        def racing_update(fn):
+            real_update(lambda d: d.setdefault("pending", []).append(
+                {"url": "https://anime-loads.org/media/test-anime/", "name": "Racer"}))
+            return real_update(fn)
+
+        app.update_ani = racing_update
+        try:
+            result = self._post("/add-release", {"url": self.URL, "name": "Test Anime", "tvdb_skip": "1"})
+        finally:
+            app.update_ani = real_update
+        self.assertEqual(result["msg"], "Already in watchlist: Racer")
+        self.assertEqual(app.load_ani()["anime"], [])
+
+    def test_fetch_failure_banner_is_an_error(self):
+        app.get_releases = lambda url: (None, "timeout")
+        result = self._post("/add-url", {"url": self.URL})
+        self.assertEqual(result["msg"], "Could not fetch releases: timeout, added to pending queue")
+        self.assertEqual(result["level"], "err")
+        pending = app.load_ani()["pending"][0]
+        self.assertNotIn("pref_audio_language", pending)
+
+    def test_invalid_url_banner_is_an_error(self):
+        result = self._post("/add-url", {"url": "https://example.com/x"})
+        self.assertEqual(result["level"], "err")
+
+    # -- saved entry --------------------------------------------------------
+
+    def test_saved_entry_gets_prefs_and_release_metadata(self):
+        self.set_prefs(auto_select=False, sub_language="english", min_resolution=720)
+        out = self._post("/add-url", {"url": self.URL + "-movie"})["html"]
+        params = self._form_fields(out, "/add-release")
+        self.assertEqual(params["year"], "2021")
+        self.assertEqual(params["display_title"], "Test Anime DE")
+        params["tvdb_skip"] = "1"
+        result = self._post("/add-release", params)
+        self.assertEqual(result["level"], "ok")
+        entry = app.load_ani()["anime"][0]
+        self.assertEqual(entry["pref_audio_language"], "german")
+        self.assertEqual(entry["pref_sub_language"], "english")
+        self.assertEqual(entry["pref_resolution"], 720)
+        self.assertEqual(entry["media_type"], "movie")
+        self.assertEqual(entry["year"], 2021)
+        self.assertEqual(entry["display_title"], "Test Anime DE")
+        self.assertEqual(len(self.scrapes), 1)
+
+    def test_implausible_year_is_not_saved(self):
+        self._post("/add-release", {"url": self.URL, "name": "X", "tvdb_skip": "1",
+                                    "year": "99999", "display_title": ""})
+        entry = app.load_ani()["anime"][0]
+        self.assertNotIn("year", entry)
+        self.assertNotIn("display_title", entry)
+
+    # -- TVDB query carry-through --------------------------------------------
+
+    def test_tvdb_seasons_reuses_custom_query_and_content_type(self):
+        app.tvdb.available = True
+        self.set_prefs(auto_select=False)
+        out = self._post("/add-url", {"url": self.URL})["html"]
+        params = self._form_fields(out, "/add-release")
+        out = self._post("/add-release", params)["html"]
+        search = self._form_fields(out, "/tvdb-search")
+        search["query"] = "Custom Query"
+        out = self._post("/tvdb-search", search)["html"]
+        select = self._form_fields(out, "/tvdb-seasons")
+        self.assertEqual(select["tvdb_query"], "Custom Query")
+        self.tvdb_searches.clear()
+        out = self._post("/tvdb-seasons", select)["html"]
+        self.assertEqual(self.tvdb_searches, [("Custom Query", "series")])
+        self.assertIn('name="query" value="Custom Query"', out)
+        self.assertEqual(len(self.scrapes), 1)
+
+    # -- search ---------------------------------------------------------------
+
+    def test_search_keeps_query_and_tags_tracked_results(self):
+        app.save_ani({
+            "anime": [{"url": "https://www.anime-loads.org/media/a", "name": "A"}],
+            "pending": [{"url": "https://www.anime-loads.org/media/b", "name": "B"}],
+        })
+        app.search_anime = lambda q: ([
+            {"name": "A", "url": "https://anime-loads.org/media/a/", "type": "Serie",
+             "episodes": "1/1", "genre": "", "dubs": "", "subs": ""},
+            {"name": "B", "url": "https://anime-loads.org/media/b", "type": "Serie",
+             "episodes": "1/1", "genre": "", "dubs": "", "subs": ""},
+            {"name": "C", "url": "https://anime-loads.org/media/c", "type": "Serie",
+             "episodes": "1/1", "genre": "", "dubs": "", "subs": ""},
+        ], None)
+        out = self._post("/search", {"q": "Fate & \"Zero\""})["html"]
+        self.assertIn('name="q" value="Fate &amp; &quot;Zero&quot;"', out)
+        self.assertIn('A <span class="badge badge-ok">In watchlist</span>', out)
+        self.assertIn('B <span class="badge badge-accent">Pending</span>', out)
+        results = out.split("<h2>Search Results</h2>", 1)[1]
+        self.assertEqual(results.count("Add to watchlist"), 1)
 
 
 if __name__ == "__main__":

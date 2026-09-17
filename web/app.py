@@ -150,9 +150,14 @@ class DockerAPI:
             return None
 
     def get_status(self, container=BOT_CONTAINER):
+        """Container state, plus ``docker_available`` distinguishing "the socket
+        is unreachable, so we simply don't know" from "we asked Docker and it
+        said the container isn't running" — the caller must not conflate the
+        two into one red "Stopped"."""
         data = self._request("GET", "/containers/{}/json".format(container))
         if not data:
-            return {"status": "unknown", "started": "", "running": False}
+            return {"status": "unavailable", "started": "", "running": False,
+                    "docker_available": False}
         try:
             info = json.loads(data)
             state = info.get("State", {})
@@ -160,9 +165,11 @@ class DockerAPI:
                 "status": state.get("Status", "unknown"),
                 "started": state.get("StartedAt", ""),
                 "running": state.get("Running", False),
+                "docker_available": True,
             }
         except (json.JSONDecodeError, KeyError):
-            return {"status": "error", "started": "", "running": False}
+            return {"status": "error", "started": "", "running": False,
+                    "docker_available": True}
 
     def get_logs(self, container=BOT_CONTAINER, tail=500):
         data = self._request(
@@ -518,9 +525,13 @@ def render_run_day(day, now=None):
     return '<div class="run-day">{}</div>'.format(escape(format_day(day, now)))
 
 
-def format_next_run_display(state_last):
-    """Next-run ETA string from the persisted run-state record, or "" if it
-    cannot be derived."""
+def format_next_run_display(state_last, now=None):
+    """Next-run ETA string from the persisted run-state record: absolute local
+    time plus the relative countdown, e.g. "18:44 (in ~31 min)" (or "Thu 18:44
+    (in ~31 min)" once it is not today, "18:44 (overdue ~5 min)" past due).
+    Returns "" if it cannot be derived. ``now`` is the UTC instant (naive) to
+    measure the ETA from; injectable so tests don't depend on wall-clock
+    drift."""
     next_time = _parse_state_ts(state_last.get("next_run_ts"))
     if next_time is None:
         return ""
@@ -528,7 +539,11 @@ def format_next_run_display(state_last):
         delay = int(state_last.get("timedelay") or 0)
     except (ValueError, TypeError):
         delay = 0
-    return _humanize_eta(next_time, datetime.now(timezone.utc).replace(tzinfo=None), delay)
+    now = now if now is not None else datetime.now(timezone.utc).replace(tzinfo=None)
+    relative = _humanize_eta(next_time, now, delay)
+    absolute = format_day_time(_to_local(next_time), fmt="%H:%M", now=now)
+    rel = "in {}".format(relative) if next_time > now else relative
+    return "{} ({})".format(absolute, rel)
 
 
 def format_last_run_display(state_last, now=None):
@@ -702,6 +717,11 @@ def get_activity():
         if next_run_display:
             result["next_run"] = next_run_display
         result["run_state"] = run_state
+
+    # Surfaced so render_activity can stay consistent with the Health panel's
+    # own "Bot Cycles" row instead of independently claiming everything is
+    # fine while Health already flagged a stale cycle.
+    result["staleness"] = check_bot_staleness(run_state)
 
     return result
 
@@ -2326,9 +2346,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="activity-value" id="move-last-run">%%MOVE_LAST_RUN%%</div>
       </div>
       <div>
-        <form method="POST" action="/move-now" style="margin:0;">
-          <button type="submit" class="btn btn-warning">Move Now</button>
-        </form>
+        %%MOVE_NOW_BUTTON%%
       </div>
     </div>
   </div>
@@ -2575,11 +2593,26 @@ function restoreRunKeys(el, keys) {
 def render_activity(activity, now=None):
     """Render the activity status bar values."""
     status = activity["status"]
-    bot_running = status.get("running", False)
-    dot_class = "running" if bot_running else "stopped"
-    status_text = '<span class="status-dot {}"></span>{}'.format(
-        dot_class, "Running" if bot_running else "Stopped"
-    )
+
+    if status.get("docker_available") is False:
+        # The container status comes only from Docker — when the socket isn't
+        # reachable we genuinely don't know whether the bot is running, so a
+        # red "Stopped" here would be a false signal. run_state-derived
+        # Last/Next Run (below) stay authoritative regardless.
+        status_text = ('<span class="status-dot unknown"></span>Unknown '
+                        '<span class="hint">&mdash; Docker socket unavailable</span>')
+    else:
+        bot_running = status.get("running", False)
+        dot_class = "running" if bot_running else "stopped"
+        status_text = '<span class="status-dot {}"></span>{}'.format(
+            dot_class, "Running" if bot_running else "Stopped"
+        )
+        # Health's own "Bot Cycles" row is the authority on staleness; don't
+        # let a green "Running" dot silently contradict it.
+        staleness = activity.get("staleness")
+        if bot_running and isinstance(staleness, dict) and staleness.get("state") == "warn":
+            status_text += ' <span class="hint">&mdash; {}</span>'.format(
+                escape(staleness.get("detail", "")))
 
     # Prefer the persisted run-state line (immune to log-tail rollover); fall
     # back to the log-parsed last run, then to the empty/unavailable states.
@@ -2955,8 +2988,11 @@ def render_run_history(runs, state_runs=None, max_runs=20, now=None):
 
 def render_move_status(now=None):
     """Render move status and last run time (day-qualified when not today)."""
+    mounted = os.path.isdir(DOWNLOAD_DIR)
     if _move_running:
         status_html = '<span class="status-dot running"></span>Running'
+    elif not mounted:
+        status_html = '<span class="status-dot unknown"></span>Not mounted'
     else:
         status_html = '<span class="status-dot unknown"></span>Idle'
 
@@ -2965,12 +3001,25 @@ def render_move_status(now=None):
             # The worker stamps an aware UTC time; shown on the local clock
             # like every other feed timestamp.
             last_html = format_day_time(_to_local(_move_last_run), now=now)
-        elif not os.path.isdir(DOWNLOAD_DIR):
+        elif not mounted:
             last_html = '<span class="faint">Download dir not mounted</span>'
         else:
             last_html = '<span class="faint">Not yet</span>'
 
     return status_html, last_html
+
+
+def render_move_now_button():
+    """The Move Now button — disabled with a reason when DOWNLOAD_DIR isn't
+    mounted, since a triggered cycle couldn't move anything anyway."""
+    if os.path.isdir(DOWNLOAD_DIR):
+        return ('<form method="POST" action="/move-now" style="margin:0;">'
+                '<button type="submit" class="btn btn-warning">Move Now</button>'
+                '</form>')
+    return ('<form method="POST" action="/move-now" style="margin:0;">'
+            '<button type="submit" class="btn btn-warning" disabled '
+            'title="Download directory not mounted">Move Now</button>'
+            '</form>')
 
 
 def render_move_history(max_entries=30):
@@ -3701,6 +3750,7 @@ def render_page(status="", search_html="", prefs_open=False, ani_data=None, sear
     page = page.replace("%%HEALTH%%", health_html)
     page = page.replace("%%MOVE_STATUS%%", move_status_html)
     page = page.replace("%%MOVE_LAST_RUN%%", move_last_html)
+    page = page.replace("%%MOVE_NOW_BUTTON%%", render_move_now_button())
     page = page.replace("%%MOVE_HISTORY%%", move_history_html)
     page = page.replace("%%MOVE_STUCK%%", move_stuck_html)
     page = page.replace("%%SEARCH_RESULTS%%", search_html)
@@ -4117,9 +4167,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect_msg("Error: {}".format(msg), level="err")
 
         elif parsed.path == "/move-now":
-            _log.info("[mover] Move Now triggered via dashboard")
-            _move_trigger.set()
-            self._redirect_msg("Move cycle triggered")
+            if not os.path.isdir(DOWNLOAD_DIR):
+                _log.warning("[mover] Move Now rejected: download directory not mounted")
+                self._redirect_msg(
+                    "Error: download directory not mounted — nothing to move", level="err")
+            else:
+                _log.info("[mover] Move Now triggered via dashboard")
+                _move_trigger.set()
+                self._redirect_msg("Move cycle triggered")
 
         elif parsed.path == "/move-stuck-ignore":
             key = params.get("key", "")
@@ -4747,44 +4802,58 @@ def _notify_mover_events(events):
     ).start()
 
 
+def _run_and_record_move_cycle():
+    """Run one mover cycle and record its results. Extracted from the worker
+    loop below so it's directly testable.
+
+    Does NOT stamp ``_move_last_run`` when DOWNLOAD_DIR isn't mounted —
+    ``run_move_cycle()`` returns immediately with no events in that case, so
+    stamping anyway would claim a cycle ran when it never had anything to
+    check."""
+    global _move_last_run
+    mounted = os.path.isdir(DOWNLOAD_DIR)
+    events = run_move_cycle()
+    with _move_lock:
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        for ev in events:
+            ev["time"] = ts
+            _move_history.append(ev)
+        if mounted:
+            _move_last_run = datetime.now(timezone.utc)
+    save_move_state()
+    _notify_mover_events(events)
+
+    if events:
+        counts = {"moved": 0, "error": 0, "skip": 0, "wait": 0, "cleanup": 0}
+        for ev in events:
+            t = ev["type"]
+            counts[t] = counts.get(t, 0) + 1
+            msg = ev.get("msg", "")
+            if t == "moved":
+                _log.info("[mover] %s", msg)
+            elif t == "error":
+                _log.warning("[mover] %s", msg)
+            else:
+                _log.debug("[mover] [%s] %s", t, msg)
+        summary = "Cycle: moved=%d errors=%d skipped=%d waiting=%d cleanup=%d" % (
+            counts["moved"], counts["error"], counts["skip"],
+            counts["wait"], counts["cleanup"])
+        if counts["moved"] or counts["error"]:
+            _log.info("[mover] %s", summary)
+        else:
+            _log.debug("[mover] %s", summary)
+
+
 def move_completed_worker():
     """Background thread: move completed downloads to media library."""
     time.sleep(MOVE_STARTUP_DELAY)
-    global _move_last_run, _move_running
+    global _move_running
 
     while True:
         try:
             _move_running = True
-            events = run_move_cycle()
-            with _move_lock:
-                ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-                for ev in events:
-                    ev["time"] = ts
-                    _move_history.append(ev)
-                _move_last_run = datetime.now(timezone.utc)
+            _run_and_record_move_cycle()
             _move_running = False
-            save_move_state()
-            _notify_mover_events(events)
-
-            if events:
-                counts = {"moved": 0, "error": 0, "skip": 0, "wait": 0, "cleanup": 0}
-                for ev in events:
-                    t = ev["type"]
-                    counts[t] = counts.get(t, 0) + 1
-                    msg = ev.get("msg", "")
-                    if t == "moved":
-                        _log.info("[mover] %s", msg)
-                    elif t == "error":
-                        _log.warning("[mover] %s", msg)
-                    else:
-                        _log.debug("[mover] [%s] %s", t, msg)
-                summary = "Cycle: moved=%d errors=%d skipped=%d waiting=%d cleanup=%d" % (
-                    counts["moved"], counts["error"], counts["skip"],
-                    counts["wait"], counts["cleanup"])
-                if counts["moved"] or counts["error"]:
-                    _log.info("[mover] %s", summary)
-                else:
-                    _log.debug("[mover] %s", summary)
         except Exception as e:
             _move_running = False
             _log.error("[mover] Error: %s", e)

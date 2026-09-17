@@ -664,9 +664,22 @@ class FormatRunStateDisplayTest(unittest.TestCase):
     def test_next_run_from_state(self):
         # Anchor 5.5 min ahead so integer-minute flooring lands on "~5 min"
         # regardless of the few ms of wall-clock drift before the helper reads now.
-        next_ts = _iso(datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=330))
-        out = app.format_next_run_display({"next_run_ts": next_ts, "timedelay": 600})
-        self.assertEqual(out, "~5 min")
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        next_ts = _iso(now + timedelta(seconds=330))
+        out = app.format_next_run_display({"next_run_ts": next_ts, "timedelay": 600}, now=now)
+        self.assertIn("(in ~5 min)", out)
+
+    def test_next_run_shows_absolute_local_time(self):
+        now = datetime(2026, 6, 13, 19, 0, 0)
+        next_ts = _iso(now + timedelta(seconds=330))
+        out = app.format_next_run_display({"next_run_ts": next_ts, "timedelay": 600}, now=now)
+        self.assertEqual(out, "19:05 (in ~5 min)")
+
+    def test_next_run_overdue_is_not_wrapped_in_in(self):
+        now = datetime(2026, 6, 13, 19, 0, 0)
+        next_ts = _iso(now - timedelta(minutes=60))
+        out = app.format_next_run_display({"next_run_ts": next_ts, "timedelay": 600}, now=now)
+        self.assertEqual(out, "18:00 (overdue ~60 min)")
 
     def test_next_run_missing_ts_is_blank(self):
         self.assertEqual(app.format_next_run_display({"timedelay": 600}), "")
@@ -742,7 +755,7 @@ class GetActivityRunStateTest(unittest.TestCase):
         })
         act = app.get_activity()
         self.assertIn("checked 5/8", act["last_run_display"])
-        self.assertEqual(act["next_run"], "~5 min")
+        self.assertIn("(in ~5 min)", act["next_run"])
         self.assertIn("run_state", act)
 
     def test_render_activity_uses_run_state_display(self):
@@ -1464,11 +1477,20 @@ class LocalZoneDisplayTest(unittest.TestCase):
         self.assertIn("00:30 — checked 4/4", state_html)
         self.assertIn('<span class="run-time">00:30:00</span>', log_html)
 
-    def test_next_run_eta_does_not_depend_on_the_zone(self):
-        next_ts = _iso(datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=330))
+    def test_next_run_relative_wording_does_not_depend_on_the_zone(self):
+        # The absolute time is deliberately zone-dependent (that's the point
+        # of showing local time); the relative countdown alongside it is not.
+        now = datetime(2026, 6, 13, 19, 0, 0)
+        next_ts = _iso(now + timedelta(seconds=330))
         with _display_zone(_CEST):
-            self.assertEqual(app.format_next_run_display({"next_run_ts": next_ts,
-                                                          "timedelay": 600}), "~5 min")
+            out_cest = app.format_next_run_display(
+                {"next_run_ts": next_ts, "timedelay": 600}, now=now)
+        with _display_zone(timezone.utc):
+            out_utc = app.format_next_run_display(
+                {"next_run_ts": next_ts, "timedelay": 600}, now=now)
+        self.assertTrue(out_cest.endswith("(in ~5 min)"))
+        self.assertTrue(out_utc.endswith("(in ~5 min)"))
+        self.assertNotEqual(out_cest, out_utc)
 
     def test_unconvertible_timestamp_stays_in_utc(self):
         # +2h past the last representable instant overflows; the page must not.
@@ -2253,6 +2275,47 @@ class RenderActivityFallbackTest(unittest.TestCase):
         finally:
             app.docker.available = orig
 
+    def test_docker_unavailable_status_is_unknown_not_stopped(self):
+        # BUG: an unreachable Docker socket used to render a red "Stopped" —
+        # indistinguishable from the bot container genuinely being down.
+        act = {"status": {"status": "unavailable", "running": False,
+                           "docker_available": False},
+               "last_run": None, "next_run": ""}
+        status_html, _last, _next = app.render_activity(act)
+        self.assertIn("Unknown", status_html)
+        self.assertIn("status-dot unknown", status_html)
+        self.assertIn("Docker socket unavailable", status_html)
+        self.assertNotIn("Stopped", status_html)
+        self.assertNotIn("status-dot stopped", status_html)
+
+    def test_docker_available_and_container_stopped_is_still_stopped(self):
+        # Docker itself distinguishes "unreachable" from "reachable, and it
+        # told us the container isn't running" — the latter stays red.
+        act = {"status": {"status": "exited", "running": False,
+                           "docker_available": True},
+               "last_run": None, "next_run": ""}
+        status_html, _last, _next = app.render_activity(act)
+        self.assertIn("Stopped", status_html)
+        self.assertIn("status-dot stopped", status_html)
+        self.assertNotIn("Unknown", status_html)
+
+    def test_running_with_stale_health_explains_instead_of_contradicting(self):
+        act = {"status": {"status": "running", "running": True, "docker_available": True},
+               "last_run": None, "next_run": "",
+               "staleness": {"state": "warn", "detail": "No cycle finished in 45 min (expected every ~10 min)"}}
+        status_html, _last, _next = app.render_activity(act)
+        self.assertIn("Running", status_html)
+        self.assertIn("status-dot running", status_html)
+        self.assertIn("No cycle finished in 45 min", status_html)
+
+    def test_running_with_ok_health_has_no_hint(self):
+        act = {"status": {"status": "running", "running": True, "docker_available": True},
+               "last_run": None, "next_run": "",
+               "staleness": {"state": "ok", "detail": "Last cycle finished 2 min ago"}}
+        status_html, _last, _next = app.render_activity(act)
+        self.assertIn("Running", status_html)
+        self.assertNotIn("hint", status_html)
+
 
 class RenderMoveStatusTest(unittest.TestCase):
     """render_move_status: running vs idle dot, last-run time, and the
@@ -2262,11 +2325,16 @@ class RenderMoveStatusTest(unittest.TestCase):
         self._orig_running = app._move_running
         self._orig_last = app._move_last_run
         self._orig_dl = app.DOWNLOAD_DIR
+        # Most cases here are about last-run formatting on top of a normally
+        # mounted dir; the not-mounted tests below point DOWNLOAD_DIR elsewhere.
+        self._dl_dir = tempfile.mkdtemp(prefix="aniloads-dl-")
+        app.DOWNLOAD_DIR = self._dl_dir
 
     def tearDown(self):
         app._move_running = self._orig_running
         app._move_last_run = self._orig_last
         app.DOWNLOAD_DIR = self._orig_dl
+        shutil.rmtree(self._dl_dir, ignore_errors=True)
 
     def test_running_state(self):
         app._move_running = True
@@ -2300,19 +2368,17 @@ class RenderMoveStatusTest(unittest.TestCase):
         app._move_running = False
         app._move_last_run = None
         app.DOWNLOAD_DIR = os.path.join(tempfile.gettempdir(), "aniloads-no-such-dl")
-        _s, last_html = app.render_move_status()
+        status_html, last_html = app.render_move_status()
+        self.assertIn("Not mounted", status_html)
+        self.assertIn("status-dot unknown", status_html)
         self.assertIn("Download dir not mounted", last_html)
 
     def test_not_yet_when_dir_present(self):
         app._move_running = False
         app._move_last_run = None
-        d = tempfile.mkdtemp(prefix="aniloads-dl-")
-        app.DOWNLOAD_DIR = d
-        try:
-            _s, last_html = app.render_move_status()
-            self.assertIn("Not yet", last_html)
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
+        status_html, last_html = app.render_move_status()
+        self.assertIn("Idle", status_html)
+        self.assertIn("Not yet", last_html)
 
 
 class RenderMoveHistoryTest(unittest.TestCase):
@@ -2764,6 +2830,64 @@ class RunMoveCycleTest(unittest.TestCase):
         self.assertEqual(len(stuck), 1)
 
 
+class MoveNowButtonTest(unittest.TestCase):
+    """render_move_now_button: enabled when DOWNLOAD_DIR is mounted, disabled
+    with a reason tooltip when it isn't."""
+
+    def setUp(self):
+        self._orig_dl = app.DOWNLOAD_DIR
+
+    def tearDown(self):
+        app.DOWNLOAD_DIR = self._orig_dl
+
+    def test_enabled_when_mounted(self):
+        d = tempfile.mkdtemp(prefix="aniloads-dl-")
+        app.DOWNLOAD_DIR = d
+        try:
+            html_out = app.render_move_now_button()
+            self.assertNotIn("disabled", html_out)
+            self.assertIn("Move Now", html_out)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_disabled_with_reason_when_not_mounted(self):
+        app.DOWNLOAD_DIR = os.path.join(tempfile.gettempdir(), "aniloads-no-such-dl-3")
+        html_out = app.render_move_now_button()
+        self.assertIn("disabled", html_out)
+        self.assertIn("Download directory not mounted", html_out)
+
+
+class RunAndRecordMoveCycleTest(unittest.TestCase):
+    """_run_and_record_move_cycle (the worker loop's per-cycle body, extracted
+    for testability): must not stamp _move_last_run for a cycle that couldn't
+    run because DOWNLOAD_DIR isn't mounted."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-cycle-")
+        self._orig_dl = app.DOWNLOAD_DIR
+        self._orig_last = app._move_last_run
+        self._orig_history_file = app.MOVE_HISTORY_FILE
+        app.MOVE_HISTORY_FILE = os.path.join(self.tmp, "move_history.json")
+        app._move_last_run = None
+
+    def tearDown(self):
+        app.DOWNLOAD_DIR = self._orig_dl
+        app._move_last_run = self._orig_last
+        app.MOVE_HISTORY_FILE = self._orig_history_file
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_does_not_stamp_last_run_when_not_mounted(self):
+        app.DOWNLOAD_DIR = os.path.join(self.tmp, "no-such-downloads")
+        app._run_and_record_move_cycle()
+        self.assertIsNone(app._move_last_run)
+
+    def test_stamps_last_run_when_mounted(self):
+        app.DOWNLOAD_DIR = os.path.join(self.tmp, "downloads")
+        os.makedirs(app.DOWNLOAD_DIR)
+        app._run_and_record_move_cycle()
+        self.assertIsNotNone(app._move_last_run)
+
+
 class MoveStatePersistenceTest(unittest.TestCase):
     """save_move_state / load_move_state: atomic tmp+os.replace write, bounded
     history, and stuck/ignored items surviving a simulated web restart."""
@@ -2927,6 +3051,9 @@ class HandlerPostRoutingTest(unittest.TestCase):
         app.MOVE_HISTORY_FILE = os.path.join(self._tmp, "move_history.json")
         self._orig_stuck = dict(app._stuck_items)
         app._stuck_items.clear()
+        self._orig_dl = app.DOWNLOAD_DIR
+        app.DOWNLOAD_DIR = os.path.join(self._tmp, "downloads")
+        os.makedirs(app.DOWNLOAD_DIR)
 
     def tearDown(self):
         app.PREFS_FILE = self._orig_prefs
@@ -2938,6 +3065,7 @@ class HandlerPostRoutingTest(unittest.TestCase):
         app.MOVE_HISTORY_FILE = self._orig_move_history_file
         app._stuck_items.clear()
         app._stuck_items.update(self._orig_stuck)
+        app.DOWNLOAD_DIR = self._orig_dl
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def _post(self, path, params):
@@ -2980,6 +3108,14 @@ class HandlerPostRoutingTest(unittest.TestCase):
         self.assertTrue(app._move_trigger.is_set())
         self.assertEqual(result["msg"], "Move cycle triggered")
 
+    def test_move_now_rejected_when_download_dir_not_mounted(self):
+        app.DOWNLOAD_DIR = os.path.join(self._tmp, "no-such-downloads")
+        app._move_trigger.clear()
+        result = self._post("/move-now", {})
+        self.assertFalse(app._move_trigger.is_set())
+        self.assertTrue(result["msg"].startswith("Error"))
+        self.assertEqual(result.get("level"), "err")
+
     def test_add_url_rejects_non_site_url(self):
         result = self._post("/add-url", {"url": "http://evil.example/x"})
         self.assertTrue(result["msg"].startswith("Error: Invalid URL"))
@@ -3004,24 +3140,20 @@ class HandlerPostRoutingTest(unittest.TestCase):
         self.assertEqual(result.get("level"), "err")
 
     def test_move_stuck_delete_removes_download_copy(self):
-        dl_dir = os.path.join(self._tmp, "downloads", "d")
+        # app.DOWNLOAD_DIR is already the setUp-managed tmp dir.
+        dl_dir = os.path.join(app.DOWNLOAD_DIR, "d")
         os.makedirs(dl_dir)
         dl_file = os.path.join(dl_dir, "x.mkv")
         with open(dl_file, "w") as f:
             f.write("x")
-        self._orig_dl = app.DOWNLOAD_DIR
-        app.DOWNLOAD_DIR = os.path.join(self._tmp, "downloads")
-        try:
-            app._stuck_items["k2"] = {
-                "key": "k2", "reason": "exists", "ignored": False, "msg": "x.mkv exists",
-                "path": "d/x.mkv", "dir": "d", "first_seen": "t", "last_seen": "t",
-            }
-            result = self._post("/move-stuck-delete", {"key": "k2"})
-            self.assertEqual(result["msg"], "Deleted download copy: x.mkv exists")
-            self.assertFalse(os.path.isfile(dl_file))
-            self.assertNotIn("k2", app._stuck_items)
-        finally:
-            app.DOWNLOAD_DIR = self._orig_dl
+        app._stuck_items["k2"] = {
+            "key": "k2", "reason": "exists", "ignored": False, "msg": "x.mkv exists",
+            "path": "d/x.mkv", "dir": "d", "first_seen": "t", "last_seen": "t",
+        }
+        result = self._post("/move-stuck-delete", {"key": "k2"})
+        self.assertEqual(result["msg"], "Deleted download copy: x.mkv exists")
+        self.assertFalse(os.path.isfile(dl_file))
+        self.assertNotIn("k2", app._stuck_items)
 
     def test_move_stuck_delete_wrong_reason_errors(self):
         app._stuck_items["k3"] = {
@@ -4158,6 +4290,13 @@ class _DashboardServerTestBase(unittest.TestCase):
         self._orig_pass = app.DASHBOARD_PASS
         app._move_trigger.clear()
 
+        # These tests use POST /move-now purely as a probe for the auth/CSRF
+        # gate, not to exercise the mover itself — mount a real dir so that
+        # probe isn't rejected for an unrelated reason (DOWNLOAD_DIR missing).
+        self._orig_download_dir = app.DOWNLOAD_DIR
+        self._download_dir = tempfile.mkdtemp(prefix="aniloads-dl-")
+        app.DOWNLOAD_DIR = self._download_dir
+
         self.server = app.ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
         self.port = self.server.server_address[1]
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -4172,6 +4311,8 @@ class _DashboardServerTestBase(unittest.TestCase):
         app.DASHBOARD_PASS = self._orig_pass
         app._move_trigger.clear()
         app.ANI_JSON = self._orig_ani
+        app.DOWNLOAD_DIR = self._orig_download_dir
+        shutil.rmtree(self._download_dir, ignore_errors=True)
         try:
             os.remove(self._ani_path)
         except OSError:

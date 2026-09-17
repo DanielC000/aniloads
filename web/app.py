@@ -1141,6 +1141,33 @@ def parse_season_episode(filename):
     return name_part, season, episode
 
 
+def _rename_season_episode(filename, new_season, new_episode):
+    """Rewrite the SxxExx token in filename to new_season/new_episode.
+
+    Only the matched season/episode digit spans are touched (via the
+    regex match's own offsets), so the rest of the filename — including
+    any other S##/E## substring inside the title — is left untouched.
+    Each number's original zero-padding width is preserved, with a
+    minimum of 2 digits (e.g. 'E001' stays 3-wide; a bare 'S1' becomes
+    'S02'-width to match the 'S{:02d}' season folder convention).
+    Returns filename unchanged if it doesn't match _SEASON_EP_RE.
+    """
+    m = _SEASON_EP_RE.match(filename)
+    if not m:
+        return filename
+    season_start, season_end = m.span(2)
+    episode_start, episode_end = m.span(3)
+    season_width = max(season_end - season_start, 2)
+    episode_width = max(episode_end - episode_start, 2)
+    new_season_str = '{:0{width}d}'.format(new_season, width=season_width)
+    new_episode_str = '{:0{width}d}'.format(new_episode, width=episode_width)
+    return (
+        filename[:season_start] + new_season_str +
+        filename[season_end:episode_start] + new_episode_str +
+        filename[episode_end:]
+    )
+
+
 def _lookup_anime_entries():
     """Load the anime list once per cycle for move lookups."""
     return load_ani().get("anime", [])
@@ -1635,19 +1662,23 @@ def run_move_cycle():
 
                 anime_name = existing or match["folder_name"]
 
+                orig_season, orig_episode = season, episode
+
                 # TVDB season override
                 if match["tvdb_season"] is not None:
                     season = match["tvdb_season"]
 
-                # TVDB episode offset — adjust episode number in filename
+                # TVDB episode offset
                 ep_offset = match["episode_offset"]
                 if ep_offset:
-                    new_ep = episode + ep_offset
-                    old_ep_str = 'E{:02d}'.format(episode)
-                    new_ep_str = 'E{:02d}'.format(new_ep)
-                    new_filename = filename.replace(old_ep_str, new_ep_str)
-                    if new_filename != filename:
-                        filename = new_filename
+                    episode += ep_offset
+
+                # Rebuild the SxxExx token in the filename itself whenever the
+                # season or episode was overridden — Plex's scanner reads
+                # SxxExx from the filename, not just the folder, so leaving
+                # a stale S01 token behind would still file it under season 1.
+                if season != orig_season or episode != orig_episode:
+                    filename = _rename_season_episode(filename, season, episode)
 
                 season_dir = 'S{:02d}'.format(season)
                 target_dir = os.path.join(MEDIA_DIR, anime_name, season_dir)

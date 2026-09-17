@@ -228,6 +228,38 @@ class ParseSeasonEpisodeTest(unittest.TestCase):
         self.assertIsNone(app.parse_season_episode("NoSeasonHere.mkv"))
 
 
+class RenameSeasonEpisodeTest(unittest.TestCase):
+    def test_rewrites_season_and_episode_preserving_width(self):
+        self.assertEqual(
+            app._rename_season_episode("Anime.Name.S01E05.mkv", 2, 5),
+            "Anime.Name.S02E05.mkv",
+        )
+
+    def test_preserves_three_digit_episode_width(self):
+        self.assertEqual(
+            app._rename_season_episode("Long.S01E001.mkv", 1, 6),
+            "Long.S01E006.mkv",
+        )
+
+    def test_minimum_width_of_two_for_single_digit_season(self):
+        self.assertEqual(
+            app._rename_season_episode("Show.S1E1.mkv", 3, 4),
+            "Show.S03E04.mkv",
+        )
+
+    def test_only_touches_matched_span_leaving_other_tokens_alone(self):
+        self.assertEqual(
+            app._rename_season_episode("Show.E05.Bonus.S01E05.mkv", 1, 17),
+            "Show.E05.Bonus.S01E17.mkv",
+        )
+
+    def test_returns_filename_unchanged_when_no_match(self):
+        self.assertEqual(
+            app._rename_season_episode("Anime Movie 1080p.mkv", 2, 5),
+            "Anime Movie 1080p.mkv",
+        )
+
+
 class MatchAnimeEntryTest(unittest.TestCase):
     def test_download_folder_pattern_match(self):
         anime = [{
@@ -2233,12 +2265,16 @@ class RunMoveCycleTest(unittest.TestCase):
         # emptied source download dir is pruned
         self.assertFalse(os.path.isdir(os.path.join(self.download, "Naruto.S01")))
 
-    def test_tvdb_season_override_changes_season_dir(self):
+    def test_tvdb_season_override_changes_season_dir_and_filename(self):
         self._write_ani([{"name": "Bleach", "media_type": "series", "tvdb_season": 2}])
         self._make_dl("Bleach.S01", ["Bleach.S01E05.mkv"])
         app.run_move_cycle()
-        # filename keeps its S01 token; only the season folder is overridden to S02.
+        # Both the season folder AND the filename's SxxExx token are
+        # overridden to S02 — Plex's scanner reads the token from the
+        # filename, so a stale S01 token would still file it under season 1.
         self.assertTrue(os.path.isfile(
+            os.path.join(self.media, "Bleach", "S02", "Bleach.S02E05.mkv")))
+        self.assertFalse(os.path.isfile(
             os.path.join(self.media, "Bleach", "S02", "Bleach.S01E05.mkv")))
 
     def test_episode_offset_renames_episode_in_filename(self):
@@ -2247,6 +2283,39 @@ class RunMoveCycleTest(unittest.TestCase):
         app.run_move_cycle()
         self.assertTrue(os.path.isfile(
             os.path.join(self.media, "Bleach", "S01", "Bleach.S01E17.mkv")))
+
+    def test_episode_offset_preserves_three_digit_episode_width(self):
+        self._write_ani([{"name": "LongShow", "media_type": "series", "episode_offset": 5}])
+        self._make_dl("LongShow.S01", ["LongShow.S01E001.mkv"])
+        app.run_move_cycle()
+        dest_dir = os.path.join(self.media, "LongShow", "S01")
+        self.assertTrue(os.path.isfile(os.path.join(dest_dir, "LongShow.S01E006.mkv")))
+        self.assertFalse(os.path.isfile(os.path.join(dest_dir, "LongShow.S01E001.mkv")))
+
+    def test_episode_offset_rename_does_not_touch_unrelated_token_in_title(self):
+        # The title itself contains "E05" (unrelated to the real SxxExx token
+        # at the end) with the SAME digits as the pre-offset episode number —
+        # a naive filename.replace('E05', 'E17') would corrupt it too.
+        self._write_ani([{"name": "Show", "media_type": "series", "episode_offset": 12}])
+        self._make_dl("Show.S01", ["Show.E05.Bonus.S01E05.mkv"])
+        app.run_move_cycle()
+        dest_dir = os.path.join(self.media, "Show", "S01")
+        self.assertTrue(os.path.isfile(os.path.join(dest_dir, "Show.E05.Bonus.S01E17.mkv")))
+
+    def test_no_override_leaves_filename_byte_identical(self):
+        self._write_ani([{"name": "Bleach", "media_type": "series"}])
+        self._make_dl("Bleach.S01", ["Bleach.S01E05.mkv"])
+        app.run_move_cycle()
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.media, "Bleach", "S01", "Bleach.S01E05.mkv")))
+
+    def test_season_override_subtitle_follows_renamed_video_stem(self):
+        self._write_ani([{"name": "Bleach", "media_type": "series", "tvdb_season": 2}])
+        self._make_dl("Bleach.S01", ["Bleach.S01E05.mkv", "Bleach.S01E05.en.srt"])
+        app.run_move_cycle()
+        dest_dir = os.path.join(self.media, "Bleach", "S02")
+        self.assertTrue(os.path.isfile(os.path.join(dest_dir, "Bleach.S02E05.mkv")))
+        self.assertTrue(os.path.isfile(os.path.join(dest_dir, "Bleach.S02E05.en.srt")))
 
     def test_movie_single_file_renamed_to_folder(self):
         self._write_ani([{"name": "Akira", "media_type": "movie", "year": 1988}])

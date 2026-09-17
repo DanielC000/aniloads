@@ -59,6 +59,7 @@ services:
       - JD_HTTP_TIMEOUT=${JD_HTTP_TIMEOUT:-30}
       - TVDB_HTTP_TIMEOUT=${TVDB_HTTP_TIMEOUT:-10}
       - EARLY_SCRAPE_DAYS=${EARLY_SCRAPE_DAYS:-1}
+      - TVDB_PASTDUE_RECHECK_HOURS=${TVDB_PASTDUE_RECHECK_HOURS:-2}
     volumes:
       - "${ANIME_CONFIG_DIR:?set in .env (see .env.example)}:/config"
     networks:

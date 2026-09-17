@@ -17,6 +17,12 @@ LOGLEVEL = getattr(logging, os.environ.get("LOGLEVEL", "INFO").upper(), logging.
 # release. 0 disables (strict skip_until honoring). See should_scrape_despite_skip().
 EARLY_SCRAPE_DAYS = int(os.environ.get("EARLY_SCRAPE_DAYS", "1"))
 
+# Hours between re-checks when TVDB's predicted airdate has already passed but
+# anime-loads.org hasn't published the episode yet. Without this throttle, a
+# "Continuing" series with a past-due airdate has no future skip_until to defer
+# to and gets scraped every poll cycle until the episode appears.
+TVDB_PASTDUE_RECHECK_HOURS = float(os.environ.get("TVDB_PASTDUE_RECHECK_HOURS", "2"))
+
 _stdout_handler = logging.StreamHandler(sys.stdout)
 _stdout_handler.setFormatter(logging.Formatter("%(message)s"))
 _handlers = [_stdout_handler]
@@ -129,6 +135,90 @@ def should_scrape_despite_skip(skip_until_str, today, window_days):
     except (ValueError, TypeError):
         return True
     return today >= skip_date - timedelta(days=window_days)
+
+def tvdb_skip_decision(series_status, tvdb_season, tvdb_ep_count, airdate, episodes,
+                        missing_count, today, now, skip_recheck_at, early_scrape_days,
+                        pastdue_recheck_hours):
+    """Pure decision logic for the anibot Step 4 TVDB skip/complete checks.
+
+    `episodes` is already in watchlist/TVDB numbering — the mover's
+    `new_ep = site_ep + episode_offset` return-leg translation (c0b7ab5,
+    `_match_batch_episodes` in animeloads.py) means the highest watchlist
+    episode is the same "episode within tvdb_season" numbering TVDB's own
+    season/episode APIs use. No further `episode_offset` translation belongs
+    here — applying it again would double-translate.
+
+    Returns a dict:
+      - "action": "complete" | "skip" | "retry" | "early" | "none"
+      - "terminal": True when the caller should count this as skipped and
+        `continue` (complete/skip); False when it should fall through to the
+        normal scrape (retry/early/none).
+      - "updates": {field: value} to merge into the anime entry (and persist)
+        before returning to the caller, or {} if nothing changed.
+      - "log": (level, message) or None.
+    """
+    no_change = {"action": "none", "terminal": False, "updates": {}, "log": None}
+
+    if series_status == "Ended":
+        if tvdb_ep_count and episodes >= tvdb_ep_count and missing_count == 0:
+            return {"action": "complete", "terminal": True, "updates": {"complete": True},
+                    "log": ("info", "series ended, all episodes downloaded")}
+        return no_change
+
+    if series_status == "Continuing" and tvdb_season:
+        if airdate:
+            try:
+                air_date_obj = date.fromisoformat(airdate)
+            except (ValueError, TypeError):
+                return no_change
+
+            if air_date_obj > today:
+                updates = {"skip_until": airdate, "skip_real_airdate": True}
+                if should_scrape_despite_skip(airdate, today, early_scrape_days):
+                    return {"action": "early", "terminal": False, "updates": updates,
+                            "log": ("info", "next episode airs " + airdate
+                                    + ", scraping within " + str(early_scrape_days) + "d for early release")}
+                if missing_count == 0:
+                    return {"action": "skip", "terminal": True, "updates": updates,
+                            "log": ("info", "next episode airs " + airdate)}
+                return {"action": "retry", "terminal": False, "updates": updates,
+                        "log": ("info", "next episode airs " + airdate + " but "
+                                + str(missing_count) + " missing episodes to retry")}
+
+            # Airdate already passed but not yet published (site running late).
+            # There's no future skip_until to defer to, so without a throttle
+            # this falls through to a full scrape every cycle until it appears.
+            recheck_dt = None
+            if skip_recheck_at:
+                try:
+                    recheck_dt = datetime.fromisoformat(skip_recheck_at)
+                except (ValueError, TypeError):
+                    recheck_dt = None
+            if recheck_dt and now < recheck_dt:
+                msg = ("next episode airdate " + airdate + " has passed but is not yet published")
+                if missing_count == 0:
+                    return {"action": "skip", "terminal": True, "updates": {},
+                            "log": ("info", msg + ", re-checking after " + skip_recheck_at)}
+                return {"action": "retry", "terminal": False, "updates": {},
+                        "log": ("info", msg + " (recheck throttled) but "
+                                + str(missing_count) + " missing episodes to retry")}
+            next_recheck = (now + timedelta(hours=pastdue_recheck_hours)).isoformat()
+            return {"action": "none", "terminal": False, "updates": {"skip_recheck_at": next_recheck},
+                    "log": None}
+
+        # No known airdate — synthetic throttle date (regenerates daily), honored
+        # strictly (skip_real_airdate=False); the early-scrape window applies
+        # only to real predicted airdates.
+        default_skip = (today + timedelta(days=1)).isoformat()
+        updates = {"skip_until": default_skip, "skip_real_airdate": False}
+        if missing_count == 0:
+            return {"action": "skip", "terminal": True, "updates": updates,
+                    "log": ("info", "no airdate known, re-check " + default_skip)}
+        return {"action": "retry", "terminal": False, "updates": updates,
+                "log": ("info", "no airdate known, re-check " + default_skip + " but "
+                        + str(missing_count) + " missing episodes to retry")}
+
+    return no_change
 
 def _boot_backoff(attempt, cap=300):
     """Capped exponential backoff (seconds) for in-process boot retries.
@@ -1102,60 +1192,30 @@ def startbot():
                         if series_status:
                             animeentry['tvdb_series_status'] = series_status
 
-                        if series_status == "Ended":
-                            # Check if all episodes for this season are downloaded
-                            if tvdb_season:
-                                tvdb_ep_count = tvdb.get_season_episode_count(tvdb_id, tvdb_season)
-                            else:
-                                tvdb_ep_count = None
-                            if tvdb_ep_count and episodes >= tvdb_ep_count and len(missingEpisodes) == 0:
-                                _log.info("[COMPLETE] " + name + " — series ended, all episodes downloaded")
-                                animeentry['complete'] = True
-                                save_ani()
-                                run_counts["skipped"] += 1
-                                continue
-
-                        elif series_status == "Continuing" and tvdb_season:
+                        tvdb_ep_count = None
+                        if series_status == "Ended" and tvdb_season:
+                            tvdb_ep_count = tvdb.get_season_episode_count(tvdb_id, tvdb_season)
+                        airdate = None
+                        if series_status == "Continuing" and tvdb_season:
                             airdate = tvdb.get_next_episode_airdate(tvdb_id, tvdb_season, episodes)
-                            if airdate:
-                                try:
-                                    air_date_obj = date.fromisoformat(airdate)
-                                    if air_date_obj > date.today():
-                                        # Cache the airdate for the skip_until badge / next cycle,
-                                        # but scrape anyway once within EARLY_SCRAPE_DAYS of it to
-                                        # catch an episode published before its TVDB airdate. Mark
-                                        # this as a real airdate so Step 3 applies the early-scrape.
-                                        animeentry['skip_until'] = airdate
-                                        animeentry['skip_real_airdate'] = True
-                                        save_ani()
-                                        if should_scrape_despite_skip(airdate, date.today(), EARLY_SCRAPE_DAYS):
-                                            _log.info("[EARLY] " + name + " — next episode airs " + airdate
-                                                      + ", scraping within " + str(EARLY_SCRAPE_DAYS) + "d for early release")
-                                        elif len(missingEpisodes) == 0:
-                                            _log.info("[SKIP] " + name + " — next episode airs " + airdate)
-                                            run_counts["skipped"] += 1
-                                            continue
-                                        else:
-                                            _log.info("[RETRY] " + name + " — next episode airs " + airdate
-                                                      + " but " + str(len(missingEpisodes)) + " missing episodes to retry")
-                                except ValueError:
-                                    pass
-                            else:
-                                # No known airdate — synthetic throttle date (regenerates daily),
-                                # so it is honored strictly (skip_real_airdate=False); the early-scrape
-                                # window applies only to real predicted airdates. Skip 1 day to avoid
-                                # pointless scraping while rechecking TVDB once per day.
-                                default_skip = (date.today() + timedelta(days=1)).isoformat()
-                                animeentry['skip_until'] = default_skip
-                                animeentry['skip_real_airdate'] = False
-                                save_ani()
-                                if len(missingEpisodes) == 0:
-                                    _log.info("[SKIP] " + name + " — no airdate known, re-check " + default_skip)
-                                    run_counts["skipped"] += 1
-                                    continue
-                                else:
-                                    _log.info("[RETRY] " + name + " — no airdate known, re-check " + default_skip
-                                              + " but " + str(len(missingEpisodes)) + " missing episodes to retry")
+
+                        decision = tvdb_skip_decision(
+                            series_status, tvdb_season, tvdb_ep_count, airdate, episodes,
+                            len(missingEpisodes), date.today(), datetime.now(),
+                            animeentry.get('skip_recheck_at'), EARLY_SCRAPE_DAYS,
+                            TVDB_PASTDUE_RECHECK_HOURS)
+
+                        if decision["updates"]:
+                            animeentry.update(decision["updates"])
+                            save_ani()
+                        if decision["log"]:
+                            level, message = decision["log"]
+                            tag = {"complete": "COMPLETE", "skip": "SKIP",
+                                   "retry": "RETRY", "early": "EARLY"}.get(decision["action"], "TVDB")
+                            getattr(_log, level)("[" + tag + "] " + name + " — " + message)
+                        if decision["terminal"]:
+                            run_counts["skipped"] += 1
+                            continue
                     except Exception as e:
                         _log.warning("[TVDB] Error checking " + name + ": " + str(e))
                 # --- End skip logic ----------------------------------------------

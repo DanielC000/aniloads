@@ -5,13 +5,14 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime
 from unittest import mock
 
 import support
 
 anibot = support.load_anibot()
 scrape = anibot.should_scrape_despite_skip
+tvdb_skip_decision = anibot.tvdb_skip_decision
 
 SKIP = date(2026, 4, 22)  # the skip_until airdate used across cases
 SKIP_STR = "2026-04-22"
@@ -548,6 +549,158 @@ class HandleFailedBatchTest(unittest.TestCase):
         saved, entry, counts = self._call(batch_result, [1])
         self.assertFalse(saved)
         self.assertEqual(counts["errors"], 1)
+
+
+class TvdbSkipDecisionTest(unittest.TestCase):
+    """Step 4 TVDB skip/complete checks (anibot.tvdb_skip_decision).
+
+    `episodes` is always passed in watchlist/TVDB numbering — the same
+    numbering the mover's `episode_offset` return-leg translation
+    (c0b7ab5, `_match_batch_episodes`) already leaves in the watchlist's
+    `episodes` field. tvdb_skip_decision never re-applies `episode_offset`
+    itself; these "offset entry" cases assert that pre-translated episodes
+    line up directly against a TVDB season's own numbering with no further
+    translation needed."""
+
+    TODAY = date(2026, 9, 17)
+    NOW = datetime(2026, 9, 17, 12, 0, 0)
+
+    def _decide(self, **kw):
+        defaults = dict(
+            series_status=None, tvdb_season=None, tvdb_ep_count=None, airdate=None,
+            episodes=0, missing_count=0, today=self.TODAY, now=self.NOW,
+            skip_recheck_at=None, early_scrape_days=1, pastdue_recheck_hours=2,
+        )
+        defaults.update(kw)
+        return tvdb_skip_decision(**defaults)
+
+    # -- offset entry: skips until airdate ---------------------------------
+    # Bleach TYBW "The Calamity": site files 41-46, episode_offset -40,
+    # watchlist wants 1-7 → animeentry['episodes'] holds 6 (watchlist/TVDB
+    # numbering) once episodes 1-6 are downloaded; tvdb_season is the season
+    # whose own numbering is 1-7 for that cour.
+    def test_offset_entry_skips_until_future_airdate(self):
+        d = self._decide(series_status="Continuing", tvdb_season=4, episodes=6,
+                          airdate="2026-09-24", missing_count=0)
+        self.assertEqual(d["action"], "skip")
+        self.assertTrue(d["terminal"])
+        self.assertEqual(d["updates"], {"skip_until": "2026-09-24", "skip_real_airdate": True})
+
+    def test_offset_entry_retries_when_missing_despite_future_airdate(self):
+        d = self._decide(series_status="Continuing", tvdb_season=4, episodes=6,
+                          airdate="2026-09-24", missing_count=2)
+        self.assertEqual(d["action"], "retry")
+        self.assertFalse(d["terminal"])
+        self.assertIn("2 missing episodes", d["log"][1])
+
+    def test_offset_entry_scrapes_early_within_window(self):
+        # today is the eve of the airdate, within early_scrape_days=1.
+        d = self._decide(series_status="Continuing", tvdb_season=4, episodes=6,
+                          airdate="2026-09-18", missing_count=0)
+        self.assertEqual(d["action"], "early")
+        self.assertFalse(d["terminal"])
+
+    # -- offset entry: auto-completes at the right count --------------------
+    def test_offset_entry_completes_at_full_season_count(self):
+        # All 7 watchlist-numbered episodes (site 41-47) downloaded, matching
+        # the TVDB season's own 7-episode count directly — no offset applied.
+        d = self._decide(series_status="Ended", tvdb_season=4, tvdb_ep_count=7,
+                          episodes=7, missing_count=0)
+        self.assertEqual(d["action"], "complete")
+        self.assertTrue(d["terminal"])
+        self.assertEqual(d["updates"], {"complete": True})
+
+    def test_offset_entry_not_yet_complete_below_season_count(self):
+        d = self._decide(series_status="Ended", tvdb_season=4, tvdb_ep_count=7,
+                          episodes=6, missing_count=0)
+        self.assertEqual(d["action"], "none")
+        self.assertFalse(d["terminal"])
+        self.assertEqual(d["updates"], {})
+
+    def test_ended_with_missing_episodes_not_complete(self):
+        d = self._decide(series_status="Ended", tvdb_season=4, tvdb_ep_count=7,
+                          episodes=7, missing_count=1)
+        self.assertEqual(d["action"], "none")
+        self.assertFalse(d["terminal"])
+
+    # -- past-due throttle ---------------------------------------------------
+    def test_pastdue_first_check_sets_recheck_and_falls_through_to_scrape(self):
+        # Airdate already passed, no recheck timestamp yet → allow this
+        # cycle's scrape and arm the throttle for the next one.
+        d = self._decide(series_status="Continuing", tvdb_season=4, episodes=6,
+                          airdate="2026-09-10", skip_recheck_at=None, missing_count=0,
+                          pastdue_recheck_hours=2)
+        self.assertEqual(d["action"], "none")
+        self.assertFalse(d["terminal"])
+        self.assertEqual(d["updates"], {"skip_recheck_at": "2026-09-17T14:00:00"})
+
+    def test_pastdue_within_throttle_window_skips(self):
+        d = self._decide(series_status="Continuing", tvdb_season=4, episodes=6,
+                          airdate="2026-09-10", skip_recheck_at="2026-09-17T14:00:00",
+                          missing_count=0)
+        self.assertEqual(d["action"], "skip")
+        self.assertTrue(d["terminal"])
+        self.assertEqual(d["updates"], {})
+        self.assertIn("re-checking after 2026-09-17T14:00:00", d["log"][1])
+
+    def test_pastdue_within_throttle_window_but_missing_retries(self):
+        d = self._decide(series_status="Continuing", tvdb_season=4, episodes=6,
+                          airdate="2026-09-10", skip_recheck_at="2026-09-17T14:00:00",
+                          missing_count=3)
+        self.assertEqual(d["action"], "retry")
+        self.assertFalse(d["terminal"])
+
+    def test_pastdue_after_throttle_window_rechecks_again(self):
+        # The previously armed recheck time has elapsed → allow another
+        # scrape and re-arm the throttle for another window.
+        d = self._decide(series_status="Continuing", tvdb_season=4, episodes=6,
+                          airdate="2026-09-10", skip_recheck_at="2026-09-17T10:00:00",
+                          missing_count=0, pastdue_recheck_hours=2)
+        self.assertEqual(d["action"], "none")
+        self.assertFalse(d["terminal"])
+        self.assertEqual(d["updates"], {"skip_recheck_at": "2026-09-17T14:00:00"})
+
+    def test_pastdue_ignores_unparseable_recheck_timestamp(self):
+        d = self._decide(series_status="Continuing", tvdb_season=4, episodes=6,
+                          airdate="2026-09-10", skip_recheck_at="not-a-timestamp",
+                          missing_count=0)
+        self.assertEqual(d["action"], "none")
+        self.assertEqual(d["updates"], {"skip_recheck_at": "2026-09-17T14:00:00"})
+
+    # -- no-offset behavior unchanged -----------------------------------------
+    def test_no_offset_entry_skips_until_airdate(self):
+        d = self._decide(series_status="Continuing", tvdb_season=1, episodes=2,
+                          airdate="2026-09-30", missing_count=0)
+        self.assertEqual(d["action"], "skip")
+        self.assertTrue(d["terminal"])
+
+    def test_no_offset_entry_completes(self):
+        d = self._decide(series_status="Ended", tvdb_season=1, tvdb_ep_count=12,
+                          episodes=12, missing_count=0)
+        self.assertEqual(d["action"], "complete")
+
+    def test_no_airdate_known_uses_synthetic_daily_throttle(self):
+        d = self._decide(series_status="Continuing", tvdb_season=1, episodes=2,
+                          airdate=None, missing_count=0)
+        self.assertEqual(d["action"], "skip")
+        self.assertTrue(d["terminal"])
+        self.assertEqual(d["updates"], {"skip_until": "2026-09-18", "skip_real_airdate": False})
+
+    def test_no_tvdb_season_no_op(self):
+        d = self._decide(series_status="Continuing", tvdb_season=None, episodes=2)
+        self.assertEqual(d["action"], "none")
+        self.assertFalse(d["terminal"])
+
+    def test_unknown_series_status_no_op(self):
+        d = self._decide(series_status="Upcoming", tvdb_season=1, episodes=2)
+        self.assertEqual(d["action"], "none")
+        self.assertFalse(d["terminal"])
+
+    def test_unparseable_airdate_is_ignored(self):
+        d = self._decide(series_status="Continuing", tvdb_season=1, episodes=2,
+                          airdate="not-a-date")
+        self.assertEqual(d["action"], "none")
+        self.assertEqual(d["updates"], {})
 
 
 if __name__ == "__main__":

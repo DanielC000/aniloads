@@ -1,10 +1,12 @@
 """Tests for the pure-logic functions in web/app.py."""
 
+import base64
 import collections
 import contextlib
 import html
 import http.client
 import json
+import logging
 import os
 import re
 import shutil
@@ -4122,6 +4124,236 @@ class NotifyMoverOncePerStuckItemTest(unittest.TestCase):
 
         app._notify_mover_events(app.run_move_cycle())
         self.assertEqual(len(self.sent), 1)  # still just the first notification
+
+
+class _DashboardServerTestBase(unittest.TestCase):
+    """Shared real-HTTP-server fixture for the auth/CSRF gate tests below.
+    Runs a genuine ThreadingHTTPServer bound to an ephemeral port so the gate
+    (Handler.parse_request) is exercised exactly as a real client hits it,
+    not by calling its methods directly."""
+
+    def setUp(self):
+        fd, self._ani_path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        with open(self._ani_path, "w", encoding="utf-8") as f:
+            json.dump({"settings": {}, "anime": []}, f)
+        self._orig_ani = app.ANI_JSON
+        app.ANI_JSON = self._ani_path
+
+        self._orig_auth_enabled = app.AUTH_ENABLED
+        self._orig_user = app.DASHBOARD_USER
+        self._orig_pass = app.DASHBOARD_PASS
+        app._move_trigger.clear()
+
+        self.server = app.ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        self.port = self.server.server_address[1]
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.server_thread.join(timeout=5)
+        app.AUTH_ENABLED = self._orig_auth_enabled
+        app.DASHBOARD_USER = self._orig_user
+        app.DASHBOARD_PASS = self._orig_pass
+        app._move_trigger.clear()
+        app.ANI_JSON = self._orig_ani
+        try:
+            os.remove(self._ani_path)
+        except OSError:
+            pass
+
+    def _request(self, method, path, headers=None, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        hdrs = dict(headers or {})
+        if body and "Content-Type" not in hdrs:
+            hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+        conn.request(method, path, body=body, headers=hdrs)
+        resp = conn.getresponse()
+        data = resp.read()
+        # resp.msg is an email.message.Message: case-insensitive .get(),
+        # unlike a plain dict built from getheaders().
+        resp_headers = resp.msg
+        conn.close()
+        return resp.status, resp_headers, data
+
+
+class DashboardAuthDisabledTest(_DashboardServerTestBase):
+    """Off (today's behavior) whenever either env var is missing."""
+
+    def test_200_when_both_unset(self):
+        app.AUTH_ENABLED = False
+        app.DASHBOARD_USER = ""
+        app.DASHBOARD_PASS = ""
+        status, _, _ = self._request("GET", "/")
+        self.assertEqual(status, 200)
+
+    def test_200_when_only_user_set(self):
+        app.DASHBOARD_USER = "u"
+        app.DASHBOARD_PASS = ""
+        app.AUTH_ENABLED = False
+        status, _, _ = self._request("GET", "/")
+        self.assertEqual(status, 200)
+
+    def test_200_when_only_pass_set(self):
+        app.DASHBOARD_USER = ""
+        app.DASHBOARD_PASS = "p"
+        app.AUTH_ENABLED = False
+        status, _, _ = self._request("GET", "/")
+        self.assertEqual(status, 200)
+
+
+class DashboardAuthEnabledTest(_DashboardServerTestBase):
+    def setUp(self):
+        super().setUp()
+        app.DASHBOARD_USER = "tester"
+        app.DASHBOARD_PASS = "s3cret-pw"
+        app.AUTH_ENABLED = True
+
+    def _basic(self, user, password):
+        token = base64.b64encode("{}:{}".format(user, password).encode("utf-8")).decode("ascii")
+        return {"Authorization": "Basic " + token}
+
+    def test_no_header_401(self):
+        status, headers, _ = self._request("GET", "/")
+        self.assertEqual(status, 401)
+        self.assertIn("Basic", headers.get("WWW-Authenticate", ""))
+
+    def test_wrong_user_401(self):
+        status, _, _ = self._request("GET", "/", headers=self._basic("nope", "s3cret-pw"))
+        self.assertEqual(status, 401)
+
+    def test_wrong_pass_401(self):
+        status, _, _ = self._request("GET", "/", headers=self._basic("tester", "wrong"))
+        self.assertEqual(status, 401)
+
+    def test_malformed_base64_401(self):
+        status, _, _ = self._request(
+            "GET", "/", headers={"Authorization": "Basic !!!not-base64!!!"})
+        self.assertEqual(status, 401)
+
+    def test_non_basic_scheme_401(self):
+        status, _, _ = self._request("GET", "/", headers={"Authorization": "Bearer abc123"})
+        self.assertEqual(status, 401)
+
+    def test_correct_creds_root_200(self):
+        status, _, _ = self._request("GET", "/", headers=self._basic("tester", "s3cret-pw"))
+        self.assertEqual(status, 200)
+
+    def test_correct_creds_api_status_200(self):
+        status, _, _ = self._request(
+            "GET", "/api/status", headers=self._basic("tester", "s3cret-pw"))
+        self.assertEqual(status, 200)
+
+    def test_correct_creds_post_ok(self):
+        status, _, _ = self._request(
+            "POST", "/move-now", headers=self._basic("tester", "s3cret-pw"))
+        self.assertEqual(status, 303)
+        self.assertTrue(app._move_trigger.is_set())
+
+    def test_password_never_logged(self):
+        log_records = []
+        handler = logging.Handler()
+        handler.emit = lambda record: log_records.append(record.getMessage())
+        app._log.addHandler(handler)
+        try:
+            creds_headers = self._basic("tester", "wrong-password-xyz")
+            self._request("GET", "/", headers=creds_headers)
+        finally:
+            app._log.removeHandler(handler)
+        combined = "\n".join(log_records)
+        self.assertNotIn("wrong-password-xyz", combined)
+        self.assertNotIn(creds_headers["Authorization"], combined)
+
+
+class CSRFProtectionTest(_DashboardServerTestBase):
+    """Always on, independent of dashboard auth — isolated here by leaving
+    auth disabled so a rejection can only be attributed to CSRF."""
+
+    def setUp(self):
+        super().setUp()
+        app.AUTH_ENABLED = False
+
+    def test_cross_origin_post_403_and_no_write(self):
+        status, _, _ = self._request(
+            "POST", "/move-now", headers={"Origin": "http://evil.example"})
+        self.assertEqual(status, 403)
+        self.assertFalse(app._move_trigger.is_set())
+
+    def test_origin_null_403(self):
+        status, _, _ = self._request("POST", "/move-now", headers={"Origin": "null"})
+        self.assertEqual(status, 403)
+        self.assertFalse(app._move_trigger.is_set())
+
+    def test_same_origin_post_ok(self):
+        origin = "http://127.0.0.1:{}".format(self.port)
+        status, _, _ = self._request("POST", "/move-now", headers={"Origin": origin})
+        self.assertEqual(status, 303)
+        self.assertTrue(app._move_trigger.is_set())
+
+    def test_referer_only_mismatch_403(self):
+        status, _, _ = self._request(
+            "POST", "/move-now", headers={"Referer": "http://evil.example/page"})
+        self.assertEqual(status, 403)
+        self.assertFalse(app._move_trigger.is_set())
+
+    def test_referer_only_match_ok(self):
+        referer = "http://127.0.0.1:{}/".format(self.port)
+        status, _, _ = self._request("POST", "/move-now", headers={"Referer": referer})
+        self.assertEqual(status, 303)
+        self.assertTrue(app._move_trigger.is_set())
+
+    def test_neither_header_ok(self):
+        status, _, _ = self._request("POST", "/move-now")
+        self.assertEqual(status, 303)
+        self.assertTrue(app._move_trigger.is_set())
+
+
+class ReverseProxyCSRFTest(_DashboardServerTestBase):
+    """A reverse proxy (e.g. nginx's default proxy_pass) forwards the
+    UPSTREAM Host, not the public name the browser's Origin carries — so the
+    CSRF check must also accept X-Forwarded-Host and an explicit
+    DASHBOARD_ALLOWED_ORIGINS allowlist, not just an exact Host match."""
+
+    def setUp(self):
+        super().setUp()
+        app.AUTH_ENABLED = False
+        self._orig_allowed = app.DASHBOARD_ALLOWED_ORIGINS
+
+    def tearDown(self):
+        app.DASHBOARD_ALLOWED_ORIGINS = self._orig_allowed
+        super().tearDown()
+
+    def test_forwarded_host_matching_origin_ok(self):
+        # Host (as seen by the dashboard) is "127.0.0.1:<port>" — the real
+        # request's own connection — but the proxy rewrote it and tells the
+        # dashboard the public name via X-Forwarded-Host, matching Origin.
+        status, _, _ = self._request(
+            "POST", "/move-now",
+            headers={
+                "Origin": "https://aniloads.home.lan",
+                "X-Forwarded-Host": "aniloads.home.lan",
+            })
+        self.assertEqual(status, 303)
+        self.assertTrue(app._move_trigger.is_set())
+
+    def test_allowlisted_origin_ok(self):
+        app.DASHBOARD_ALLOWED_ORIGINS = {"https://aniloads.home.lan"}
+        status, _, _ = self._request(
+            "POST", "/move-now", headers={"Origin": "https://aniloads.home.lan"})
+        self.assertEqual(status, 303)
+        self.assertTrue(app._move_trigger.is_set())
+
+    def test_mismatched_everything_403_with_hint(self):
+        app.DASHBOARD_ALLOWED_ORIGINS = set()
+        status, _, body = self._request(
+            "POST", "/move-now", headers={"Origin": "https://aniloads.home.lan"})
+        self.assertEqual(status, 403)
+        self.assertFalse(app._move_trigger.is_set())
+        text = body.decode("utf-8")
+        self.assertIn("X-Forwarded-Host", text)
+        self.assertIn("DASHBOARD_ALLOWED_ORIGINS", text)
 
 
 if __name__ == "__main__":

@@ -99,6 +99,9 @@ services:
       - RESOLVE_PENDING_BATCH_INTERVAL=${RESOLVE_PENDING_BATCH_INTERVAL:-120}
       - TVDB_HTTP_TIMEOUT=${TVDB_HTTP_TIMEOUT:-10}
       - NOTIFY_URL=${NOTIFY_URL:-}
+      - DASHBOARD_USER=${DASHBOARD_USER:-}
+      - DASHBOARD_PASS=${DASHBOARD_PASS:-}
+      - DASHBOARD_ALLOWED_ORIGINS=${DASHBOARD_ALLOWED_ORIGINS:-}
     volumes:
       - "${ANIME_CONFIG_DIR:?set in .env (see .env.example)}:/config"
       - "${ANIME_SETUP_DIR:?set in .env (see .env.example)}/web/app.py:/app/app.py:ro"

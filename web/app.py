@@ -5,7 +5,9 @@ Manages the ani.json watchlist for the pfuenzle/anime-loads bot.
 Reads bot logs and triggers runs via Docker socket.
 """
 
+import base64
 import collections
+import hmac
 import http.client
 import json
 import os
@@ -75,6 +77,34 @@ RESOLVE_PENDING_STARTUP_DELAY = int(os.environ.get("RESOLVE_PENDING_STARTUP_DELA
 RESOLVE_PENDING_EMPTY_INTERVAL = int(os.environ.get("RESOLVE_PENDING_EMPTY_INTERVAL", "60"))
 RESOLVE_PENDING_PER_ENTRY_DELAY = int(os.environ.get("RESOLVE_PENDING_PER_ENTRY_DELAY", "5"))
 RESOLVE_PENDING_BATCH_INTERVAL = int(os.environ.get("RESOLVE_PENDING_BATCH_INTERVAL", "120"))
+
+# Optional dashboard auth: HTTP Basic, enabled only when BOTH are set — read
+# once at import time (not per-request) so a test can still flip these on the
+# module to exercise both states. Off (today's behavior) when either is unset.
+DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "")
+DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "")
+AUTH_ENABLED = bool(DASHBOARD_USER and DASHBOARD_PASS)
+
+
+def _normalize_origin(value):
+    """A raw DASHBOARD_ALLOWED_ORIGINS entry as a lowercase "scheme://host:port"
+    string, tolerating a trailing slash / stray whitespace. Falls back to a
+    lowercased, stripped copy of the input if it doesn't parse as scheme+host,
+    so a malformed entry just never matches instead of raising at import."""
+    value = value.strip()
+    parsed = urlparse(value)
+    if not parsed.scheme or not parsed.netloc:
+        return value.lower()
+    return "{}://{}".format(parsed.scheme.lower(), parsed.netloc.lower())
+
+
+# Explicit CSRF allowlist (full "scheme://host:port" origins, comma-separated)
+# for a reverse-proxy setup where neither the request's own Host nor
+# X-Forwarded-Host lines up with the browser's Origin/Referer — see
+# Handler._check_csrf's docstring.
+DASHBOARD_ALLOWED_ORIGINS = {
+    _normalize_origin(o) for o in os.environ.get("DASHBOARD_ALLOWED_ORIGINS", "").split(",") if o.strip()
+}
 
 # Try to import animeloads library
 AL_AVAILABLE = False
@@ -3516,6 +3546,121 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def parse_request(self):
+        """The single gate for every route, present and future: this runs
+        before any do_GET/do_POST/etc. is dispatched (see
+        BaseHTTPRequestHandler.handle_one_request), so a handler added later
+        can't accidentally bypass auth/CSRF by skipping a call other routes
+        remember to make. Auth covers every method; CSRF only applies to
+        state-changing POSTs."""
+        if not BaseHTTPRequestHandler.parse_request(self):
+            return False
+        if not self._authorize():
+            return False
+        if self.command == "POST" and not self._check_csrf():
+            return False
+        return True
+
+    def _authorize(self):
+        """HTTP Basic auth, only enforced when both DASHBOARD_USER and
+        DASHBOARD_PASS are configured. Both the username and password are
+        compared with hmac.compare_digest, and both comparisons always run
+        (even on a username mismatch) so a wrong username can't be timed
+        apart from a wrong password. Never logs the Authorization header,
+        the password, or the attempted username — at most the client IP."""
+        if not AUTH_ENABLED:
+            return True
+        header = self.headers.get("Authorization", "")
+        valid = False
+        if header.startswith("Basic "):
+            try:
+                decoded = base64.b64decode(header[len("Basic "):].strip(), validate=True).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                decoded = None
+            if decoded is not None and ":" in decoded:
+                user, _, password = decoded.partition(":")
+                user_ok = hmac.compare_digest(user.encode("utf-8"), DASHBOARD_USER.encode("utf-8"))
+                pass_ok = hmac.compare_digest(password.encode("utf-8"), DASHBOARD_PASS.encode("utf-8"))
+                valid = user_ok and pass_ok
+        if valid:
+            return True
+        _log.warning("failed dashboard login from %s", self.client_address[0])
+        body = b"401 Unauthorized\n"
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Aniloads", charset="UTF-8"')
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return False
+
+    def _check_csrf(self):
+        """CSRF check, independent of auth: a cross-site POST — e.g. from a
+        malicious page a LAN browser visits — must not be able to trigger a
+        state change. Origin (or, absent that, Referer) must match the
+        dashboard's effective host, compared as host:port (inherently
+        scheme-insensitive, since netloc excludes scheme).
+
+        "Effective host" accounts for a reverse proxy in front of the
+        dashboard: nginx's default proxy_pass forwards the UPSTREAM Host
+        (e.g. "anime-web:8080") while the browser's Origin carries the
+        PUBLIC name (e.g. "https://aniloads.home.lan") — an exact match
+        against Host alone would then 403 every legitimate form POST after
+        such a deploy, silently making the dashboard read-only. So a
+        request also passes when Origin/Referer matches the first value of
+        X-Forwarded-Host (set by a proxy that rewrites Host), or matches one
+        of DASHBOARD_ALLOWED_ORIGINS (an explicit escape hatch for a proxy
+        that forwards neither). X-Forwarded-Host is set by the proxy, not
+        the browser — a cross-site attacker's own form POST has no way to
+        set it — so honoring it doesn't weaken this check.
+
+        Requests with neither Origin nor Referer (non-browser clients, old
+        browsers) are allowed — there's nothing to check them against, and
+        the dashboard's own forms are same-origin, so this only widens the
+        door for clients that were never going to send a forgeable browser
+        header anyway."""
+        origin = self.headers.get("Origin")
+        referer = self.headers.get("Referer")
+        candidate = origin if origin is not None else referer
+        if candidate is None:
+            return True
+
+        if origin is not None and origin.strip().lower() == "null":
+            self._csrf_reject(origin)
+            return False
+
+        parsed = urlparse(candidate)
+        candidate_netloc = parsed.netloc.lower()
+        candidate_origin = "{}://{}".format(parsed.scheme.lower(), candidate_netloc)
+
+        host = (self.headers.get("Host") or "").strip().lower()
+        forwarded_host = (self.headers.get("X-Forwarded-Host") or "").split(",")[0].strip().lower()
+
+        if candidate_netloc == host:
+            return True
+        if forwarded_host and candidate_netloc == forwarded_host:
+            return True
+        if candidate_origin in DASHBOARD_ALLOWED_ORIGINS:
+            return True
+
+        self._csrf_reject(candidate)
+        return False
+
+    def _csrf_reject(self, origin_value):
+        host_value = self.headers.get("Host") or ""
+        msg = (
+            "Cross-site form post rejected (Origin {} does not match Host {}). "
+            "If you use a reverse proxy, forward X-Forwarded-Host or set "
+            "DASHBOARD_ALLOWED_ORIGINS.".format(origin_value, host_value)
+        )
+        _log.warning(msg)
+        body = (msg + "\n").encode("utf-8")
+        self.send_response(403)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _respond(self, code, html):
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -4396,6 +4541,10 @@ def move_completed_worker():
 
 if __name__ == "__main__":
     _log.info("Anime-Loads Dashboard starting on port %d", PORT)
+    if AUTH_ENABLED:
+        _log.info("Dashboard login enabled")
+    else:
+        _log.info("Dashboard login DISABLED — set DASHBOARD_USER and DASHBOARD_PASS to require one")
 
     resolver = threading.Thread(target=resolve_pending, daemon=True)
     resolver.start()

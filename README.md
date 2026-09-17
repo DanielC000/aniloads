@@ -115,6 +115,14 @@ Open http://SERVER_IP:8085. Features:
 
 Both actions share one cooldown — `RUN_NOW_COOLDOWN_SECONDS` (default 120) — to protect anime-loads.org from being hit repeatedly; the dashboard shows how long until the next request is allowed. Restarting the bot container is still available directly via Docker (`docker restart anime-loads`) if ever needed, but is no longer wired into the dashboard UI.
 
+### Security
+
+The dashboard mounts `docker.sock` (`:ro` only restricts *how* the socket is bind-mounted, not what its API can do — anything with access to the socket can drive the Docker daemon), so treat access to the dashboard as equivalent to host access. It's recommended to set `DASHBOARD_USER` and `DASHBOARD_PASS` in `.env`: this turns on HTTP Basic auth for every route. Leave either unset and the dashboard has no login, same as before this feature — fine on a fully trusted LAN, risky on anything shared or exposed further.
+
+Independent of that login, every POST is checked against CSRF: if the request carries an `Origin` (or, absent that, a `Referer`) header, its host:port must match the dashboard's own — otherwise the request is rejected with `403` before anything changes. A request with **neither** header is allowed through, since there's nothing to check it against; this only matters for non-browser clients or very old browsers, as every dashboard form and its `fetch()` poll are same-origin and always send one of these headers.
+
+Behind a reverse proxy, the request's own `Host` is often the *upstream* name (e.g. `anime-web:8080`) rather than the public name the browser's `Origin` carries (e.g. `https://aniloads.home.lan`) — without help, that mismatch would 403 every legitimate form post. So the CSRF check also accepts a match against `X-Forwarded-Host` (set by a proxy that rewrites `Host`; a cross-site attacker's own form post can't set this header, so honoring it doesn't weaken the check), or against `DASHBOARD_ALLOWED_ORIGINS` — an explicit, comma-separated allowlist of full origins (e.g. `https://aniloads.home.lan`) for a proxy that forwards neither.
+
 ## ani.json Schema
 
 The bot and web UI share `ani.json`. Anime entries:

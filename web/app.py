@@ -1576,7 +1576,7 @@ def _parse_year(raw):
 # Move-completed logic
 # ---------------------------------------------------------------------------
 
-_SEASON_EP_RE = re.compile(r'(.*?)[._][Ss](\d+)[Ee](\d+)')
+_SEASON_EP_RE = re.compile(r'(.*?)[ ._-][Ss](\d+)[Ee](\d+)')
 _VIDEO_EXTS = {'.mkv', '.mp4', '.avi'}
 _ARCHIVE_RE = re.compile(r'\.(rar|r\d\d)$')
 # External subtitle sidecars: moved alongside their video, never deleted.
@@ -1589,11 +1589,17 @@ _JUNK_EXTS = {'.nfo', '.txt', '.url', '.jpg', '.jpeg', '.png'}
 
 
 def parse_season_episode(filename):
-    """Extract (name_part, season, episode) from a filename like 'Anime.Name.S01E05.mkv'."""
+    """Extract (name_part, season, episode) from a filename like 'Anime.Name.S01E05.mkv'.
+
+    The separator before SxxExx may be '.', '_', '-' or a space (so "Name -
+    S01E05" and "Name S01E05" both parse), and the matched separator itself
+    is stripped from the trailing edge of name_part (via rstrip) so a " - "
+    separator doesn't leave a dangling hyphen on the parsed name.
+    """
     m = _SEASON_EP_RE.match(filename)
     if not m:
         return None
-    name_part = m.group(1)
+    name_part = m.group(1).rstrip(' .-_')
     season = int(m.group(2))
     episode = int(m.group(3))
     return name_part, season, episode
@@ -1984,7 +1990,32 @@ def run_move_cycle():
 
     for entry_name in os.listdir(DOWNLOAD_DIR):
         dir_path = os.path.join(DOWNLOAD_DIR, entry_name)
+
         if not os.path.isdir(dir_path):
+            # A video file sitting loose in the download root (JDownloader
+            # without package subfolders enabled has nowhere else to put
+            # it). The move logic below is entirely folder-oriented (recency
+            # scan, archive/junk cleanup, subtitle sidecars, empty-dir
+            # removal all key off dir_path) and match_anime_entry's reliable
+            # signals (download_folder_pattern, customPackage) are keyed off
+            # a package folder name that doesn't exist here — so rather than
+            # guess at a destination, surface it as stuck for a human to
+            # enable package subfolders or move it into one by hand.
+            if os.path.splitext(entry_name)[1].lower() not in _VIDEO_EXTS:
+                continue
+            file_path = dir_path
+            try:
+                if os.path.getmtime(file_path) > age_threshold:
+                    events.append({"type": "wait", "msg": "{} — file still being modified".format(entry_name)})
+                    continue
+            except OSError:
+                continue
+            rel_path = os.path.relpath(file_path, DOWNLOAD_DIR)
+            msg = ("{} — not in a package folder (enable JDownloader's package "
+                   "subfolders, or move it into one)").format(entry_name)
+            is_new, ignored, _ = _stuck_touch(rel_path, "loose", entry_name, msg)
+            if is_new and not ignored:
+                events.append({"type": "error", "msg": msg})
             continue
 
         # --- Safety checks ---
@@ -3417,6 +3448,7 @@ _STUCK_REASON_LABELS = {
     "exists": "Already exists in library",
     "unmatched": "No watchlist match",
     "unsafe_folder": "Unsafe folder name (blocked)",
+    "loose": "Not in a package folder",
 }
 
 

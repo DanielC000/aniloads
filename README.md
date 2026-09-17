@@ -81,6 +81,8 @@ Open http://SERVER_IP:5800 and configure:
 
 The ExternInterface settings are required for the anime-loads bot container to reach JDownloader's CNL endpoint (port 9666) over the Docker network.
 
+- **Settings > General**: Enable "Create subfolder for packages" — without it, downloads land loose in `DOWNLOAD_DIR` and the mover can't safely file them, so they show up as stuck ("Not in a package folder") instead of being moved.
+
 ### 4. Anime-Loads Bot Config
 
 The bot config lives at `/config/ani.json` inside the container — i.e. the `ani.json` in the host directory you set as `ANIME_CONFIG_DIR`. The bot (or the dashboard, whichever starts first) seeds this file automatically with the defaults below the first time it finds none — it never overwrites an existing file. Non-secret fields can also be edited from the dashboard's Settings card (see below) instead of hand-editing the file. The one thing that must still be set explicitly (either here or from the dashboard) before the bot can download anything is a backend: `jdhost` (a local JDownloader) or `myjd_user` (MyJDownloader).

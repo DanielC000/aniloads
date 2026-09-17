@@ -247,6 +247,36 @@ class ParseSeasonEpisodeTest(unittest.TestCase):
         self.assertIsNone(app.parse_season_episode("Anime Movie 1080p.mkv"))
         self.assertIsNone(app.parse_season_episode("NoSeasonHere.mkv"))
 
+    def test_separator_variants_table(self):
+        cases = [
+            ("Anime.Name.S01E05.mkv", ("Anime.Name", 1, 5)),
+            ("Anime_Name_S02E10.mkv", ("Anime_Name", 2, 10)),
+            ("Show.s03e07.mkv", ("Show", 3, 7)),
+            ("Long.S12E123.mkv", ("Long", 12, 123)),
+            ("Kaiju No 8 S01E05.mkv", ("Kaiju No 8", 1, 5)),
+            ("Kaiju No 8-S01E03.mkv", ("Kaiju No 8", 1, 3)),
+            ("Kaiju No 8 - S01E03.mkv", ("Kaiju No 8", 1, 3)),
+        ]
+        for filename, expected in cases:
+            with self.subTest(filename=filename):
+                self.assertEqual(app.parse_season_episode(filename), expected)
+
+    def test_separator_variants_negative_table(self):
+        cases = [
+            "Anime Movie 1080p.mkv",
+            "NoSeasonHere.mkv",
+            # A title that happens to end in a bare season marker (no
+            # episode) must not be mistaken for a real SxxExx token.
+            "Attack on Titan S2.mkv",
+            # SxxExx glued directly onto a preceding word/tag, with no
+            # separator at all, must not false-match.
+            "CarS01E05.mkv",
+            "x264S01E05.mkv",
+        ]
+        for filename in cases:
+            with self.subTest(filename=filename):
+                self.assertIsNone(app.parse_season_episode(filename))
+
 
 class RenameSeasonEpisodeTest(unittest.TestCase):
     def test_rewrites_season_and_episode_preserving_width(self):
@@ -3099,6 +3129,64 @@ class RunMoveCycleTest(unittest.TestCase):
         escaped_dir = os.path.realpath(os.path.join(self.media, "..", "escaped"))
         self.assertFalse(os.path.isdir(escaped_dir))
         stuck = [v for v in app._stuck_items.values() if v["reason"] == "unsafe_folder"]
+        self.assertEqual(len(stuck), 1)
+
+    def _make_loose_file(self, filename, old=True):
+        """Create a bare file directly under DOWNLOAD_DIR (no package
+        subfolder), back-dated by default like _make_dl."""
+        p = os.path.join(self.download, filename)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("x")
+        if old:
+            past = time.time() - 3600
+            os.utime(p, (past, past))
+        return p
+
+    def test_loose_video_file_goes_stuck_not_silently_ignored(self):
+        self._write_ani([{"name": "Naruto", "media_type": "series"}])
+        loose = self._make_loose_file("Naruto.S01E05.mkv")
+        events = app.run_move_cycle()
+        self.assertIn("error", self._types(events))
+        stuck = [v for v in app._stuck_items.values() if v["reason"] == "loose"]
+        self.assertEqual(len(stuck), 1)
+        self.assertIn("package folder", stuck[0]["msg"])
+        # Left exactly where it was — not moved, not deleted.
+        self.assertTrue(os.path.isfile(loose))
+
+    def test_loose_video_file_recent_mtime_waits_not_stuck(self):
+        self._write_ani([])
+        self._make_loose_file("Fresh.S01E01.mkv", old=False)
+        events = app.run_move_cycle()
+        self.assertEqual(self._types(events), ["wait"])
+        self.assertEqual(app._stuck_items, {})
+
+    def test_loose_nonvideo_file_ignored(self):
+        self._write_ani([])
+        self._make_loose_file("readme.txt")
+        events = app.run_move_cycle()
+        self.assertEqual(events, [])
+        self.assertEqual(app._stuck_items, {})
+
+    def test_loose_video_file_not_repeated_on_next_cycle(self):
+        self._write_ani([])
+        self._make_loose_file("Loose.S01E01.mkv")
+        events = app.run_move_cycle()
+        self.assertIn("error", self._types(events))
+        events2 = app.run_move_cycle()
+        self.assertEqual(events2, [])
+
+    def test_loose_file_alongside_directory_download_both_processed(self):
+        # A mixed listing (one real package dir, one bare loose file) must
+        # not crash and must handle each independently.
+        self._write_ani([{"name": "Naruto", "media_type": "series"}])
+        self._make_dl("Naruto.S01", ["Naruto.S01E05.mkv"])
+        self._make_loose_file("Bleach.S01E01.mkv")
+        events = app.run_move_cycle()
+        self.assertIn("moved", self._types(events))
+        self.assertIn("error", self._types(events))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.media, "Naruto", "S01", "Naruto.S01E05.mkv")))
+        stuck = [v for v in app._stuck_items.values() if v["reason"] == "loose"]
         self.assertEqual(len(stuck), 1)
 
     def test_mover_containment_check_blocks_movie_escape(self):

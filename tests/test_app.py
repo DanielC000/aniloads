@@ -8249,7 +8249,12 @@ class MoveStartupWaitTest(unittest.TestCase):
         start = time.time()
         app._move_startup_wait()
         elapsed = time.time() - start
-        self.assertGreaterEqual(elapsed, 0.1)
+        # threading.Event.wait(timeout) can return a fraction of a
+        # millisecond before the nominal timeout on Windows (OS timer/
+        # scheduler granularity, not a bug in _move_startup_wait itself),
+        # so assert against the delay minus a small tolerance rather than
+        # the exact value.
+        self.assertGreaterEqual(elapsed, 0.1 - 0.02)
         self.assertFalse(app._move_trigger.is_set())
 
 

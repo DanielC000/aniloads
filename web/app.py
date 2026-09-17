@@ -876,11 +876,17 @@ def trigger_run_now(entry_url=None):
                 if entry is None:
                     outcome["result"] = "not_found"
                     return
+                if entry.get("paused"):
+                    outcome["result"] = "paused"
+                    outcome["name"] = entry.get("name", "?")
+                    return
                 entry["force_check"] = True
                 outcome["result"] = "ok"
                 outcome["name"] = entry.get("name", "?")
 
             update_ani(_set_force_check)
+            if outcome.get("result") == "paused":
+                return False, "{} is paused. Resume it first".format(outcome["name"])
             if outcome.get("result") != "ok":
                 return False, "Entry not found"
             name = outcome.get("name")
@@ -2286,6 +2292,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .wl-status--ok .wl-status-head { color: var(--ok-text); }
   .wl-status--danger .wl-status-dot { background: var(--danger-text); }
   .wl-status--danger .wl-status-head { color: var(--danger-text); }
+  /* Paused: a neutral pause glyph in place of the dot */
+  .wl-status--paused .wl-status-dot { width: 8px; height: 10px; border-radius: 0; background: none; border-left: 3px solid var(--text-muted); border-right: 3px solid var(--text-muted); }
   .wl-card .anime-meta { margin-top: var(--s2); }
 
   .wl-panels { display: flex; flex-wrap: wrap; column-gap: var(--s5); margin-top: var(--s3); padding-top: var(--s1); border-top: 1px solid var(--border); }
@@ -2315,6 +2323,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .wl-inline form { margin: 0; }
   .wl-edit-note { font-size: var(--fs-xs); color: var(--text); }
   .wl-card .folder-input { flex: 1 1 220px; max-width: 360px; width: auto; padding: 6px 10px; margin: 0; min-height: 32px; font-size: var(--fs-xs); }
+  .wl-edit-hint { font-size: var(--fs-xs); color: var(--text-faint); margin: 0; }
+  input[type=number].wl-num { width: 96px; padding: 6px 8px; margin: 0; min-height: 32px; font-size: var(--fs-xs); }
+  .wl-prefs { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--s2) var(--s3); margin-bottom: var(--s1); }
+  .wl-field { display: flex; flex-direction: column; gap: 2px; flex: 0 1 140px; font-size: var(--fs-xs); color: var(--text-muted); }
+  select.wl-select { width: 100%; padding: 6px 28px 6px 10px; margin: 0; min-height: 32px; font-size: var(--fs-xs); background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239aa3b2' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; }
+  .flow-have { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s3); }
+  .card .flow-have:not(:only-child) { margin-top: var(--s3); }
   .wl-remove { padding-top: var(--s3); border-top: 1px solid var(--border); }
   .wl-remove > summary { list-style: none; width: fit-content; }
   .wl-remove > summary::-webkit-details-marker { display: none; }
@@ -2329,7 +2344,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .form-row { flex-wrap: wrap; }
     .form-row select { flex: 1 1 100%; }
     /* 44px touch targets on phones */
-    .wl-card .btn, .wl-panel > summary, .wl-card .folder-input, .ep-add-row input[type=number] { min-height: 44px; }
+    .wl-card .btn, .wl-panel > summary, .wl-card .folder-input, .ep-add-row input[type=number], input[type=number].wl-num, select.wl-select { min-height: 44px; }
+    .wl-field { flex: 1 1 120px; }
     .wl-card .folder-input { max-width: none; flex-basis: 100%; }
   }
   @media (prefers-reduced-motion: reduce) {
@@ -2519,6 +2535,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 // take up to ~a minute — disable the button and relabel it on submit so the
 // page doesn't look hung while a normal (non-AJAX) form POST is in flight.
 // The threaded server keeps the /api/status poll below updating throughout.
+// "Already have episodes up to" fields show the episode the bot starts at.
+document.addEventListener('input', function(e) {
+  var hintId = e.target.getAttribute && e.target.getAttribute('data-next-hint');
+  var hint = hintId && document.getElementById(hintId);
+  if (!hint) return;
+  var n = parseInt(e.target.value, 10);
+  hint.textContent = (n >= 0) ? 'Next download: episode ' + (n + 1) : 'Enter 0 or more';
+});
+// Add flow: every form on the step carries a hidden have_episodes; fill it
+// from the one visible field when any of them is submitted.
+document.addEventListener('submit', function(e) {
+  var src = document.getElementById('flow-have');
+  var dst = e.target.querySelector('input[type=hidden][name=have_episodes]');
+  if (src && dst) dst.value = src.value || '0';
+}, true);
+
 function scrapeBusy(form, label) {
   var btn = form.querySelector('button[type=submit]');
   if (btn && !btn.disabled) {
@@ -3252,8 +3284,9 @@ def watchlist_status(entry, today=None):
 
     Returns ``(tone, headline, details)``: ``tone`` is ok / danger / neutral,
     ``headline`` the state in a few words and ``details`` a list of short
-    supporting facts. Precedence follows what needs the reader: retries first,
-    then movie, complete, never-downloaded, a known next date, and finally the
+    supporting facts. Precedence follows what needs the reader: a pause the
+    user set comes first (nothing else happens while it holds), then retries,
+    movie, complete, never-downloaded, a known next date, and finally the
     site status."""
     if today is None:
         today = _to_local(_utc_now()).date()
@@ -3262,6 +3295,13 @@ def watchlist_status(entry, today=None):
     site = translate_al_status(entry.get("al_status"))
     is_movie = entry.get("media_type") == "movie"
 
+    if entry.get("paused"):
+        details = ["the bot skips it until you resume"]
+        if missing:
+            details.append("{} waiting to retry".format(_plural(len(missing), "episode")))
+        elif eps and not is_movie:
+            details.append(_plural(eps, "episode"))
+        return "paused", "Paused", details
     if missing:
         if is_movie:
             return "danger", "Download retrying", []
@@ -3321,6 +3361,127 @@ def ep_add_max(entry):
     if isinstance(al_max_episodes, (int, float)) and 0 < al_max_episodes < 999999:
         return int(al_max_episodes)
     return 5000
+
+
+# Per-entry release preferences an edit may set. A blank choice removes the
+# override so the entry follows the global Preferences again.
+_PREF_LANGS = (("german", "German"), ("japanese", "Japanese"),
+               ("english", "English"), ("any", "Any"))
+_PREF_RESOLUTIONS = (480, 720, 1080)
+
+
+def entry_effective_prefs(entry, prefs):
+    """Global prefs with this entry's per-entry overrides applied: what
+    pick_best_release should use for this one series."""
+    effective = dict(prefs)
+    audio_override = entry.get("pref_audio_language", entry.get("pref_language"))
+    if audio_override:
+        effective["audio_language"] = audio_override
+    if entry.get("pref_sub_language"):
+        effective["sub_language"] = entry["pref_sub_language"]
+    if entry.get("pref_resolution"):
+        effective["min_resolution"] = entry["pref_resolution"]
+    return effective
+
+
+def next_download_note(entry):
+    """One sentence on what the bot does next with this entry, shown after an
+    edit that changes it (episodes, release, pause)."""
+    if entry.get("paused"):
+        return "Paused, so the bot skips it until you resume."
+    if entry.get("complete"):
+        return "Marked complete, so the bot downloads nothing more until you mark it incomplete."
+    if entry.get("media_type") == "movie":
+        return "The bot downloads the movie on its next check." if not _episode_count(entry) else ""
+    note = "The bot will download from episode {} on its next check".format(
+        _episode_count(entry) + 1)
+    missing = [m for m in (entry.get("missing") or []) if isinstance(m, int)]
+    if missing:
+        note += " and retry {}".format(_plural(len(missing), "episode"))
+    return note + "."
+
+
+def parse_have_episodes(raw, cap=_MAX_SANE_EPISODE_COUNT):
+    """The "I already have episodes up to N" field: an int 0..cap, or None
+    when it isn't one. Blank means 0 (have none)."""
+    raw = str(raw if raw is not None else "").strip()
+    if not raw:
+        return 0
+    if not re.fullmatch(r"\d{1,6}", raw):
+        return None
+    value = int(raw)
+    return value if value <= cap else None
+
+
+def parse_entry_prefs(params):
+    """The per-entry prefs form as {field: value-or-None}; None removes the
+    override. Returns (prefs, error)."""
+    langs = {code for code, _ in _PREF_LANGS}
+    out = {}
+    for field in ("pref_audio_language", "pref_sub_language"):
+        value = params.get(field, "").strip().lower()
+        if value and value not in langs:
+            return None, "unknown language"
+        out[field] = value or None
+    res = params.get("pref_resolution", "").strip()
+    if res:
+        if not res.isdigit() or int(res) not in _PREF_RESOLUTIONS:
+            return None, "unknown resolution"
+        out["pref_resolution"] = int(res)
+    else:
+        out["pref_resolution"] = None
+    return out, None
+
+
+def apply_entry_edit(entry, edit, value):
+    """Apply one validated dashboard edit to a watchlist entry, in place.
+
+    ``edit`` is "episodes" (int), "paused" (bool), "prefs" (dict from
+    parse_entry_prefs) or "release" (a release id already confirmed against
+    the site). Pure local mutation, so it can run inside update_ani's lock.
+    Returns (result, detail): result is "saved", "unchanged" or "invalid"."""
+    if edit == "episodes":
+        if not isinstance(value, int) or value < 0 or value > ep_add_max(entry):
+            return "invalid", "episodes must be between 0 and {}".format(ep_add_max(entry))
+        if _episode_count(entry) == value and "episodes" in entry:
+            return "unchanged", ""
+        entry["episodes"] = value
+        return "saved", ""
+    if edit == "paused":
+        if bool(entry.get("paused")) == bool(value):
+            return "unchanged", ""
+        if value:
+            entry["paused"] = True
+        else:
+            entry.pop("paused", None)
+        return "saved", ""
+    if edit == "prefs":
+        changed = False
+        for field, new in value.items():
+            if field == "pref_audio_language" and "pref_language" in entry:
+                entry.pop("pref_language", None)
+                changed = True
+            if new is None:
+                if field in entry:
+                    entry.pop(field)
+                    changed = True
+            elif entry.get(field) != new:
+                entry[field] = new
+                changed = True
+        return ("saved" if changed else "unchanged"), ""
+    if edit == "release":
+        try:
+            release_id = int(value)
+        except (TypeError, ValueError):
+            return "invalid", "invalid release"
+        if entry.get("releaseID") == release_id:
+            return "unchanged", ""
+        entry["releaseID"] = release_id
+        # The available-episodes cap was measured on the old release.
+        entry.pop("al_available_max", None)
+        entry.pop("al_available_max_set_at", None)
+        return "saved", ""
+    return "invalid", "unknown edit"
 
 
 def _sr(text):
@@ -3399,9 +3560,87 @@ def _render_episode_panel(i, entry, key, name):
                 escape(" · ".join(summary_bits)), body)
 
 
+def _pref_select(field, i, label, options, current):
+    """One labelled per-entry preference select; the blank option follows
+    the global Preferences."""
+    opts = '<option value="">Use global</option>'
+    for value, text in options:
+        opts += '<option value="{v}"{sel}>{t}</option>'.format(
+            v=escape(str(value)), t=escape(text),
+            sel=" selected" if str(current) == str(value) else "")
+    return ('<div class="wl-field"><label for="{f}-{i}">{label}</label>'
+            '<select id="{f}-{i}" name="{f}" class="wl-select">{opts}</select></div>').format(
+                f=field, i=i, label=label, opts=opts)
+
+
+def _render_download_rows(i, entry, key, name):
+    """The top of the Edit panel: pause, episodes already owned, release and
+    per-entry release preferences."""
+    if entry.get("paused"):
+        note, value, button = "Paused. The bot skips this series.", "0", "Resume downloads"
+    else:
+        note, value, button = "Active. Checked on every bot run.", "1", "Pause downloads"
+    rows = (
+        '<div class="wl-edit-row"><span class="wl-edit-label">Downloads</span>'
+        '<div class="wl-inline"><span class="wl-edit-note">{note}</span>'
+        '<form method="POST" action="/entry-edit">{key}'
+        '<input type="hidden" name="edit" value="paused">'
+        '<input type="hidden" name="paused" value="{value}">'
+        '<button type="submit" class="btn btn-ghost btn-sm">{button}{sr}</button>'
+        '</form></div></div>').format(
+            note=note, value=value, button=button, key=_key_input(key),
+            sr=_sr(" for {}".format(name)))
+
+    if entry.get("media_type") != "movie":
+        eps = _episode_count(entry)
+        rows += (
+            '<form method="POST" action="/entry-edit" class="wl-edit-row">{key}'
+            '<input type="hidden" name="edit" value="episodes">'
+            '<label class="wl-edit-label" for="have-{i}">Already have episodes up to</label>'
+            '<div class="wl-inline">'
+            '<input type="number" id="have-{i}" name="episodes" value="{eps}" min="0" max="{max}" '
+            'inputmode="numeric" required class="wl-num" aria-describedby="have-hint-{i}" '
+            'data-next-hint="have-hint-{i}">'
+            '<button type="submit" class="btn btn-ghost btn-sm">Save episodes{sr}</button>'
+            '<span class="wl-edit-hint" id="have-hint-{i}">Next download: episode {next}</span>'
+            '</div></form>').format(
+                key=_key_input(key), i=i, eps=eps, max=ep_add_max(entry), next=eps + 1,
+                sr=_sr(" for {}".format(name)))
+
+    release_id = entry.get("releaseID")
+    rows += (
+        '<div class="wl-edit-row"><span class="wl-edit-label">Release</span>'
+        '<div class="wl-inline"><span class="wl-edit-note">{current}</span>'
+        '<form method="POST" action="/entry-releases" '
+        'onsubmit="return scrapeBusy(this, \'Fetching releases…\');">{key}'
+        '<button type="submit" class="btn btn-ghost btn-sm">Change release{sr}</button>'
+        '</form></div></div>').format(
+            current="Release #{}".format(escape(str(release_id))) if release_id else "No release chosen",
+            key=_key_input(key), sr=_sr(" for {}".format(name)))
+
+    audio = entry.get("pref_audio_language", entry.get("pref_language", ""))
+    rows += (
+        '<form method="POST" action="/entry-edit" class="wl-edit-row">{key}'
+        '<input type="hidden" name="edit" value="prefs">'
+        '<span class="wl-edit-label" id="prefs-label-{i}">Release preferences</span>'
+        '<div class="wl-prefs" role="group" aria-labelledby="prefs-label-{i}">{dub}{sub}{res}'
+        '<button type="submit" class="btn btn-ghost btn-sm">Save preferences{sr}</button></div>'
+        '<p class="wl-edit-hint">Used to pick the best match when you change release.</p>'
+        '</form>').format(
+            key=_key_input(key), i=i, sr=_sr(" for {}".format(name)),
+            dub=_pref_select("pref_audio_language", i, "Dub", _PREF_LANGS, audio),
+            sub=_pref_select("pref_sub_language", i, "Sub", _PREF_LANGS,
+                             entry.get("pref_sub_language", "")),
+            res=_pref_select("pref_resolution", i, "Min resolution",
+                             [(r, "{}p".format(r)) for r in _PREF_RESOLUTIONS],
+                             entry.get("pref_resolution", "")))
+    return rows
+
+
 def _render_edit_panel(i, entry, key, name):
     folder = entry.get("customPackage", entry.get("name", "Unknown"))
-    rows = (
+    rows = _render_download_rows(i, entry, key, name)
+    rows += (
         '<form method="POST" action="/update-folder" class="wl-edit-row">{key}'
         '<label class="wl-edit-label" for="folder-{i}">Download folder</label>'
         '<div class="wl-inline">'
@@ -3419,9 +3658,15 @@ def _render_edit_panel(i, entry, key, name):
         rows += (
             '<div class="wl-edit-row"><span class="wl-edit-label">TVDB</span>'
             '<div class="wl-inline"><span class="wl-edit-note">Linked{detail}</span>'
+            '{edit_form}'
             '<form method="POST" action="/tvdb-unlink">{key}'
             '<button type="submit" class="btn btn-ghost btn-sm" onclick="{confirm}">'
             'Unlink TVDB{sr}</button></form></div></div>').format(
+                edit_form=(
+                    '<form method="POST" action="/tvdb-link">{}'
+                    '<button type="submit" class="btn btn-ghost btn-sm">Edit TVDB link{}</button>'
+                    '</form>').format(_key_input(key), _sr(" for {}".format(name)))
+                if tvdb.available else "",
                 detail=escape(", " + ", ".join(linked)) if linked else "",
                 key=_key_input(key),
                 confirm=confirm_attr("Unlink {} from TVDB?".format(name)),
@@ -3503,6 +3748,20 @@ def render_watchlist_card(i, a):
             '<span class="badge badge-neutral" title="{}">{}</span>'.format(escape(t), escape(label))
             for label, t in facts))
 
+    # While paused, Check now would do nothing: the header offers Resume.
+    if a.get("paused"):
+        head_action = (
+            '<form method="POST" action="/entry-edit" class="wl-check">{}'
+            '<input type="hidden" name="edit" value="paused">'
+            '<input type="hidden" name="paused" value="0">'
+            '<button type="submit" class="btn btn-ghost btn-sm">Resume{}</button></form>').format(
+                _key_input(key), _sr(" downloads for {}".format(name)))
+    else:
+        head_action = (
+            '<form method="POST" action="/check-now" class="wl-check">{}'
+            '<button type="submit" class="btn btn-ghost btn-sm">Check now{}</button></form>').format(
+                _key_input(key), _sr(" for {}".format(name)))
+
     return """
         <article class="card wl-card" aria-labelledby="wl-name-{i}">
           <div class="wl-head">
@@ -3510,17 +3769,14 @@ def render_watchlist_card(i, a):
               <h3 class="anime-name" id="wl-name-{i}">{name}</h3>
               {url_html}
             </div>
-            <form method="POST" action="/check-now" class="wl-check">
-              {key_input}
-              <button type="submit" class="btn btn-ghost btn-sm">Check now{sr}</button>
-            </form>
+            {head_action}
           </div>
           {status_html}
           {facts_html}
           <div class="wl-panels">{ep_panel}{edit_panel}</div>
         </article>""".format(
         i=i, name=escape(name), url_html=_watchlist_url_html(url),
-        key_input=_key_input(key), sr=_sr(" for {}".format(name)),
+        head_action=head_action,
         status_html=status_html, facts_html=facts_html,
         ep_panel=_render_episode_panel(i, a, key, name),
         edit_panel=_render_edit_panel(i, a, key, name),
@@ -3604,9 +3860,23 @@ def render_search_results(results, ani_data=None):
     return html
 
 
-def render_releases(anime_info, best_id=None, with_tvdb=True, note=""):
+def _render_have_field(have_episodes):
+    """The add flow's "I already have episodes up to N" field. Every form on
+    the step carries a hidden ``have_episodes`` the page script fills from
+    this one visible input on submit."""
+    return """
+      <div class="flow-have">
+        <label class="hint" for="flow-have">Already have episodes up to</label>
+        <input type="number" id="flow-have" value="{have}" min="0" max="{cap}" inputmode="numeric"
+               class="wl-num" aria-describedby="flow-have-hint" data-next-hint="flow-have-hint">
+        <span class="hint" id="flow-have-hint">Next download: episode {next}</span>
+      </div>""".format(have=have_episodes, cap=_MAX_SANE_EPISODE_COUNT, next=have_episodes + 1)
+
+
+def render_releases(anime_info, best_id=None, with_tvdb=True, note="", have_episodes=0):
     """Release picker, step 1 of the add flow. ``note`` is an optional hint
-    shown above the list (e.g. why auto-select didn't skip this step)."""
+    shown above the list (e.g. why auto-select didn't skip this step).
+    ``have_episodes`` prefills "Already have episodes up to" (series only)."""
     if not anime_info:
         return ""
     html = '<div class="section">'
@@ -3614,13 +3884,15 @@ def render_releases(anime_info, best_id=None, with_tvdb=True, note=""):
     html += '<h2>Select Release for: {}</h2>'.format(escape(anime_info["name"]))
     if note:
         html += '<p class="hint flow-note">{}</p>'.format(escape(note))
+    media_type = anime_info.get("media_type", "series") or "series"
+    have_episodes = parse_have_episodes(have_episodes) or 0
     html += """
     <div class="card" style="margin-bottom:16px;">
       <label class="hint" for="release-folder">Folder name in /anime library:</label>
-      <input type="text" id="release-folder" value="{name}" style="margin-top:4px;margin-bottom:0;">
-    </div>""".format(name=escape(anime_info["name"]))
+      <input type="text" id="release-folder" value="{name}" style="margin-top:4px;margin-bottom:0;">{have}
+    </div>""".format(name=escape(anime_info["name"]),
+                     have="" if media_type == "movie" else _render_have_field(have_episodes))
 
-    media_type = anime_info.get("media_type", "series") or "series"
     year = _parse_year(anime_info.get("year"))
     display_title = anime_info.get("display_title") or ""
     # Every release id actually offered on this page — carried as a hidden
@@ -3655,6 +3927,7 @@ def render_releases(anime_info, best_id=None, with_tvdb=True, note=""):
               <input type="hidden" name="media_type" value="{mt}">
               <input type="hidden" name="year" value="{year}">
               <input type="hidden" name="display_title" value="{display_title}">
+              <input type="hidden" name="have_episodes" value="{have}">
               <button type="submit" class="btn btn-primary btn-sm">Add this release</button>
             </form>
           </div>
@@ -3664,7 +3937,72 @@ def render_releases(anime_info, best_id=None, with_tvdb=True, note=""):
             name=escape(anime_info["name"]), rid=rel["id"], highlight=highlight,
             best_label=best_label, mt=escape(media_type), valid_ids=escape(valid_ids),
             year=year or "", display_title=escape(display_title),
+            have=0 if media_type == "movie" else have_episodes,
         )
+    html += "</div>"
+    return html
+
+
+def render_entry_release_picker(entry, anime_info, best_id=None):
+    """Release picker for an entry already on the watchlist (Edit > Change
+    release). Picking one posts to /entry-edit; the entry keeps its episode
+    count, so the page says where downloads continue from."""
+    name = entry.get("name", "Unknown")
+    key = entry.get("url", "")
+    current = entry.get("releaseID")
+    media_type = anime_info.get("media_type", "series") or "series"
+    valid_ids = ",".join(str(rel["id"]) for rel in anime_info["releases"])
+    cancel_href = "/?" + urlencode({"msg": "Cancelled: {} unchanged".format(name)})
+
+    html = '<div class="section">'
+    html += '<h2>Change release: {}</h2>'.format(escape(name))
+    if media_type == "movie":
+        hint = "Switching release keeps everything else about this entry."
+    else:
+        eps = _episode_count(entry)
+        hint = ("You have episodes up to {}, so after switching the bot downloads "
+                "from episode {} of the new release.").format(eps, eps + 1)
+    html += '<p class="hint">{}</p>'.format(escape(hint))
+    html += ('<div class="flow-actions"><a class="btn btn-ghost" href="{}">Cancel</a></div>').format(
+        escape(cancel_href))
+
+    for rel in anime_info["releases"]:
+        dubs = escape(", ".join(rel["dubs"])) if rel["dubs"] else "&mdash;"
+        subs = escape(", ".join(rel["subs"])) if rel["subs"] else "&mdash;"
+        is_current = str(rel["id"]) == str(current)
+        labels = ""
+        if is_current:
+            labels += ' <span class="badge badge-ok">Current</span>'
+        if rel["id"] == best_id:
+            labels += ' <span class="badge badge-accent">Best match</span>'
+        if is_current:
+            action = '<span class="hint" style="margin-left:auto;">In use</span>'
+        else:
+            action = """
+            <form method="POST" action="/entry-edit" style="margin:0;margin-left:auto;">
+              <input type="hidden" name="key" value="{key}">
+              <input type="hidden" name="edit" value="release">
+              <input type="hidden" name="release_id" value="{rid}">
+              <input type="hidden" name="release_ids" value="{valid_ids}">
+              <input type="hidden" name="release_episodes" value="{eps}">
+              <input type="hidden" name="media_type" value="{mt}">
+              <button type="submit" class="btn btn-primary btn-sm">Use this release</button>
+            </form>""".format(key=escape(key), rid=rel["id"], valid_ids=escape(valid_ids),
+                              eps=rel["episodes"], mt=escape(media_type))
+        html += """
+        <div class="card {highlight}">
+          <div class="release-row">
+            <span class="badge badge-res">{res}p</span>
+            <span class="badge badge-neutral">Dub: {dubs}</span>
+            <span class="badge badge-neutral">Sub: {subs}</span>
+            <span class="badge badge-ep">{eps} eps</span>
+            <span class="hint">#{rid} &middot; {size}MB &middot; {group}</span>
+            {labels}{action}
+          </div>
+        </div>""".format(
+            highlight="card-selected" if is_current else "", res=rel["resolution"],
+            dubs=dubs, subs=subs, eps=rel["episodes"], rid=rel["id"], size=rel["size_mb"],
+            group=escape(rel["group"]), labels=labels, action=action)
     html += "</div>"
     return html
 
@@ -3686,7 +4024,8 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
                      search_results=None, seasons=None, selected_tvdb_id="",
                      selected_tvdb_name="", ep_count=0, edit_key=None,
                      media_type="series", release_ids="", episodes=0,
-                     query=None, year="", display_title="", auto_release=None):
+                     query=None, year="", display_title="", auto_release=None,
+                     have_episodes=0, current_season=None, current_offset=0):
     """Render the TVDB correlation page shown between release selection and saving.
 
     When edit_key is set (the existing entry's URL), this is editing an existing
@@ -3708,6 +4047,11 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
     series doesn't silently re-run the search under a different query.
     ``auto_release`` is the release auto-select picked when it skipped the
     picker, so the page can say what was chosen.
+
+    ``have_episodes`` is the add flow's "Already have episodes up to" value,
+    shown as a field here too since auto-select can skip the picker.
+    ``current_season``/``current_offset`` prefill the season picker when
+    editing an existing TVDB link.
     """
     is_movie = (media_type == "movie")
     is_add = edit_key is None
@@ -3727,11 +4071,14 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
              rid=escape(str(release_id)), folder=escape(custom_folder),
              mt=escape(media_type), valid_ids=escape(release_ids),
              eps=int(episodes) if str(episodes).lstrip("-").isdigit() else 0)
+    have_episodes = parse_have_episodes(have_episodes) or 0
     if is_add:
         hidden += (
             '<input type="hidden" name="year" value="{year}">'
             '<input type="hidden" name="display_title" value="{dt}">'
-        ).format(year=_parse_year(year) or "", dt=escape(display_title or ""))
+            '<input type="hidden" name="have_episodes" value="{have}">'
+        ).format(year=_parse_year(year) or "", dt=escape(display_title or ""),
+                 have=0 if is_movie else have_episodes)
     else:
         hidden += '<input type="hidden" name="key" value="{}">'.format(escape(edit_key))
 
@@ -3746,6 +4093,13 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
     if auto_release:
         html += '<p class="hint flow-note">Auto-selected the release that best matches your preferences: <strong>{}</strong></p>'.format(
             escape(_release_summary(auto_release)))
+    if not is_add and selected_tvdb_id:
+        linked = "Currently linked to TVDB {}".format(selected_tvdb_id)
+        if current_season is not None:
+            linked += ", season {}".format(current_season)
+        if current_offset:
+            linked += ", offset {:+d}".format(current_offset)
+        html += '<p class="hint flow-note">{}.</p>'.format(escape(linked))
 
     if is_add:
         # Leave the TVDB step without linking: save as-is, or go back to the
@@ -3760,9 +4114,13 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
       <form method="POST" action="/add-url" onsubmit="return scrapeBusy(this, 'Fetching releases…');">
         <input type="hidden" name="url" value="{url}">
         <input type="hidden" name="pick" value="1">
+        <input type="hidden" name="have_episodes" value="{have}">
         <button type="submit" class="btn btn-ghost">Change release</button>
       </form>
-    </div>""".format(hidden=hidden, action=save_action, url=escape(url))
+    </div>""".format(hidden=hidden, action=save_action, url=escape(url), have=have_episodes)
+        if not is_movie:
+            html += '<div class="card" style="margin-bottom:16px;">{}</div>'.format(
+                _render_have_field(have_episodes))
     else:
         html += """
     <div class="flow-actions">
@@ -3833,6 +4191,9 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
         for s in seasons:
             is_suggested = best_season is not None and s["season_number"] == best_season
             suggest_label = ' <span class="badge badge-accent">Likely match ({} eps)</span>'.format(ep_count) if is_suggested else ""
+            is_current = not is_add and current_season is not None and s["season_number"] == current_season
+            if is_current:
+                suggest_label = ' <span class="badge badge-ok">Current</span>' + suggest_label
             special_label = ' <span class="hint">Specials</span>' if s["season_number"] == 0 else ""
             highlight = "background:var(--accent-soft-bg);border-radius:6px;padding-left:8px;padding-right:8px;" if is_suggested else ""
             html += """
@@ -3846,24 +4207,29 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
                 {hidden}
                 <input type="hidden" name="tvdb_id" value="{tid}">
                 <input type="hidden" name="tvdb_season" value="{snum}">
-                <input type="hidden" name="episode_offset" value="0">
+                <input type="hidden" name="episode_offset" value="{offset}">
                 <button type="submit" class="btn btn-primary btn-sm">Use Season {snum}</button>
               </form>
             </div>""".format(
                 snum=s["season_number"], eps=s["episode_count"],
                 suggest=suggest_label, special=special_label, hidden=hidden,
                 tid=escape(str(selected_tvdb_id)), highlight=highlight,
-                save_action=save_action)
+                save_action=save_action,
+                # Re-picking the linked season keeps its offset; a different
+                # season starts from none (set one under Advanced).
+                offset=current_offset if is_current else 0)
 
         # Advanced: manual offset input. Defaults to the suggested season,
         # or with no suggestion to the first regular (non-specials) season.
-        if best_season is not None:
+        if not is_add and current_season is not None:
+            default_season = current_season
+        elif best_season is not None:
             default_season = best_season
         else:
             regular = [s["season_number"] for s in seasons if s["season_number"] != 0]
             default_season = min(regular) if regular else (seasons[0]["season_number"] if seasons else 1)
         html += """
-        <details style="margin-top:12px;">
+        <details style="margin-top:12px;"{adv_open}>
           <summary class="hint" style="cursor:pointer;">Advanced: episode offset</summary>
           <div style="margin-top:8px;">
             <p class="hint" style="margin:0 0 8px;">
@@ -3876,13 +4242,15 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
               <label for="adv-season">Season:</label>
               <input type="number" id="adv-season" name="tvdb_season" min="0" value="{suggested}" style="width:60px;margin:0;" required>
               <label for="adv-offset">Offset:</label>
-              <input type="number" id="adv-offset" name="episode_offset" value="0" style="width:60px;margin:0;">
+              <input type="number" id="adv-offset" name="episode_offset" value="{offset}" style="width:60px;margin:0;">
               <button type="submit" class="btn btn-primary btn-sm">Save season</button>
             </form>
           </div>
         </details>""".format(hidden=hidden, tid=escape(str(selected_tvdb_id)),
                              suggested=default_season,
-                             save_action=save_action)
+                             save_action=save_action,
+                             offset=current_offset if not is_add else 0,
+                             adv_open=" open" if (not is_add and current_offset) else "")
         html += '</div>'
 
     html += "</div>"
@@ -4390,11 +4758,20 @@ class Handler(BaseHTTPRequestHandler):
                 release_ids=params.get("release_ids", ""), episodes=episodes,
                 year=params.get("year", ""),
                 display_title=params.get("display_title", ""),
-                auto_release=auto_release)
+                auto_release=auto_release,
+                have_episodes=params.get("have_episodes", 0))
             self._respond(200, render_page(search_html=search_html))
             return
 
         folder_name_raw = custom_folder if custom_folder else name
+        have_episodes = parse_have_episodes(params.get("have_episodes"))
+        if have_episodes is None:
+            self._redirect_msg(
+                "Error: 'Already have episodes up to' must be a whole number, 0 or more",
+                level="err")
+            return
+        if media_type == "movie":
+            have_episodes = 0
         folder_name = _safe_folder_segment(folder_name_raw)
         if not folder_name:
             self._redirect_msg("Error: invalid folder name", level="err")
@@ -4406,7 +4783,7 @@ class Handler(BaseHTTPRequestHandler):
         entry = {
             "url": url,
             "name": name,
-            "episodes": 0,
+            "episodes": have_episodes,
             "missing": [],
             "customPackage": folder_name,
             "pref_audio_language": prefs.get("audio_language", "german"),
@@ -4481,8 +4858,90 @@ class Handler(BaseHTTPRequestHandler):
         if auto_release:
             auto_info = "; auto-selected the {}p release".format(
                 auto_release.get("resolution", "?"))
+        if have_episodes:
+            auto_info += "; downloads start at episode {}".format(have_episodes + 1)
         self._redirect_msg("Added: {} (folder: {}{}{})".format(
             name, folder_display, season_info, auto_info), level="ok")
+
+    def _entry_edit(self, params):
+        """/entry-edit: one per-entry setting from a watchlist card's Edit
+        panel (``edit`` = episodes / paused / prefs / release), keyed by URL.
+        Input is validated first; a release pick may need one scrape to be
+        confirmed, which happens before the single update_ani lock hold."""
+        entry_url = params.get("key", "")
+        edit = params.get("edit", "")
+        if edit == "episodes":
+            value = parse_have_episodes(params.get("episodes"))
+            if value is None:
+                self._redirect_msg("Error: episodes must be a whole number, 0 or more", level="err")
+                return
+        elif edit == "paused":
+            if params.get("paused") not in ("0", "1"):
+                self._redirect_msg("Error: invalid pause request", level="err")
+                return
+            value = params.get("paused") == "1"
+        elif edit == "prefs":
+            value, err = parse_entry_prefs(params)
+            if err:
+                self._redirect_msg("Error: {}".format(err), level="err")
+                return
+        elif edit == "release":
+            if not params.get("release_id"):
+                self._redirect_msg("Error: no release selected", level="err")
+                return
+            value, _media_type, _eps = _resolve_release_selection(entry_url, {
+                "release_id": params.get("release_id", ""),
+                "release_ids": params.get("release_ids", ""),
+                "media_type": params.get("media_type", ""),
+                "episodes": params.get("release_episodes", ""),
+            })
+            if not value:
+                self._redirect_msg(
+                    "Error: invalid release selection. Fetch releases again", level="err")
+                return
+        else:
+            self._redirect_msg("Error: unknown edit", level="err")
+            return
+
+        outcome = {}
+
+        def _apply(data):
+            _, entry = find_entry_by_url(data.get("anime", []), entry_url)
+            if entry is None:
+                outcome["result"] = "not_found"
+                return
+            result, detail = apply_entry_edit(entry, edit, value)
+            outcome.update(result=result, detail=detail, name=entry.get("name", "?"),
+                           note=next_download_note(entry),
+                           episodes=_episode_count(entry), release=entry.get("releaseID"))
+
+        update_ani(_apply)
+        result = outcome.get("result")
+        if result == "not_found":
+            self._redirect_msg("Error: entry not found", level="err")
+            return
+        name = outcome["name"]
+        if result == "invalid":
+            self._redirect_msg("Error: {}: {}".format(name, outcome["detail"]), level="err")
+            return
+        _log.info("[watchlist] Edit %s (%s): %s", name, edit, result)
+        changed = result == "saved"
+        note = outcome["note"]
+        if edit == "episodes":
+            msg = "{}: {} episodes up to {}. {}".format(
+                name, "you have" if changed else "already set to have", outcome["episodes"], note)
+        elif edit == "paused":
+            if value:
+                msg = "Paused {}. The bot skips it until you resume.".format(name) if changed                     else "{} is already paused.".format(name)
+            else:
+                msg = "Resumed {}. {}".format(name, note) if changed                     else "{} is not paused.".format(name)
+        elif edit == "prefs":
+            msg = ("Saved release preferences for {}. They apply when you change release."
+                   if changed else "Release preferences for {} unchanged.").format(name)
+        else:
+            msg = "{} {} release #{}. {}".format(
+                name, "now uses" if changed else "already uses", outcome["release"], note)
+        self._redirect_msg(msg.strip(), level="ok")
 
     def _dispatch_post(self, parsed, params):
         if parsed.path == "/run-now":
@@ -4655,7 +5114,8 @@ class Handler(BaseHTTPRequestHandler):
                 note = "No release matches your preferences, so auto-select was skipped. Pick one below."
             search_html = render_releases(
                 anime_info, best["id"] if best else None,
-                with_tvdb=tvdb.available, note=note)
+                with_tvdb=tvdb.available, note=note,
+                have_episodes=params.get("have_episodes", 0))
             self._respond(200, render_page(search_html=search_html))
 
         elif parsed.path == "/add-release":
@@ -4679,7 +5139,8 @@ class Handler(BaseHTTPRequestHandler):
                 release_ids=params.get("release_ids", ""),
                 episodes=params.get("episodes", 0), query=query,
                 year=params.get("year", ""),
-                display_title=params.get("display_title", ""))
+                display_title=params.get("display_title", ""),
+                have_episodes=params.get("have_episodes", 0))
             self._respond(200, render_page(search_html=search_html))
 
         elif parsed.path == "/tvdb-seasons":
@@ -4729,7 +5190,8 @@ class Handler(BaseHTTPRequestHandler):
                 media_type=media_type,
                 release_ids=params.get("release_ids", ""), episodes=ep_count,
                 query=query, year=params.get("year", ""),
-                display_title=params.get("display_title", ""))
+                display_title=params.get("display_title", ""),
+                have_episodes=params.get("have_episodes", 0))
             self._respond(200, render_page(search_html=search_html))
 
         elif parsed.path == "/search":
@@ -4870,10 +5332,25 @@ class Handler(BaseHTTPRequestHandler):
                 media_type = entry.get("media_type", "series")
                 content_type = "movie" if media_type == "movie" else "series"
                 results = tvdb.search(name, content_type=content_type)
-                search_html = render_tvdb_step(
-                    name, url, "", "",
-                    search_results=results, edit_key=url,
-                    media_type=media_type)
+                if entry.get("tvdb_id"):
+                    # Already linked: open the step on the current link so
+                    # changing the season or offset is one click, not
+                    # unlink + search + relink.
+                    seasons = (tvdb.get_seasons(entry["tvdb_id"])
+                               if media_type != "movie" else None)
+                    search_html = render_tvdb_step(
+                        name, url, "", "",
+                        search_results=results, edit_key=url,
+                        media_type=media_type, seasons=seasons,
+                        selected_tvdb_id=entry["tvdb_id"], selected_tvdb_name=name,
+                        ep_count=_episode_count(entry),
+                        current_season=entry.get("tvdb_season"),
+                        current_offset=entry.get("episode_offset", 0) or 0)
+                else:
+                    search_html = render_tvdb_step(
+                        name, url, "", "",
+                        search_results=results, edit_key=url,
+                        media_type=media_type)
                 self._respond(200, render_page(search_html=search_html))
             else:
                 self._redirect_msg("Error: entry not found or TVDB unavailable", level="err")
@@ -4954,6 +5431,27 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect_msg("TVDB unlinked: {}".format(outcome["name"]))
             else:
                 self._redirect_msg("Error: entry not found", level="err")
+
+        elif parsed.path == "/entry-releases":
+            entry_url = params.get("key", "")
+            _, entry = find_entry_by_url(load_ani().get("anime", []), entry_url)
+            if entry is None:
+                self._redirect_msg("Error: entry not found", level="err")
+                return
+            # Scrape with no lock held (see update_ani).
+            anime_info, err = get_releases(entry_url)
+            if err or not anime_info or not anime_info.get("releases"):
+                self._redirect_msg("Error: could not fetch releases for {}{}".format(
+                    entry.get("name", "?"), ": " + err if err else ""), level="err")
+                return
+            best = pick_best_release(anime_info["releases"],
+                                     entry_effective_prefs(entry, load_prefs()))
+            search_html = render_entry_release_picker(
+                entry, anime_info, best["id"] if best else None)
+            self._respond(200, render_page(search_html=search_html))
+
+        elif parsed.path == "/entry-edit":
+            self._entry_edit(params)
 
         elif parsed.path == "/update-folder":
             entry_url = params.get("key", "")

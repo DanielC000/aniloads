@@ -5299,7 +5299,8 @@ class RenderWatchlistCardTest(unittest.TestCase):
         c = _ControlCollector()
         c.feed(out)
         self.assertEqual(len(c.ids), len(set(c.ids)))
-        self.assertEqual(len(c.controls), 4)  # folder + retry number, per card
+        # per card: have-episodes, dub, sub, resolution, folder, retry number
+        self.assertEqual(len(c.controls), 12)
         for ctl in c.controls:
             self.assertTrue(ctl.get("id") in c.label_for or ctl.get("aria-label"), ctl)
 
@@ -5351,6 +5352,263 @@ class DashboardLandmarksTest(unittest.TestCase):
     def test_per_episode_js_builder_is_gone(self):
         self.assertNotIn("expandEps", app.HTML_TEMPLATE)
 
+
+class ApplyEntryEditTest(unittest.TestCase):
+    """Pure per-entry edits behind /entry-edit: each field persists, invalid
+    input is rejected, a no-op says so."""
+
+    def test_episodes_persist_within_announced_total(self):
+        entry = {"episodes": 0, "al_max_episodes": 24}
+        self.assertEqual(app.apply_entry_edit(entry, "episodes", 12), ("saved", ""))
+        self.assertEqual(entry["episodes"], 12)
+        self.assertEqual(app.apply_entry_edit(entry, "episodes", 12)[0], "unchanged")
+        self.assertEqual(app.apply_entry_edit(entry, "episodes", 0)[0], "saved")
+        self.assertEqual(entry["episodes"], 0)
+
+    def test_episodes_beyond_announced_total_or_negative_rejected(self):
+        entry = {"episodes": 3, "al_max_episodes": 24}
+        self.assertEqual(app.apply_entry_edit(entry, "episodes", 25)[0], "invalid")
+        self.assertEqual(app.apply_entry_edit(entry, "episodes", -1)[0], "invalid")
+        self.assertEqual(entry["episodes"], 3)
+
+    def test_pause_and_resume(self):
+        entry = {}
+        self.assertEqual(app.apply_entry_edit(entry, "paused", True)[0], "saved")
+        self.assertIs(entry["paused"], True)
+        self.assertEqual(app.apply_entry_edit(entry, "paused", True)[0], "unchanged")
+        self.assertEqual(app.apply_entry_edit(entry, "paused", False)[0], "saved")
+        self.assertNotIn("paused", entry)
+
+    def test_prefs_set_and_blank_removes_override(self):
+        entry = {"pref_language": "german", "pref_resolution": 1080}
+        prefs, err = app.parse_entry_prefs({"pref_audio_language": "japanese",
+                                            "pref_sub_language": "", "pref_resolution": ""})
+        self.assertIsNone(err)
+        self.assertEqual(app.apply_entry_edit(entry, "prefs", prefs)[0], "saved")
+        self.assertEqual(entry, {"pref_audio_language": "japanese"})
+        prefs, _ = app.parse_entry_prefs({"pref_audio_language": "japanese",
+                                          "pref_sub_language": "", "pref_resolution": ""})
+        self.assertEqual(app.apply_entry_edit(entry, "prefs", prefs)[0], "unchanged")
+
+    def test_prefs_invalid_rejected(self):
+        self.assertEqual(app.parse_entry_prefs({"pref_audio_language": "klingon"})[1],
+                         "unknown language")
+        self.assertEqual(app.parse_entry_prefs({"pref_resolution": "2160"})[1],
+                         "unknown resolution")
+        self.assertEqual(app.parse_entry_prefs({"pref_resolution": "abc"})[1],
+                         "unknown resolution")
+
+    def test_release_change_drops_old_release_cap(self):
+        entry = {"releaseID": 1, "al_available_max": 9, "al_available_max_set_at": "2026-09-01"}
+        self.assertEqual(app.apply_entry_edit(entry, "release", "2")[0], "saved")
+        self.assertEqual(entry, {"releaseID": 2})
+        self.assertEqual(app.apply_entry_edit(entry, "release", "2")[0], "unchanged")
+        self.assertEqual(app.apply_entry_edit(entry, "release", "x")[0], "invalid")
+
+    def test_parse_have_episodes(self):
+        self.assertEqual(app.parse_have_episodes(""), 0)
+        self.assertEqual(app.parse_have_episodes(" 12 "), 12)
+        for bad in ("-1", "1.5", "abc", "9999999"):
+            self.assertIsNone(app.parse_have_episodes(bad), bad)
+
+    def test_next_download_note(self):
+        self.assertEqual(app.next_download_note({"episodes": 12}),
+                         "The bot will download from episode 13 on its next check.")
+        self.assertIn("retry 1 episode", app.next_download_note({"episodes": 12, "missing": [4]}))
+        self.assertIn("Paused", app.next_download_note({"episodes": 12, "paused": True}))
+        self.assertIn("mark it incomplete", app.next_download_note({"episodes": 12, "complete": True}))
+
+
+class EntryEditHandlerTest(unittest.TestCase):
+    """/entry-edit and /entry-releases through the real handler, with the
+    release scrape stubbed."""
+
+    URL = "https://www.anime-loads.org/media/edit-me"
+
+    setUp = AddAnimeFlowTest.setUp
+    tearDown = AddAnimeFlowTest.tearDown
+    set_prefs = AddAnimeFlowTest.set_prefs
+    _post = AddAnimeFlowTest._post
+    _form_fields = AddAnimeFlowTest._form_fields
+
+    def seed(self, **fields):
+        entry = {"url": self.URL, "name": "Edit Me", "releaseID": 11, "episodes": 3,
+                 "missing": [], "customPackage": "Edit Me", "al_max_episodes": 24}
+        entry.update(fields)
+        app.save_ani({"settings": {}, "anime": [entry]})
+
+    def entry(self):
+        return app.load_ani()["anime"][0]
+
+    def edit(self, **params):
+        params.setdefault("key", self.URL)
+        return self._post("/entry-edit", params)
+
+    def test_episodes_saved_with_next_download_guardrail(self):
+        self.seed()
+        r = self.edit(edit="episodes", episodes="12")
+        self.assertEqual(r["level"], "ok")
+        self.assertEqual(self.entry()["episodes"], 12)
+        self.assertIn("will download from episode 13", r["msg"])
+
+    def test_episodes_invalid_rejected_and_unchanged(self):
+        self.seed()
+        for bad in ("abc", "-2", "25"):
+            r = self.edit(edit="episodes", episodes=bad)
+            self.assertEqual(r["level"], "err", bad)
+        self.assertEqual(self.entry()["episodes"], 3)
+
+    def test_pause_then_resume(self):
+        self.seed()
+        r = self.edit(edit="paused", paused="1")
+        self.assertIn("Paused Edit Me", r["msg"])
+        self.assertIs(self.entry()["paused"], True)
+        r = self.edit(edit="paused", paused="1")
+        self.assertIn("already paused", r["msg"])
+        r = self.edit(edit="paused", paused="0")
+        self.assertIn("Resumed Edit Me", r["msg"])
+        self.assertNotIn("paused", self.entry())
+        self.assertEqual(self.edit(edit="paused", paused="maybe")["level"], "err")
+
+    def test_prefs_saved(self):
+        self.seed(pref_audio_language="german")
+        r = self.edit(edit="prefs", pref_audio_language="", pref_sub_language="english",
+                      pref_resolution="720")
+        self.assertEqual(r["level"], "ok")
+        e = self.entry()
+        self.assertNotIn("pref_audio_language", e)
+        self.assertEqual((e["pref_sub_language"], e["pref_resolution"]), ("english", 720))
+        self.assertEqual(self.edit(edit="prefs", pref_audio_language="x")["level"], "err")
+
+    def test_release_picker_then_switch(self):
+        self.seed(pref_audio_language="japanese", pref_resolution=720)
+        page = self._post("/entry-releases", {"key": self.URL})["html"]
+        # the picker section only; the page's watchlist card has its own forms
+        out = page.split("<h2>Change release:", 1)[1].split('<h2>Watchlist (', 1)[0]
+        self.assertTrue(out.startswith(" Edit Me</h2>"))
+        self.assertIn("downloads from episode 4 of the new release", out)
+        # Current release (11) has no button; best match uses the entry's own prefs.
+        fields = self._form_fields(out, "/entry-edit")
+        self.assertEqual(fields["release_id"], "12")
+        self.assertEqual(out.count('action="/entry-edit"'), 1)
+        self.assertIn('Best match</span>', out)
+        r = self._post("/entry-edit", fields)
+        self.assertEqual(r["level"], "ok")
+        self.assertIn("now uses release #12", r["msg"])
+        self.assertEqual(self.entry()["releaseID"], 12)
+        self.assertEqual(len(self.scrapes), 1)
+
+    def test_tampered_release_rejected(self):
+        self.seed()
+        # Not among the offered ids: re-checked against a fresh scrape, refused.
+        r = self.edit(edit="release", release_id="99", release_ids="11,12",
+                      release_episodes="12", media_type="series")
+        self.assertEqual(r["level"], "err")
+        self.assertEqual(self.entry()["releaseID"], 11)
+
+    def test_unknown_entry(self):
+        self.seed()
+        r = self.edit(key="https://www.anime-loads.org/media/nope", edit="paused", paused="1")
+        self.assertEqual(r["msg"], "Error: entry not found")
+
+    def test_add_flow_already_have_episodes(self):
+        self.set_prefs(auto_select=False)
+        out = self._post("/add-url", {"url": self.URL})["html"]
+        self.assertIn('id="flow-have"', out)
+        fields = self._form_fields(out, "/add-release")
+        self.assertEqual(fields["have_episodes"], "0")
+        fields["have_episodes"] = "7"
+        r = self._post("/add-release", fields)
+        self.assertIn("downloads start at episode 8", r["msg"])
+        self.assertEqual(app.load_ani()["anime"][0]["episodes"], 7)
+
+    def test_add_flow_have_episodes_carried_through_tvdb_step(self):
+        app.tvdb.available = True
+        self.set_prefs(auto_select=False)
+        out = self._post("/add-url", {"url": self.URL})["html"]
+        fields = self._form_fields(out, "/add-release")
+        fields["have_episodes"] = "5"
+        out = self._post("/add-release", fields)["html"]
+        self.assertIn('id="flow-have" value="5"', out)
+        seasons_fields = self._form_fields(out, "/tvdb-seasons")
+        self.assertEqual(seasons_fields["have_episodes"], "5")
+        out = self._post("/tvdb-seasons", seasons_fields)["html"]
+        save = self._form_fields(out, "/add-release", index=1)  # 0 is "Save without TVDB"
+        self.assertEqual(save["tvdb_season"], "1")
+        self.assertEqual(save["have_episodes"], "5")
+        self._post("/add-release", save)
+        entry = app.load_ani()["anime"][0]
+        self.assertEqual((entry["episodes"], entry["tvdb_id"]), (5, 77))
+
+    def test_add_flow_invalid_have_episodes_rejected(self):
+        self.set_prefs(auto_select=False)
+        out = self._post("/add-url", {"url": self.URL})["html"]
+        fields = self._form_fields(out, "/add-release")
+        fields["have_episodes"] = "lots"
+        self.assertEqual(self._post("/add-release", fields)["level"], "err")
+        self.assertEqual(app.load_ani()["anime"], [])
+
+    def test_edit_tvdb_link_prefills_current_season_and_offset(self):
+        app.tvdb.available = True
+        app.tvdb.get_seasons = lambda tvdb_id: [{"season_number": 1, "episode_count": 12},
+                                                {"season_number": 2, "episode_count": 12}]
+        self.seed(tvdb_id=77, tvdb_season=2, episode_offset=12)
+        out = self._post("/tvdb-link", {"key": self.URL})["html"]
+        self.assertIn("Currently linked to TVDB 77, season 2, offset +12.", out)
+        self.assertIn('<span class="badge badge-ok">Current</span>', out)
+        self.assertIn('id="adv-season" name="tvdb_season" min="0" value="2"', out)
+        self.assertIn('id="adv-offset" name="episode_offset" value="12"', out)
+        # form 0 is Cancel, then one "Use Season" form per season
+        season2 = self._form_fields(out, "/tvdb-save", index=2)
+        self.assertEqual((season2["tvdb_season"], season2["episode_offset"]), ("2", "12"))
+        season1 = self._form_fields(out, "/tvdb-save", index=1)
+        self.assertEqual(season1["episode_offset"], "0")
+
+
+class PausedEntryTest(unittest.TestCase):
+    def test_paused_status_outranks_retries(self):
+        tone, head, details = app.watchlist_status(
+            {"paused": True, "episodes": 5, "missing": [2], "complete": True})
+        self.assertEqual((tone, head), ("paused", "Paused"))
+        self.assertIn("1 episode waiting to retry", details)
+
+    def test_paused_card_offers_resume_instead_of_check_now(self):
+        out = app.render_watchlist([{"name": "P", "url": "https://x/p", "episodes": 5,
+                                     "paused": True}])
+        head, edit = out.split('<details class="wl-panel wl-edit">', 1)
+        self.assertNotIn('action="/check-now"', out)
+        self.assertIn('Resume<span class="sr-only"> downloads for P</span>', head)
+        self.assertIn('Resume downloads<span class="sr-only"> for P</span>', edit)
+        self.assertIn("wl-status--paused", head)
+
+    def test_active_card_edit_panel_fields(self):
+        out = app.render_watchlist([{"name": "A", "url": "https://x/a", "episodes": 5,
+                                     "releaseID": 2, "pref_sub_language": "english",
+                                     "al_max_episodes": 24}])
+        edit = out.split('<details class="wl-panel wl-edit">', 1)[1]
+        self.assertIn('Pause downloads<span class="sr-only"> for A</span>', edit)
+        self.assertIn('id="have-0" name="episodes" value="5" min="0" max="24"', edit)
+        self.assertIn("Next download: episode 6", edit)
+        self.assertIn("Release #2", edit)
+        self.assertIn('action="/entry-releases"', edit)
+        self.assertIn('<option value="english" selected>English</option>', edit)
+
+    def test_movie_has_no_episodes_field(self):
+        out = app.render_watchlist([{"name": "M", "url": "https://x/m", "media_type": "movie"}])
+        self.assertNotIn('name="episodes"', out)
+
+
+class PausedCheckNowTest(unittest.TestCase):
+    setUp = RunNowTriggerTest.setUp
+    tearDown = RunNowTriggerTest.tearDown
+
+    def test_check_now_refuses_paused_entry(self):
+        app.save_ani({"anime": [{"name": "A", "url": "http://x/a", "paused": True}]})
+        ok, msg = app.trigger_run_now(entry_url="http://x/a")
+        self.assertFalse(ok)
+        self.assertIn("paused", msg)
+        self.assertNotIn("force_check", app.load_ani()["anime"][0])
+        self.assertFalse(os.path.isfile(app.RUN_NOW_FILE))
 
 if __name__ == "__main__":
     unittest.main()

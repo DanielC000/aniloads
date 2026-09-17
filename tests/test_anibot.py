@@ -1569,5 +1569,156 @@ class NotifyCycleTest(unittest.TestCase):
         self.assertIn("bad creds", self.sent[0][2])
 
 
+class UserEditedEntryTest(unittest.TestCase):
+    """Dashboard-edited fields the bot must read fresh: `paused` (skip before
+    any other logic, never unpause) and `episodes` (user-editable, re-read
+    right before planning downloads; the bot only writes it back when it
+    changed it itself)."""
+
+    URL = "http://x/a"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-useredit-")
+        self.path = os.path.join(self.tmp, "ani.json")
+
+    def _write(self, anime):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"settings": {}, "anime": anime}, f)
+
+    def _read_entry(self):
+        with open(self.path, "r", encoding="utf-8") as f:
+            return json.load(f)["anime"][0]
+
+    def _set_on_disk(self, **fields):
+        # What a dashboard /entry-edit does: a field write on the fresh file.
+        entry = self._read_entry()
+        entry.update(fields)
+        self._write([entry])
+
+    def _start_entry(self, snapshot):
+        """The top of startbot()'s per-entry loop: refresh, then the
+        saved_state baseline, exactly as the loop builds them."""
+        self.assertTrue(anibot.refresh_entry(self.path, snapshot))
+        saved_state = {f: snapshot[f] for f in anibot.BOT_OWNED_SCALAR_FIELDS if f in snapshot}
+        saved_state["missing"] = list(snapshot["missing"])
+        return saved_state
+
+    def _save(self, saved_state, animeentry):
+        fields, unset, list_deltas = anibot.compute_entry_delta(saved_state, animeentry)
+        if fields or unset or list_deltas:
+            self.assertTrue(anibot.anistore.merge_entry_fields(
+                self.path, "anime", self.URL, fields=fields, unset=unset, list_deltas=list_deltas))
+            saved_state.update(fields)
+
+    def test_paused_entry_is_skipped_with_reason(self):
+        self.assertIsNone(anibot.paused_skip_reason({"name": "A"}))
+        self.assertIsNone(anibot.paused_skip_reason({"name": "A", "paused": False}))
+        self.assertEqual(anibot.paused_skip_reason({"name": "A", "paused": True}),
+                         "A — paused in the dashboard, skipping")
+
+    def test_paused_skip_recorded_in_run_state_entries(self):
+        orig_botfile = anibot.botfile
+        anibot.botfile = self.path
+        self.addCleanup(setattr, anibot, "botfile", orig_botfile)
+        counts = {"entries": 2, "checked": 0, "downloaded": 0, "errors": 0, "skipped": 0,
+                  "unavailable": 0, "mismatch": 0}
+        outcomes = {}
+        self.assertFalse(anibot.skip_if_paused({"name": "B", "url": "http://x/b"}, counts, outcomes))
+        self.assertTrue(anibot.skip_if_paused(
+            {"name": "A", "url": self.URL, "paused": True}, counts, outcomes))
+        self.assertEqual(counts["skipped"], 1)
+        anibot.write_run_state("2026-09-17T01:00:00Z", "2026-09-17T01:01:00Z", 600, counts,
+                               entry_outcomes=outcomes, watchlist_urls=[self.URL, "http://x/b"])
+        with open(os.path.join(self.tmp, "run_state.json"), "r", encoding="utf-8") as f:
+            entries = json.load(f)["entries"]
+        self.assertEqual(entries[self.URL]["result"], "paused")
+        self.assertEqual(entries[self.URL]["reason"], "paused from dashboard")
+        self.assertNotIn("http://x/b", entries)
+
+    def test_pause_set_after_cycle_start_is_seen(self):
+        snapshot = {"name": "A", "url": self.URL, "episodes": 3, "missing": []}
+        self._write([dict(snapshot, paused=True, releaseID=2)])
+        self.assertTrue(anibot.refresh_entry(self.path, snapshot))
+        self.assertTrue(snapshot["paused"])
+        self.assertEqual(snapshot["releaseID"], 2)
+        self.assertIsNotNone(anibot.paused_skip_reason(snapshot))
+
+    def test_paused_skip_runs_before_any_other_entry_logic(self):
+        import inspect
+        src = inspect.getsource(anibot.startbot)
+        order = [src.index(token) for token in (
+            "refresh_entry(botfile", "skip_if_paused(animeentry",
+            "resolve_force_check(botfile", "pre_scrape_skip_decision(",
+            "al.getAnime(url)", "sync_user_episodes(botfile", "wanted_episodes(")]
+        self.assertEqual(order, sorted(order))
+
+    def test_refresh_skips_entry_removed_mid_cycle(self):
+        self._write([{"name": "Other", "url": "http://x/other"}])
+        snapshot = {"name": "A", "url": self.URL}
+        self.assertFalse(anibot.refresh_entry(self.path, snapshot))
+        self.assertEqual(snapshot, {"name": "A", "url": self.URL})
+
+    def test_refresh_keeps_snapshot_when_file_is_corrupt(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("{nope")
+        snapshot = {"name": "A", "url": self.URL, "episodes": 3}
+        self.assertTrue(anibot.refresh_entry(self.path, snapshot))
+        self.assertEqual(snapshot["episodes"], 3)
+
+    def test_user_sets_episodes_mid_entry_and_bot_continues_from_there(self):
+        # Cycle start read episodes=3; the dashboard set 5 before the bot got
+        # to this entry, then 12 while the bot was scraping it.
+        snapshot = {"name": "A", "url": self.URL, "episodes": 3, "missing": []}
+        self._write([dict(snapshot, episodes=5)])
+        saved_state = self._start_entry(snapshot)
+        self.assertEqual(snapshot["episodes"], 5)
+
+        self._set_on_disk(episodes=12)
+        episodes = anibot.sync_user_episodes(self.path, snapshot, saved_state)
+        self.assertEqual(episodes, 12)
+        self.assertEqual(anibot.wanted_episodes([], episodes, 14), ([], [13, 14]))
+        # Adopting the user's value is not itself a bot delta.
+        self.assertEqual(anibot.compute_entry_delta(saved_state, snapshot), ({}, [], {}))
+
+        # The bot downloads 13 and 14: its own change is written.
+        snapshot["episodes"] = 14
+        self._save(saved_state, snapshot)
+        self.assertEqual(self._read_entry()["episodes"], 14)
+
+    def test_user_edit_after_planning_survives_when_bot_downloads_nothing(self):
+        snapshot = {"name": "A", "url": self.URL, "episodes": 10, "missing": []}
+        self._write([dict(snapshot)])
+        saved_state = self._start_entry(snapshot)
+        self.assertEqual(anibot.sync_user_episodes(self.path, snapshot, saved_state), 10)
+        self._set_on_disk(episodes=12)
+        # Nothing new online; the bot touches other fields only.
+        snapshot["al_status"] = "Laufend"
+        self._save(saved_state, snapshot)
+        entry = self._read_entry()
+        self.assertEqual((entry["episodes"], entry["al_status"]), (12, "Laufend"))
+
+    def test_bot_rollback_this_cycle_wins_over_user_value(self):
+        snapshot = {"name": "A", "url": self.URL, "episodes": 10, "missing": []}
+        self._write([dict(snapshot)])
+        saved_state = self._start_entry(snapshot)
+        snapshot["episodes"] = 8  # rolled back to the available cap, not yet saved
+        self._set_on_disk(episodes=12)
+        self.assertEqual(anibot.sync_user_episodes(self.path, snapshot, saved_state), 8)
+        self._save(saved_state, snapshot)
+        self.assertEqual(self._read_entry()["episodes"], 8)
+
+    def test_sync_ignores_garbage_episodes_on_disk(self):
+        snapshot = {"name": "A", "url": self.URL, "episodes": 4, "missing": []}
+        self._write([dict(snapshot)])
+        saved_state = self._start_entry(snapshot)
+        for bad in ("12", -1, True, None):
+            self._set_on_disk(episodes=bad)
+            self.assertEqual(anibot.sync_user_episodes(self.path, snapshot, saved_state), 4)
+
+    def test_wanted_episodes(self):
+        self.assertEqual(anibot.wanted_episodes([2], 0, 3), ([2], [1, 2, 3]))
+        self.assertEqual(anibot.wanted_episodes([], 12, 10), ([], []))
+        self.assertEqual(anibot.wanted_episodes([], "4", 5), ([], [5]))
+
 if __name__ == "__main__":
     unittest.main()

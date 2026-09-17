@@ -241,9 +241,21 @@ def tvdb_skip_decision(series_status, tvdb_season, tvdb_ep_count, airdate, episo
 # single retry episode; the bot removes a downloaded one and adds a failed
 # one on the same list), so it is handled as a DELTA against the fresh
 # on-disk list, never a wholesale replacement — see BOT_OWNED_LIST_FIELDS
-# and compute_entry_delta() below. `episodes` has no such conflict (the
-# dashboard never writes it), so the bot's value — even when it goes DOWN,
-# e.g. rolling back after an episode turns out unavailable — always wins.
+# and compute_entry_delta() below.
+#
+# `episodes` is shared too: the dashboard sets it when the user says "I
+# already have episodes up to N". It stays in the scalar list, but the bot
+# writes it only through compute_entry_delta(), i.e. only when the bot itself
+# changed it this cycle (advanced it after a download, or rolled it back after
+# an episode turned out unavailable) — and then its value wins, even going
+# DOWN. The bot never writes back a value it merely read. startbot() re-reads
+# the entry fresh at the top of each entry (refresh_entry) and re-reads
+# `episodes` again right before deciding what to download
+# (sync_user_episodes), so a dashboard edit made up to that point is honored
+# this same cycle.
+#
+# `paused` is user-owned like releaseID and the pref_* overrides: the bot
+# only reads it (fresh, at the top of each entry) and never clears it.
 BOT_OWNED_SCALAR_FIELDS = (
     "episodes", "skip_until", "skip_real_airdate", "skip_recheck_at",
     "al_status", "al_max_episodes", "al_available_max", "al_available_max_set_at",
@@ -289,6 +301,98 @@ def compute_entry_delta(before, after, scalar_fields=BOT_OWNED_SCALAR_FIELDS,
             list_deltas[f] = (added, removed)
 
     return fields, unset, list_deltas
+
+
+def _peek_entry(path, url):
+    """A fresh on-disk copy of `url`'s anime entry, read under the lock.
+
+    Returns the entry dict, None when no entry has that URL (the dashboard
+    removed it), or _UNSET when ani.json can't be read right now (corrupt),
+    so callers can keep what they already have instead of guessing."""
+    try:
+        with anistore.locked(path):
+            data = anistore.load(path)
+    except anistore.CorruptStoreError:
+        return _UNSET
+    for entry in data.get('anime', []) or []:
+        if entry.get('url') == url:
+            return entry
+    return None
+
+
+def refresh_entry(path, animeentry):
+    """Replace the cycle-start snapshot of one entry with its fresh on-disk
+    copy, in place, right before the bot starts on it.
+
+    The cycle-start snapshot can be minutes old by the time the loop reaches
+    a later entry; the dashboard may have paused it, changed its release,
+    prefs, folder or `episodes` since. The bot hasn't touched this entry yet
+    this cycle, so the fresh copy is authoritative. Returns False when the
+    entry is gone (removed mid-cycle: skip it, never resurrect it). An
+    unreadable file keeps the snapshot and returns True."""
+    fresh = _peek_entry(path, animeentry.get('url'))
+    if fresh is None:
+        return False
+    if fresh is not _UNSET:
+        animeentry.clear()
+        animeentry.update(fresh)
+    return True
+
+
+def paused_skip_reason(animeentry):
+    """Why this entry is skipped before any other check, or None. Paused is
+    set and cleared only in the dashboard; the bot never unpauses."""
+    if not animeentry.get('paused'):
+        return None
+    return (str(animeentry.get('name') or animeentry.get('url') or "?")
+            + " — paused in the dashboard, skipping")
+
+
+def skip_if_paused(animeentry, run_counts, entry_outcomes):
+    """The paused early-skip at the top of startbot()'s per-entry loop: log
+    it, count it as skipped and record a "paused" outcome for run_state.
+    Returns True when the caller must skip the entry."""
+    reason = paused_skip_reason(animeentry)
+    if not reason:
+        return False
+    _log.info("[PAUSED] " + reason)
+    run_counts["skipped"] += 1
+    _record_entry_outcome(entry_outcomes, animeentry.get('url'), "paused", "paused from dashboard")
+    return True
+
+
+def sync_user_episodes(path, animeentry, saved_state):
+    """Adopt a dashboard edit of `episodes` made while the bot was busy on
+    this entry (e.g. during the scrape), right before the bot decides which
+    episodes to download.
+
+    Only when the bot hasn't changed `episodes` itself since its last save:
+    a pending bot change (a rollback to the available cap) stands and is
+    written by the next save_ani(). The adopted value also becomes the
+    saved baseline, so it's never echoed back as a bot delta. Returns the
+    episode count to plan with."""
+    current = animeentry.get('episodes', 0)
+    if current != saved_state.get('episodes', _UNSET):
+        return current
+    fresh = _peek_entry(path, animeentry.get('url'))
+    if not isinstance(fresh, dict) or 'episodes' not in fresh:
+        return current
+    value = fresh['episodes']
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return current
+    if value != current:
+        animeentry['episodes'] = value
+        saved_state['episodes'] = value
+    return value
+
+
+def wanted_episodes(missing, episodes, cur_episodes):
+    """What to download: retries first, then every episode after the
+    `episodes` the entry already has, up to what's online now."""
+    wanted_missing = list(missing)
+    episodes = int(episodes)
+    wanted_new = list(range(episodes + 1, cur_episodes + 1)) if episodes < cur_episodes else []
+    return wanted_missing, wanted_new
 
 # Soft run-now: the dashboard drops this trigger file next to ani.json (see
 # web/app.py's trigger_run_now()) instead of restarting the bot container.
@@ -1617,6 +1721,12 @@ def startbot():
         if(anidata != ""):
             run_counts["entries"] = len(anidata)
             for idx, animeentry in enumerate(anidata):
+                # Fresh copy first: user-owned fields (paused, releaseID,
+                # prefs, folder, episodes) may have changed since cycle start.
+                if not refresh_entry(botfile, animeentry):
+                    continue
+                if skip_if_paused(animeentry, run_counts, entry_outcomes):
+                    continue
                 name = animeentry['name']
                 url = animeentry['url']
                 releaseID = animeentry['releaseID']
@@ -1758,6 +1868,10 @@ def startbot():
                     _record_entry_outcome(entry_outcomes, url, "error", "Failed to fetch anime data")
                     continue
 
+                # The scrape above can take a while: pick up an `episodes`
+                # edit made meanwhile before planning what to download.
+                episodes = sync_user_episodes(botfile, animeentry, saved_state)
+
                 now = datetime.now()
                 run_counts["checked"] += 1
                 _log.info("[" + now.strftime("%H:%M:%S") + "] Prüfe " + name + " auf updates")
@@ -1821,8 +1935,7 @@ def startbot():
                 if display:
                     animeentry['display_title'] = display
                 # Collect all wanted episodes (missing + new)
-                wanted_missing = list(missingEpisodes)
-                wanted_new = list(range(episodes + 1, curEpisodes + 1)) if int(episodes) < curEpisodes else []
+                wanted_missing, wanted_new = wanted_episodes(missingEpisodes, episodes, curEpisodes)
                 all_wanted = wanted_missing + wanted_new
                 if len(all_wanted) > 1:
                     # Multi-episode: CNL only, no per-episode fallback

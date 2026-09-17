@@ -2321,14 +2321,14 @@ class SaveSettingsPostTest(unittest.TestCase):
         h.do_POST()
         return captured
 
-    def test_valid_save_persists_under_the_lock_and_reports_restart_needed(self):
+    def test_valid_save_persists_under_the_lock_and_applies_next_cycle(self):
         app.AUTH_ENABLED = False
         result = self._post({
             "hoster": "0", "timedelay_minutes": "5",
             "jdhost": "myhost", "myjd_user": "", "myjd_device": "",
         })
         self.assertEqual(result.get("level"), None)
-        self.assertIn("restart the bot container", result["msg"])
+        self.assertIn("next cycle", result["msg"])
 
         saved = app.load_ani()["settings"]
         self.assertEqual(saved["hoster"], 0)

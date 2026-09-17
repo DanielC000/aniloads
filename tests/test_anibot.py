@@ -1720,6 +1720,190 @@ class UserEditedEntryTest(unittest.TestCase):
         self.assertEqual(anibot.wanted_episodes([], 12, 10), ([], []))
         self.assertEqual(anibot.wanted_episodes([], "4", 5), ([], [5]))
 
+
+class ReloadSettingsForCycleTest(unittest.TestCase):
+    """reload_settings_for_cycle() is what startbot()'s while(True) loop calls
+    at each cycle boundary (card 2a89b409) so dashboard settings changes take
+    effect without a container restart."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-reloadsettings-")
+        self._orig_botfile = anibot.botfile
+        self._orig_botfolder = anibot.botfolder
+        anibot.botfile = os.path.join(self.tmp, "ani.json")
+        anibot.botfolder = self.tmp
+
+    def tearDown(self):
+        anibot.botfile = self._orig_botfile
+        anibot.botfolder = self._orig_botfolder
+
+    def _write_settings(self, **overrides):
+        settings = dict(anibot.config_defaults.DEFAULT_SETTINGS)
+        settings["jdhost"] = "127.0.0.1"  # a backend, unless overridden below
+        settings.update(overrides)
+        with open(anibot.botfile, "w", encoding="utf-8") as f:
+            json.dump({"settings": settings, "anime": []}, f)
+
+    def _current(self):
+        """The 13-tuple loadconfig() shape currently in effect, exactly as
+        startbot() threads it through the loop."""
+        return anibot.loadconfig()
+
+    def test_changed_timedelay_and_hoster_are_picked_up_next_cycle(self):
+        self._write_settings(hoster=1, timedelay=600)
+        current = self._current()
+
+        self._write_settings(hoster=0, timedelay=120)
+        updated, reloaded, reason = anibot.reload_settings_for_cycle(current)
+
+        self.assertTrue(reloaded)
+        self.assertIsNone(reason)
+        self.assertEqual(updated[1], 0)    # hoster
+        self.assertEqual(updated[5], 120)  # timedelay
+
+    def test_changed_jdhost_flows_into_the_next_download_call(self):
+        # There is no persisted JD/MyJD connection object anywhere in this
+        # codebase -- animeloads.downloadEpisode/downloadBatchCNL take
+        # jdhost/myjd_* as plain parameters and connect fresh on every call
+        # (see animeloads.utils.addToMYJD/addToJD). So "reconnect" is just:
+        # the updated tuple value flowing into the *next* download call,
+        # which this asserts.
+        self._write_settings(jdhost="127.0.0.1")
+        current = self._current()
+
+        self._write_settings(jdhost="10.0.0.5")
+        updated, reloaded, reason = anibot.reload_settings_for_cycle(current)
+
+        self.assertTrue(reloaded)
+        self.assertEqual(updated[0], "10.0.0.5")
+
+    def test_corrupt_ani_json_mid_run_keeps_previous_settings(self):
+        self._write_settings(jdhost="127.0.0.1", hoster=1)
+        current = self._current()
+
+        with open(anibot.botfile, "w", encoding="utf-8") as f:
+            f.write("{not valid json")
+
+        updated, reloaded, reason = anibot.reload_settings_for_cycle(current)
+
+        self.assertFalse(reloaded)
+        self.assertIsNotNone(reason)
+        self.assertEqual(updated, current)
+
+    def test_missing_backend_does_not_crash_and_keeps_previous_settings(self):
+        self._write_settings(jdhost="127.0.0.1", myjd_user="")
+        current = self._current()
+
+        self._write_settings(jdhost="", myjd_user="")
+        updated, reloaded, reason = anibot.reload_settings_for_cycle(current)
+
+        self.assertFalse(reloaded)
+        self.assertIn("download backend", reason)
+        self.assertEqual(updated, current)
+
+    def test_browserengine_change_is_not_applied_live(self):
+        self._write_settings(jdhost="127.0.0.1", browserengine=0, browserlocation="")
+        current = self._current()
+
+        self._write_settings(jdhost="127.0.0.1", browserengine=1, browserlocation="/opt/chrome")
+        with self.assertLogs(anibot._log, level="WARNING") as cm:
+            updated, reloaded, reason = anibot.reload_settings_for_cycle(current)
+
+        self.assertTrue(reloaded)
+        # browser/browserlocation stay at their startup value -- switching
+        # needs a new Selenium driver, which still requires a restart.
+        self.assertEqual(updated[2], current[2])
+        self.assertEqual(updated[3], current[3])
+        self.assertTrue(any("restart" in msg for msg in cm.output))
+
+
+class StartbotSettingsReloadWiringTest(unittest.TestCase):
+    """Structural check that startbot()'s while(True) loop actually calls
+    reload_settings_for_cycle at the top of each cycle, before it loads
+    ani.json's watchlist data -- mirrors the existing
+    test_paused_skip_runs_before_any_other_entry_logic pattern."""
+
+    def test_settings_reload_runs_before_ani_json_is_loaded_each_cycle(self):
+        import inspect
+        src = inspect.getsource(anibot.startbot)
+        while_true_idx = src.rindex("while(True):")
+        reload_idx = src.index("reload_settings_for_cycle(", while_true_idx)
+        relogin_idx = src.index("relogin_if_credentials_changed(", while_true_idx)
+        load_idx = src.index("load_ani_cycle_start(botfile)", while_true_idx)
+        self.assertLess(reload_idx, load_idx)
+        # The relogin check depends on this cycle's freshly-reloaded
+        # al_user/al_pass, so it must run after the reload and (like it)
+        # before the watchlist is loaded.
+        self.assertLess(reload_idx, relogin_idx)
+        self.assertLess(relogin_idx, load_idx)
+
+
+class ReloginIfCredentialsChangedTest(unittest.TestCase):
+    """Manager review follow-up on card 2a89b409: al.login() must actually be
+    re-invoked when AL_USER/AL_PASS (or ani.json's al_user/al_pass fallback)
+    change at a cycle boundary. Unlike the JD/MyJD fields, the login lives on
+    the long-lived `animeloads` instance's session, not in a value passed per
+    call -- swapping the local al_user/al_pass variables alone changes
+    nothing, so this must call al.login() itself."""
+
+    class FakeAnimeloads:
+        def __init__(self, fail=False):
+            self.isVIP = False
+            self.username = "anonymous"
+            self.login_calls = []
+            self._fail = fail
+
+        def login(self, user, pw):
+            self.login_calls.append((user, pw))
+            if self._fail:
+                raise Exception("bad credentials")
+            self.username = user
+            self.isVIP = True
+
+    def setUp(self):
+        # A successful/failed relogin calls the real write_login_state(),
+        # which writes run_state.json next to anibot.botfile -- redirect
+        # that into a tempdir so this never touches the real repo checkout.
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-relogin-")
+        self._orig_botfile = anibot.botfile
+        anibot.botfile = os.path.join(self.tmp, "ani.json")
+
+    def tearDown(self):
+        anibot.botfile = self._orig_botfile
+
+    def test_unchanged_credentials_do_not_trigger_a_relogin(self):
+        al = self.FakeAnimeloads()
+        attempted = anibot.relogin_if_credentials_changed(al, "user", "pw", "user", "pw")
+        self.assertFalse(attempted)
+        self.assertEqual(al.login_calls, [])
+
+    def test_changed_credentials_trigger_exactly_one_relogin(self):
+        al = self.FakeAnimeloads()
+        attempted = anibot.relogin_if_credentials_changed(al, "newuser", "newpw", "user", "pw")
+        self.assertTrue(attempted)
+        self.assertEqual(al.login_calls, [("newuser", "newpw")])
+        self.assertEqual(al.username, "newuser")
+
+    def test_failed_relogin_is_logged_and_recorded_without_crashing(self):
+        al = self.FakeAnimeloads(fail=True)
+        events = []
+        with self.assertLogs(anibot._log, level="WARNING"):
+            attempted = anibot.relogin_if_credentials_changed(
+                al, "newuser", "newpw", "user", "pw", events=events)
+        self.assertTrue(attempted)
+        self.assertEqual(len(al.login_calls), 1)
+        self.assertEqual(events[0]["kind"], "error")
+        self.assertIn("re-login failed", events[0]["detail"])
+
+    def test_credentials_removed_logs_that_anonymous_session_stays(self):
+        al = self.FakeAnimeloads()
+        with self.assertLogs(anibot._log, level="INFO") as cm:
+            attempted = anibot.relogin_if_credentials_changed(al, "", "", "user", "pw")
+        self.assertTrue(attempted)
+        self.assertEqual(al.login_calls, [])
+        self.assertTrue(any("anonymous" in msg for msg in cm.output))
+
+
 if __name__ == "__main__":
     unittest.main()
 

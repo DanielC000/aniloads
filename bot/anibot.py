@@ -841,8 +841,10 @@ def write_run_state(started_ts, finished_ts, timedelay, counts, events=None, tri
 def write_login_state(user_configured, ok, error=None, vip=None):
     """Persist the anime-loads.org login outcome as a top-level `login` key in
     run_state.json, alongside (not inside) the per-cycle `last_run`/`runs`
-    records write_run_state maintains — login happens once at bot startup, not
-    once per cycle, so it survives until the next login attempt overwrites it.
+    records write_run_state maintains — login normally happens once at bot
+    startup (and again at a cycle boundary if AL_USER/AL_PASS change, see
+    relogin_if_credentials_changed), not once per cycle, so it survives until
+    the next login attempt overwrites it.
 
     Additive: existing readers that only look at `last_run`/`runs` are
     unaffected, and a reader must tolerate this key's absence (e.g. an older
@@ -1559,6 +1561,114 @@ def handle_failed_batch(batch_result, all_wanted, animeentry, run_counts,
     return False
 
 
+def reload_settings_for_cycle(current):
+    """Re-read ani.json's settings block at the start of a cycle and apply
+    everything that's safe to change without restarting the bot: the poll
+    interval, hoster, pushbullet key, and the JD/MyJDownloader connection
+    fields (jdhost/myjd_user/myjd_pw/myjd_device/jd_deprecated*). Those
+    connection fields aren't held open anywhere -- animeloads.downloadEpisode/
+    downloadBatchCNL take them as plain parameters and connect fresh on every
+    call (see utils.addToMYJD/addToJD) -- so simply returning the
+    freshly-loaded values here is all a "reconnect" requires; the next
+    download call picks them up.
+
+    The returned al_user/al_pass are also freshly loaded, but unlike the JD
+    fields they are NOT self-applying: the anime-loads.org login lives on the
+    long-lived `animeloads` instance's session, not in a value passed per
+    call, so returning a new al_user/al_pass here changes nothing by itself.
+    The caller (startbot()'s loop) is responsible for noticing they changed
+    and calling `al.login()` again -- see relogin_if_credentials_changed.
+
+    `browserengine`/`browserlocation` are intentionally carried over
+    unchanged from `current` -- switching them needs a new Selenium
+    driver, which this function does not attempt, so those two still
+    require a container restart.
+
+    `current` is the 13-tuple loadconfig() shape currently in effect (the
+    tuple startbot() already threads through its loop). Returns
+    (updated, reloaded, reason): `reloaded` is False when the file is
+    corrupt/torn or no longer configures a download backend -- loadconfig()
+    can't tell those two apart, and both are transient, so `current` is
+    returned unchanged (with `reason` describing what happened) rather
+    than crashing the loop.
+    """
+    (jdhost, hoster, browser, browserlocation, pushkey, timedelay,
+     myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport,
+     al_user, al_pass) = current
+
+    reloaded_values = loadconfig()
+    if reloaded_values[0] == False:
+        return current, False, ("settings reload failed (corrupt ani.json or no "
+                                 "download backend configured) -- keeping previous settings")
+
+    (new_jdhost, new_hoster, new_browser, new_browserlocation, new_pushkey,
+     new_timedelay, new_myjd_user, new_myjd_pass, new_myjd_device,
+     new_jd_deprecated, new_jd_deprecatedport, new_al_user, new_al_pass) = reloaded_values
+
+    if new_browser != browser or new_browserlocation != browserlocation:
+        _log.warning(
+            "browserengine/browserlocation wurden geaendert, das erfordert einen Neustart "
+            "des Bot-Containers / browserengine/browserlocation changed -- restart the bot "
+            "container to apply this change"
+        )
+
+    updated = (
+        new_jdhost, new_hoster, browser, browserlocation, new_pushkey, new_timedelay,
+        new_myjd_user, new_myjd_pass, new_myjd_device, new_jd_deprecated,
+        new_jd_deprecatedport, new_al_user, new_al_pass,
+    )
+    return updated, True, None
+
+
+def relogin_if_credentials_changed(al, al_user, al_pass, last_al_user, last_al_pass, events=None):
+    """Re-run the anime-loads.org login when AL_USER/AL_PASS (env) or
+    ani.json's al_user/al_pass fallback changed since the last cycle.
+
+    Unlike the JD/MyJDownloader fields (see reload_settings_for_cycle), the
+    login isn't a value passed per call -- `al` is the single long-lived
+    `animeloads` instance startbot() keeps for the whole run, and its session
+    only changes when `al.login()` is actually invoked again. Swapping the
+    local al_user/al_pass variables alone changes nothing: the batch-download
+    path checks `al.username`, which keeps whatever it was set to at startup
+    (or the last successful login) until this re-runs it.
+
+    Returns True if it attempted a re-login (whether or not it succeeded),
+    False if the credentials are unchanged and there was nothing to do.
+    Never raises -- a failed re-login is logged and recorded as a run_state
+    event, and the previous session (logged in or anonymous) carries on
+    unchanged, exactly like the startup login's own failure handling.
+    """
+    if (al_user, al_pass) == (last_al_user, last_al_pass):
+        return False
+
+    if al_user and al_pass:
+        try:
+            al.login(al_user, al_pass)
+        except Exception as e:
+            _log.warning(
+                "Anime-Loads Zugangsdaten geaendert, erneute Anmeldung fehlgeschlagen, "
+                "vorherige Sitzung bleibt bestehen / anime-loads.org login changed, "
+                "re-login failed -- keeping the previous session: %s", e
+            )
+            write_login_state(True, False, error=str(e))
+            if events is not None:
+                _record_event(events, "error", "settings",
+                              detail="anime-loads.org re-login failed: " + type(e).__name__)
+        else:
+            _log.info(
+                "Anime-Loads Zugangsdaten geaendert, erneute Anmeldung erfolgreich / "
+                "anime-loads.org login changed, re-login succeeded"
+            )
+            write_login_state(True, True, vip=getattr(al, "isVIP", None))
+    else:
+        _log.info(
+            "Anime-Loads Zugangsdaten entfernt -- die anonyme Sitzung bleibt bis zum "
+            "naechsten Neustart bestehen / anime-loads.org login removed -- the "
+            "anonymous session stays until the next restart"
+        )
+    return True
+
+
 def startbot():
 
     jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport, al_user, al_pass = loadconfig()
@@ -1589,6 +1699,7 @@ def startbot():
             jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport, al_user, al_pass = loadconfig()
 
     pb = init_pushbullet(pushkey)
+    last_pushkey = pushkey
     notify_targets = notify.parse_targets(os.environ.get("NOTIFY_URL", ""))
 
     # The animeloads() constructor launches headless Firefox/geckodriver to fetch
@@ -1641,6 +1752,8 @@ def startbot():
         else:
             _log.info("Keine Anmeldedaten für Anime-Loads hinterlegt, fahre mit anonymen Account fort")
             write_login_state(False, False)
+
+    last_al_user, last_al_pass = al_user, al_pass
 
     if(jdhost == "" and myjd_pass == ""):
         if(interactive == False):
@@ -1696,6 +1809,28 @@ def startbot():
                       "skipped": 0, "unavailable": 0, "mismatch": 0}
         events = []
         entry_outcomes = {}
+
+        # Apply dashboard settings changes at this cycle boundary (card
+        # 2a89b409) -- see reload_settings_for_cycle's own docstring for
+        # exactly what does/doesn't take effect without a restart.
+        (jdhost, hoster, browser, browserlocation, pushkey, timedelay,
+         myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport,
+         al_user, al_pass), settings_reloaded, settings_reload_reason = reload_settings_for_cycle(
+            (jdhost, hoster, browser, browserlocation, pushkey, timedelay,
+             myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport,
+             al_user, al_pass))
+        if not settings_reloaded:
+            _log.warning(settings_reload_reason)
+            _record_event(events, "error", "settings", detail=settings_reload_reason)
+        else:
+            if pushkey != last_pushkey:
+                pb = init_pushbullet(pushkey)
+            if not interactive:
+                relogin_if_credentials_changed(al, al_user, al_pass, last_al_user, last_al_pass,
+                                                events=events)
+        last_pushkey = pushkey
+        last_al_user, last_al_pass = al_user, al_pass
+
         os.makedirs(os.path.dirname(botfolder), exist_ok=True)
         data, corrupt_err = load_ani_cycle_start(botfile)
         if corrupt_err is not None:

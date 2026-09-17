@@ -108,7 +108,7 @@ Open http://SERVER_IP:8085. Features:
 - **Watchlist** — add/remove anime, see episode counts, retry status, TVDB season mapping, and completion status
 - **Check Now** (per watchlist card) — force one entry's next triggered cycle to bypass its skip logic
 - **Preferences** — default language, resolution, auto-select
-- **Settings** — edit non-secret bot config (hoster, poll interval, JDownloader/MyJDownloader host+user+device) without hand-editing `ani.json`; a first-ever run seeds it with sane defaults automatically. Secrets (`myjd_pw`, Pushbullet API key) only ever show "set"/"not set" and can be replaced/cleared from here once dashboard login (below) is enabled — a saved change takes effect on the bot's *next restart*, not live
+- **Settings** — edit non-secret bot config (hoster, poll interval, JDownloader/MyJDownloader host+user+device) without hand-editing `ani.json`; a first-ever run seeds it with sane defaults automatically. Secrets (`myjd_pw`, Pushbullet API key) only ever show "set"/"not set" and can be replaced/cleared from here once dashboard login (below) is enabled — a saved change applies at the bot's *next cycle*, no restart needed (only a hand-edited `browserengine`/`browserlocation` still needs one)
 - **Add Anime** — paste an anime-loads.org URL or search by name, with TVDB season correlation
 - **TVDB Linking** — link/unlink existing watchlist entries to TVDB series and seasons
 - **Smart Skip Badges** — shows "Complete" (green), "Next: date" (orange), and anime-loads status per entry. "Mark Incomplete" button to force re-checking.
@@ -296,7 +296,7 @@ The local fork (`bot/`) fixes this by:
 
 ## Known Quirks
 
-- **Login needed for multi-episode fetches**: Set `AL_USER`/`AL_PASS` in `.env` (the `al_user`/`al_pass` fields in `ani.json` are a fallback). The bot logs in once at startup; if no credentials are set, or the login fails, it runs anonymously. Anonymous single-episode downloads still work, but when an entry needs two or more episodes in one cycle the bot uses batch Click'n'Load, which requires a login — that entry is skipped with a "Login required for batch download" error, and there is no per-episode fallback. The dashboard's health panel shows whether the login worked.
+- **Login needed for multi-episode fetches**: Set `AL_USER`/`AL_PASS` in `.env` (the `al_user`/`al_pass` fields in `ani.json` are a fallback). The bot logs in at startup, and again at the next cycle if `al_user`/`al_pass` change in `ani.json` (env vars only take effect on container start, since they're fixed for the process's lifetime); if no credentials are set, or a login attempt fails, it runs anonymously until the next successful one. Anonymous single-episode downloads still work, but when an entry needs two or more episodes in one cycle the bot uses batch Click'n'Load, which requires a login — that entry is skipped with a "Login required for batch download" error, and there is no per-episode fallback. The dashboard's health panel shows whether the login worked.
 - **CNL timeout**: The bot logs "request timed out (links likely added)" — this is expected. JDownloader's addcrypted2 endpoint processes the links but doesn't always send a response.
 - **Search speed**: Dashboard search uses headless Firefox to bypass DDoS-Guard. First search takes ~60s (Firefox startup).
 - **Pending entries**: When adding via URL, entries go to a `pending` queue. A background resolver fetches release info and auto-selects the best release.

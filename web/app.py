@@ -5803,7 +5803,7 @@ class Handler(BaseHTTPRequestHandler):
                 return data
 
             update_ani(_apply)
-            self._redirect_msg("Saved — restart the bot container to apply", anchor=ANCHOR_SETTINGS)
+            self._redirect_msg("Saved — applies at the next cycle", anchor=ANCHOR_SETTINGS)
 
         elif parsed.path == "/add-url":
             url = params.get("url", "").strip()

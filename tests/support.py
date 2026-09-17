@@ -28,6 +28,7 @@ os.environ.setdefault("CONFIG_DIR", _TMP)
 _app_cache = None
 _anibot_cache = None
 _animeloads_cache = None
+_anistore_cache = None
 
 
 def _load_from_path(name, path):
@@ -45,6 +46,16 @@ def load_app():
     if _app_cache is None:
         _app_cache = _load_from_path("aniloads_web_app", _WEB_APP)
     return _app_cache
+
+
+def load_anistore():
+    """Import bot/anistore.py once. Stdlib only — no stubs needed."""
+    global _anistore_cache
+    if _anistore_cache is None:
+        if _BOT_DIR not in sys.path:
+            sys.path.insert(0, _BOT_DIR)
+        _anistore_cache = _load_from_path("aniloads_anistore", os.path.join(_BOT_DIR, "anistore.py"))
+    return _anistore_cache
 
 
 def _install_anibot_stubs():

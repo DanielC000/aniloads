@@ -703,5 +703,41 @@ class TvdbSkipDecisionTest(unittest.TestCase):
         self.assertEqual(d["updates"], {})
 
 
+class LoadAniCycleStartTest(unittest.TestCase):
+    """The per-cycle load at the top of startbot()'s while(True) loop, guarded
+    against a torn/corrupt ani.json (the dashboard writing concurrently) so it
+    can never crash the loop and restart-loop the container."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-cyclestart-")
+        self._orig_botfile = anibot.botfile
+        anibot.botfile = os.path.join(self.tmp, "ani.json")
+
+    def tearDown(self):
+        anibot.botfile = self._orig_botfile
+
+    def test_missing_file_returns_default_and_no_error(self):
+        data, err = anibot.load_ani_cycle_start(anibot.botfile)
+        self.assertIsNone(err)
+        self.assertEqual(data, {"settings": {}, "anime": []})
+
+    def test_valid_file_returns_data_and_no_error(self):
+        fixture = {"settings": {}, "anime": [{"name": "A", "url": "http://x/a"}]}
+        with open(anibot.botfile, "w", encoding="utf-8") as f:
+            json.dump(fixture, f)
+        data, err = anibot.load_ani_cycle_start(anibot.botfile)
+        self.assertIsNone(err)
+        self.assertEqual(data, fixture)
+
+    def test_corrupt_file_returns_error_instead_of_raising(self):
+        with open(anibot.botfile, "w", encoding="utf-8") as f:
+            f.write("{not valid json")
+        # No exception escapes — the caller (the cycle loop) gets a
+        # (None, error) pair back to log and skip to the next cycle on.
+        data, err = anibot.load_ani_cycle_start(anibot.botfile)
+        self.assertIsNone(data)
+        self.assertIsInstance(err, anibot.anistore.CorruptStoreError)
+
+
 if __name__ == "__main__":
     unittest.main()

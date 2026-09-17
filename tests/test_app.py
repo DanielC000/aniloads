@@ -1570,6 +1570,77 @@ class ConfigUtf8Test(unittest.TestCase):
         self.assertEqual(app.load_run_state(), {})
 
 
+class AniJsonCorruptTest(unittest.TestCase):
+    """A corrupt ani.json (e.g. the bot caught mid-write) must never be
+    silently treated as an empty watchlist — that's what let the next POST
+    wipe a real watchlist+settings. load_ani() now raises anistore's
+    CorruptStoreError instead, and do_GET/do_POST catch it centrally to
+    refuse to save and show an error banner instead."""
+
+    def setUp(self):
+        fd, self._path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        with open(self._path, "w", encoding="utf-8") as f:
+            f.write("{not valid json")
+        self._orig_ani = app.ANI_JSON
+        app.ANI_JSON = self._path
+
+    def tearDown(self):
+        app.ANI_JSON = self._orig_ani
+        try:
+            os.remove(self._path)
+        except OSError:
+            pass
+
+    def _raw_bytes(self):
+        with open(self._path, "rb") as f:
+            return f.read()
+
+    def test_load_ani_raises_instead_of_returning_empty_default(self):
+        with self.assertRaises(app.anistore.CorruptStoreError):
+            app.load_ani()
+
+    def _post(self, path, params):
+        captured = {}
+        h = app.Handler.__new__(app.Handler)
+        h.path = path
+        h._read_post = lambda: params
+        h._redirect_msg = lambda msg: captured.__setitem__("msg", msg)
+        h._redirect = lambda url: captured.__setitem__("url", url)
+        h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
+        h.do_POST()
+        return captured
+
+    def test_post_refuses_to_save_and_shows_error_banner(self):
+        before = self._raw_bytes()
+        result = self._post("/remove", {"key": "http://x/a"})
+        # File is byte-for-byte untouched — no save happened.
+        self.assertEqual(self._raw_bytes(), before)
+        self.assertTrue(result["msg"].startswith("Error"))
+        self.assertIn("corrupt", result["msg"].lower())
+
+    def test_add_url_post_also_refuses_to_save(self):
+        # A different route that also load_ani()s before mutating/saving.
+        before = self._raw_bytes()
+        result = self._post("/add-url", {"url": "https://www.anime-loads.org/anime/x"})
+        self.assertEqual(self._raw_bytes(), before)
+        self.assertTrue(result["msg"].startswith("Error"))
+
+    def _get(self, path):
+        captured = {}
+        h = app.Handler.__new__(app.Handler)
+        h.path = path
+        h._respond = lambda code, html_body: captured.__setitem__("resp", (code, html_body))
+        h.do_GET()
+        return captured["resp"]
+
+    def test_get_shows_error_banner_instead_of_crashing(self):
+        code, html_out = self._get("/")
+        self.assertEqual(code, 200)
+        self.assertIn("status-err", html_out)
+        self.assertIn("corrupt", html_out.lower())
+
+
 class ParseBotLogsBranchesTest(unittest.TestCase):
     """Coverage for parse_bot_logs branches beyond the BUG-3 standalone cases:
     docker-ts stripping, in-run event classification, the glued anime-name-prefix

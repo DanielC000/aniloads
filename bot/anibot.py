@@ -56,6 +56,8 @@ except ImportError:
 
 from tvdb import TVDBClient
 
+import anistore
+
 import animeloads as animeloads_module
 
 from animeloads import animeloads, ALLinkExtractionException
@@ -326,6 +328,19 @@ def write_run_state(started_ts, finished_ts, timedelay, counts, events=None):
     except Exception:
         # Run-state bookkeeping is never allowed to take down the bot loop.
         pass
+
+def load_ani_cycle_start(path):
+    """Load ani.json at the start of a bot cycle, under the lock shared with
+    the dashboard. Returns (data, None) on success, or (None, error) if the
+    file is corrupt — a torn read (the dashboard mid-write) must not crash
+    the loop and restart-loop the container; the caller logs the error and
+    retries next cycle instead."""
+    try:
+        with anistore.locked(path):
+            return anistore.load(path), None
+    except anistore.CorruptStoreError as e:
+        return None, e
+
 
 def loadconfig():
     try:
@@ -1084,9 +1099,13 @@ def startbot():
                       "skipped": 0, "unavailable": 0, "mismatch": 0}
         events = []
         os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-        f = open(botfile, "r", encoding="utf-8")
-        data = json.load(f)
-        f.close()
+        data, corrupt_err = load_ani_cycle_start(botfile)
+        if corrupt_err is not None:
+            _log.error("ani.json ist beschaedigt, ueberspringe Zyklus: %s", corrupt_err)
+            recheck = timedelay if isinstance(timedelay, int) and timedelay > 0 else 600
+            write_run_state(run_started, _utcnow_iso(), recheck, run_counts, events)
+            time.sleep(recheck)
+            continue
 
         anidata = ""
         try:
@@ -1106,10 +1125,8 @@ def startbot():
 
         def save_ani():
             os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-            jfile = open(botfile, "w", encoding="utf-8")
-            jfile.write(json.dumps(data, indent=4, sort_keys=True))
-            jfile.flush()
-            jfile.close()
+            with anistore.locked(botfile):
+                anistore.save(botfile, data)
 
         if(anidata != ""):
             run_counts["entries"] = len(anidata)

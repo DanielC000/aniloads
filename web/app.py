@@ -184,6 +184,7 @@ _move_trigger = threading.Event()
 # ---------------------------------------------------------------------------
 
 from tvdb import TVDBClient, TVDB_API_KEY  # noqa: E402 — path set above
+import anistore  # noqa: E402 — path set above
 
 tvdb = TVDBClient()
 
@@ -612,18 +613,33 @@ def get_activity():
 # ---------------------------------------------------------------------------
 
 def load_ani():
-    try:
-        with open(ANI_JSON, "r", encoding="utf-8") as f:
-            return json.load(f)
-    # ValueError also covers UnicodeDecodeError (a corrupt/non-UTF-8 file);
-    # see load_run_state's comment for why this is a deliberate widening.
-    except (FileNotFoundError, ValueError):
-        return {"settings": {}, "anime": []}
+    """Load ani.json under the lock shared with the bot.
+
+    Unlike the old bare-except version, a corrupt file is NOT silently
+    swallowed into the empty default here — that was the bug: the next save
+    from a POST handler would then persist that empty default over the real
+    watchlist. Corrupt files propagate as anistore.CorruptStoreError; callers
+    (do_GET/do_POST below) catch it centrally and show an error banner
+    instead of rendering/saving over a wiped-looking watchlist."""
+    with anistore.locked(ANI_JSON):
+        return anistore.load(ANI_JSON, default={"settings": {}, "anime": []})
 
 
 def save_ani(data):
-    with open(ANI_JSON, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, sort_keys=True)
+    with anistore.locked(ANI_JSON):
+        anistore.save(ANI_JSON, data)
+
+
+def update_ani(fn):
+    """Read-modify-write ani.json in ONE lock hold.
+
+    A handler doing load_ani() ... mutate ... save_ani(data) acquires and
+    releases the lock twice, leaving a window between them where a bot save
+    can land and then be silently overwritten by the handler's now-stale
+    in-memory copy. fn(data) must be pure local mutation (in place, or by
+    returning a replacement dict) — no network/scrape calls inside it, since
+    it runs while the lock is held; do any scraping before calling this."""
+    return anistore.update(ANI_JSON, fn, default={"settings": {}, "anime": []})
 
 
 def load_prefs():
@@ -2485,8 +2501,8 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
     return html
 
 
-def render_page(status="", search_html="", prefs_open=False):
-    data = load_ani()
+def render_page(status="", search_html="", prefs_open=False, ani_data=None):
+    data = ani_data if ani_data is not None else load_ani()
     anime_list = data.get("anime", [])
     pending_list = data.get("pending", [])
     prefs = load_prefs()
@@ -2609,12 +2625,29 @@ class Handler(BaseHTTPRequestHandler):
             cls = "status-ok" if not msg.startswith("Error") else "status-err"
             status = '<div class="status-msg {}" id="status-msg">{}</div>'.format(cls, escape(msg))
 
-        self._respond(200, render_page(status=status))
+        try:
+            page = render_page(status=status)
+        except anistore.CorruptStoreError as e:
+            _log.error("[watchlist] ani.json is corrupt, refusing to render it: %s", e)
+            status = '<div class="status-msg status-err" id="status-msg">Error: ani.json is corrupt — the watchlist can\'t be shown or edited until it is fixed or restored.</div>'
+            page = render_page(status=status, ani_data={"settings": {}, "anime": []})
+
+        self._respond(200, page)
 
     def do_POST(self):
         parsed = urlparse(self.path)
         params = self._read_post()
+        try:
+            self._dispatch_post(parsed, params)
+        except anistore.CorruptStoreError as e:
+            # Refuse to save over a corrupt file — a POST handler that got
+            # this far already found the file unreadable before it could
+            # mutate/save anything, so nothing was written.
+            _log.error("[watchlist] ani.json is corrupt, refused POST %s: %s", parsed.path, e)
+            self._redirect_msg(
+                "Error: ani.json is corrupt — refused to save. Fix or restore the file, then reload.")
 
+    def _dispatch_post(self, parsed, params):
         if parsed.path == "/run-now":
             ok, msg = docker.restart_container()
             if ok:
@@ -2748,8 +2781,24 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     pass
 
-            data.setdefault("anime", []).append(entry)
-            save_ani(data)
+            # No scraping happens below this point in this request (the TVDB
+            # correlation branch above already returned) — safe to do the
+            # final duplicate re-check + append inside one lock hold.
+            already_present = False
+
+            def _add_release(data):
+                nonlocal already_present
+                for a in data.get("anime", []):
+                    if a.get("url") == url:
+                        already_present = True
+                        return
+                data.setdefault("anime", []).append(entry)
+
+            update_ani(_add_release)
+            if already_present:
+                self._redirect_msg("Already in watchlist")
+                return
+
             season_info = ""
             if entry.get("tvdb_season"):
                 season_info = ", season {}".format(entry["tvdb_season"])
@@ -2843,13 +2892,19 @@ class Handler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/remove-pending":
             entry_url = params.get("key", "")
-            data = load_ani()
-            pending = data.get("pending", [])
-            idx, removed = find_entry_by_url(pending, entry_url)
+            removed = None
+
+            def _remove_pending(data):
+                nonlocal removed
+                pending = data.get("pending", [])
+                idx, entry = find_entry_by_url(pending, entry_url)
+                if entry is not None:
+                    pending.pop(idx)
+                    data["pending"] = pending
+                    removed = entry
+
+            update_ani(_remove_pending)
             if removed is not None:
-                pending.pop(idx)
-                data["pending"] = pending
-                save_ani(data)
                 _log.info("[watchlist] Removed pending: %s", removed.get("name") or removed.get("url", "?"))
                 self._redirect_msg("Removed: {}".format(removed.get("name", "?")))
             else:
@@ -2857,12 +2912,18 @@ class Handler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/remove":
             entry_url = params.get("key", "")
-            data = load_ani()
-            anime_list = data.get("anime", [])
-            idx, removed = find_entry_by_url(anime_list, entry_url)
+            removed = None
+
+            def _remove(data):
+                nonlocal removed
+                anime_list = data.get("anime", [])
+                idx, entry = find_entry_by_url(anime_list, entry_url)
+                if entry is not None:
+                    anime_list.pop(idx)
+                    removed = entry
+
+            update_ani(_remove)
             if removed is not None:
-                anime_list.pop(idx)
-                save_ani(data)
                 _log.info("[watchlist] Removed anime: %s", removed.get("name", "?"))
                 self._redirect_msg("Removed: {}".format(removed.get("name", "?")))
             else:
@@ -2871,37 +2932,57 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/ep-add":
             entry_url = params.get("key", "")
             ep = int(params.get("ep", -1))
-            data = load_ani()
-            anime_list = data.get("anime", [])
-            _, entry = find_entry_by_url(anime_list, entry_url)
-            if entry is not None and ep > 0:
+            outcome = {}
+
+            def _ep_add(data):
+                anime_list = data.get("anime", [])
+                _, entry = find_entry_by_url(anime_list, entry_url)
+                if entry is None or ep <= 0:
+                    outcome["result"] = "invalid"
+                    return
+                outcome["name"] = entry.get("name", "?")
                 missing = entry.get("missing", [])
-                if ep not in missing:
-                    missing.append(ep)
-                    missing.sort()
-                    entry["missing"] = missing
-                    save_ani(data)
-                    self._redirect_msg("Added episode {} to retry queue for {}".format(ep, entry.get("name", "?")))
-                else:
-                    self._redirect_msg("Episode {} already in retry queue".format(ep))
+                if ep in missing:
+                    outcome["result"] = "already"
+                    return
+                missing.append(ep)
+                missing.sort()
+                entry["missing"] = missing
+                outcome["result"] = "added"
+
+            update_ani(_ep_add)
+            if outcome["result"] == "added":
+                self._redirect_msg("Added episode {} to retry queue for {}".format(ep, outcome["name"]))
+            elif outcome["result"] == "already":
+                self._redirect_msg("Episode {} already in retry queue".format(ep))
             else:
                 self._redirect_msg("Error: entry not found or invalid episode")
 
         elif parsed.path == "/ep-remove":
             entry_url = params.get("key", "")
             ep = int(params.get("ep", -1))
-            data = load_ani()
-            anime_list = data.get("anime", [])
-            _, entry = find_entry_by_url(anime_list, entry_url)
-            if entry is not None and ep > 0:
+            outcome = {}
+
+            def _ep_remove(data):
+                anime_list = data.get("anime", [])
+                _, entry = find_entry_by_url(anime_list, entry_url)
+                if entry is None or ep <= 0:
+                    outcome["result"] = "invalid"
+                    return
+                outcome["name"] = entry.get("name", "?")
                 missing = entry.get("missing", [])
-                if ep in missing:
-                    missing.remove(ep)
-                    entry["missing"] = missing
-                    save_ani(data)
-                    self._redirect_msg("Removed episode {} from retry queue for {}".format(ep, entry.get("name", "?")))
-                else:
-                    self._redirect_msg("Episode {} not in retry queue".format(ep))
+                if ep not in missing:
+                    outcome["result"] = "not_queued"
+                    return
+                missing.remove(ep)
+                entry["missing"] = missing
+                outcome["result"] = "removed"
+
+            update_ani(_ep_remove)
+            if outcome["result"] == "removed":
+                self._redirect_msg("Removed episode {} from retry queue for {}".format(ep, outcome["name"]))
+            elif outcome["result"] == "not_queued":
+                self._redirect_msg("Episode {} not in retry queue".format(ep))
             else:
                 self._redirect_msg("Error: entry not found or invalid episode")
 
@@ -2926,13 +3007,12 @@ class Handler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/tvdb-save":
             entry_url = params.get("key", "")
-            data = load_ani()
-            anime_list = data.get("anime", [])
-            _, entry = find_entry_by_url(anime_list, entry_url)
 
             if "tvdb_skip" in params:
                 # Cancelling a TVDB edit makes no changes — say so, otherwise the
                 # bare redirect home looks like the click did nothing (UI-5).
+                # Read-only lookup: no mutation, so no need for update_ani here.
+                _, entry = find_entry_by_url(load_ani().get("anime", []), entry_url)
                 if entry is not None:
                     self._redirect_msg("Cancelled — {} unchanged".format(
                         entry.get("name", "?")))
@@ -2940,11 +3020,17 @@ class Handler(BaseHTTPRequestHandler):
                     self._redirect_msg("Cancelled")
                 return
 
-            if entry is not None:
-                tvdb_id = params.get("tvdb_id", "")
-                tvdb_season = params.get("tvdb_season", "")
-                episode_offset = params.get("episode_offset", "")
+            tvdb_id = params.get("tvdb_id", "")
+            tvdb_season = params.get("tvdb_season", "")
+            episode_offset = params.get("episode_offset", "")
+            outcome = {}
 
+            def _tvdb_save(data):
+                anime_list = data.get("anime", [])
+                _, entry = find_entry_by_url(anime_list, entry_url)
+                if entry is None:
+                    outcome["result"] = "not_found"
+                    return
                 if tvdb_id:
                     try:
                         entry["tvdb_id"] = int(tvdb_id)
@@ -2964,51 +3050,77 @@ class Handler(BaseHTTPRequestHandler):
                             del entry["episode_offset"]
                     except ValueError:
                         pass
+                outcome["result"] = "saved"
+                outcome["name"] = entry.get("name", "?")
+                outcome["season_str"] = (
+                    " S{:02d}".format(entry.get("tvdb_season", 0)) if entry.get("tvdb_season") else "")
 
-                save_ani(data)
-                season_str = " S{:02d}".format(entry.get("tvdb_season", 0)) if entry.get("tvdb_season") else ""
-                self._redirect_msg("TVDB linked: {}{}".format(
-                    entry.get("name", "?"), season_str))
+            update_ani(_tvdb_save)
+            if outcome.get("result") == "saved":
+                self._redirect_msg("TVDB linked: {}{}".format(outcome["name"], outcome["season_str"]))
             else:
                 self._redirect_msg("Error: entry not found")
 
         elif parsed.path == "/tvdb-unlink":
             entry_url = params.get("key", "")
-            data = load_ani()
-            anime_list = data.get("anime", [])
-            _, entry = find_entry_by_url(anime_list, entry_url)
-            if entry is not None:
+            outcome = {}
+
+            def _tvdb_unlink(data):
+                anime_list = data.get("anime", [])
+                _, entry = find_entry_by_url(anime_list, entry_url)
+                if entry is None:
+                    outcome["result"] = "not_found"
+                    return
                 for field in ("tvdb_id", "tvdb_season", "episode_offset"):
                     entry.pop(field, None)
-                save_ani(data)
-                self._redirect_msg("TVDB unlinked: {}".format(entry.get("name", "?")))
+                outcome["result"] = "unlinked"
+                outcome["name"] = entry.get("name", "?")
+
+            update_ani(_tvdb_unlink)
+            if outcome.get("result") == "unlinked":
+                self._redirect_msg("TVDB unlinked: {}".format(outcome["name"]))
             else:
                 self._redirect_msg("Error: entry not found")
 
         elif parsed.path == "/update-folder":
             entry_url = params.get("key", "")
             folder = params.get("folder", "").strip()
-            data = load_ani()
-            anime_list = data.get("anime", [])
-            _, entry = find_entry_by_url(anime_list, entry_url)
-            if entry is not None and folder:
+            outcome = {}
+
+            def _update_folder(data):
+                anime_list = data.get("anime", [])
+                _, entry = find_entry_by_url(anime_list, entry_url)
+                if entry is None or not folder:
+                    outcome["result"] = "invalid"
+                    return
                 entry["customPackage"] = folder
-                save_ani(data)
-                self._redirect_msg("Folder updated: {} -> {}".format(
-                    entry.get("name", "?"), folder))
+                outcome["result"] = "updated"
+                outcome["name"] = entry.get("name", "?")
+
+            update_ani(_update_folder)
+            if outcome.get("result") == "updated":
+                self._redirect_msg("Folder updated: {} -> {}".format(outcome["name"], folder))
             else:
                 self._redirect_msg("Error: entry not found or empty folder")
 
         elif parsed.path == "/mark-incomplete":
             entry_url = params.get("key", "")
-            data = load_ani()
-            anime_list = data.get("anime", [])
-            _, entry = find_entry_by_url(anime_list, entry_url)
-            if entry is not None:
+            outcome = {}
+
+            def _mark_incomplete(data):
+                anime_list = data.get("anime", [])
+                _, entry = find_entry_by_url(anime_list, entry_url)
+                if entry is None:
+                    outcome["result"] = "not_found"
+                    return
                 for field in ("complete", "skip_until"):
                     entry.pop(field, None)
-                save_ani(data)
-                self._redirect_msg("Marked incomplete: {}".format(entry.get("name", "?")))
+                outcome["result"] = "marked"
+                outcome["name"] = entry.get("name", "?")
+
+            update_ani(_mark_incomplete)
+            if outcome.get("result") == "marked":
+                self._redirect_msg("Marked incomplete: {}".format(outcome["name"]))
             else:
                 self._redirect_msg("Error: entry not found")
 

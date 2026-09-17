@@ -1444,6 +1444,32 @@ def normalize_anime_url(url):
         p.path.rstrip("/"), "?" + p.query if p.query else "")
 
 
+def is_valid_anime_url(url):
+    """True when ``url`` is a plausible anime-loads.org media page: an
+    http(s) URL whose hostname is exactly ``anime-loads.org`` or a
+    subdomain of it (exact suffix match, so a query-string trick like
+    ``https://x.example/?anime-loads.org`` or userinfo like
+    ``https://anime-loads.org@evil.example/`` never matches — urlparse
+    already resolves ``hostname`` past any userinfo), with a path that
+    starts with ``/media/``.
+
+    Gates every point a NEW url is accepted from a form (add flow, TVDB
+    step, pending). Never applied to an existing entry's stored url — those
+    are looked up by find_entry_by_url instead, so an odd/legacy url stays
+    editable and removable."""
+    raw = (url or "").strip()
+    try:
+        p = urlparse(raw)
+    except ValueError:
+        return False
+    if p.scheme not in ("http", "https"):
+        return False
+    host = (p.hostname or "").lower()
+    if host != "anime-loads.org" and not host.endswith(".anime-loads.org"):
+        return False
+    return p.path.startswith("/media/")
+
+
 def find_duplicate_entry(data, url):
     """First entry in ``anime`` or ``pending`` whose URL normalizes to the
     same key as ``url`` (see normalize_anime_url), else None."""
@@ -5758,6 +5784,13 @@ class Handler(BaseHTTPRequestHandler):
         name = params.get("name", "Unknown")
         custom_folder = params.get("custom_folder", "").strip()
 
+        if not is_valid_anime_url(url):
+            self._redirect_msg(
+                "Error: URL must be an anime-loads.org media page, "
+                "e.g. https://www.anime-loads.org/media/...",
+                level="err", anchor=ANCHOR_ADD_FLOW)
+            return
+
         duplicate = find_duplicate_entry(load_ani(), url)
         if duplicate is not None:
             self._redirect_msg(_duplicate_msg(duplicate), level="err",
@@ -6114,8 +6147,11 @@ class Handler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/add-url":
             url = params.get("url", "").strip()
-            if not url or "anime-loads.org" not in url.lower():
-                self._redirect_msg("Error: Invalid URL", level="err", anchor=ANCHOR_ADD_FLOW)
+            if not is_valid_anime_url(url):
+                self._redirect_msg(
+                    "Error: URL must be an anime-loads.org media page, "
+                    "e.g. https://www.anime-loads.org/media/...",
+                    level="err", anchor=ANCHOR_ADD_FLOW)
                 return
             # "Change release" from the TVDB step posts pick=1: show the
             # picker even when auto-select would otherwise skip it.
@@ -6209,6 +6245,13 @@ class Handler(BaseHTTPRequestHandler):
             media_type = params.get("media_type", "series")
             edit_key = params.get("key")
 
+            if edit_key is None and not is_valid_anime_url(url):
+                self._redirect_msg(
+                    "Error: URL must be an anime-loads.org media page, "
+                    "e.g. https://www.anime-loads.org/media/...",
+                    level="err", anchor=ANCHOR_ADD_FLOW)
+                return
+
             content_type = "movie" if media_type == "movie" else "series"
             results = tvdb.search(query, content_type=content_type) if tvdb.available else []
             search_html = render_tvdb_step(
@@ -6232,6 +6275,13 @@ class Handler(BaseHTTPRequestHandler):
             # The query that produced the result the user just picked, so the
             # list stays the one they were looking at.
             query = params.get("tvdb_query", "").strip() or name
+
+            if edit_key is None and not is_valid_anime_url(url):
+                self._redirect_msg(
+                    "Error: URL must be an anime-loads.org media page, "
+                    "e.g. https://www.anime-loads.org/media/...",
+                    level="err", anchor=ANCHOR_ADD_FLOW)
+                return
 
             # Fetch seasons for the selected series
             seasons = tvdb.get_seasons(tvdb_id) if tvdb.available and tvdb_id else []

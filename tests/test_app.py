@@ -1905,7 +1905,7 @@ class WatchlistMutationKeyByUrlTest(unittest.TestCase):
     def test_add_release_sanitizes_custom_folder(self):
         app.save_ani({"anime": []})
         result = self._post("/add-release", {
-            "url": "http://x/new", "name": "New Show",
+            "url": "https://www.anime-loads.org/media/new", "name": "New Show",
             "custom_folder": "../../etc", "tvdb_skip": "1",
         })
         entries = app.load_ani()["anime"]
@@ -1916,7 +1916,7 @@ class WatchlistMutationKeyByUrlTest(unittest.TestCase):
     def test_add_release_rejects_dot_dot_custom_folder(self):
         app.save_ani({"anime": []})
         result = self._post("/add-release", {
-            "url": "http://x/new2", "name": "New Show 2",
+            "url": "https://www.anime-loads.org/media/new2", "name": "New Show 2",
             "custom_folder": "..", "tvdb_skip": "1",
         })
         self.assertEqual(app.load_ani().get("anime", []), [])
@@ -1925,7 +1925,7 @@ class WatchlistMutationKeyByUrlTest(unittest.TestCase):
     def test_add_release_fallback_name_with_slash_flattens(self):
         app.save_ani({"anime": []})
         result = self._post("/add-release", {
-            "url": "http://x/fate", "name": "Fate/stay night", "tvdb_skip": "1",
+            "url": "https://www.anime-loads.org/media/fate", "name": "Fate/stay night", "tvdb_skip": "1",
         })
         entries = app.load_ani()["anime"]
         self.assertEqual(entries[0]["customPackage"], "Fatestay night")
@@ -2044,7 +2044,7 @@ class AniJsonCorruptTest(unittest.TestCase):
     def test_add_url_post_also_refuses_to_save(self):
         # A different route that also load_ani()s before mutating/saving.
         before = self._raw_bytes()
-        result = self._post("/add-url", {"url": "https://www.anime-loads.org/anime/x"})
+        result = self._post("/add-url", {"url": "https://www.anime-loads.org/media/x"})
         self.assertEqual(self._raw_bytes(), before)
         self.assertTrue(result["msg"].startswith("Error"))
 
@@ -3524,7 +3524,7 @@ class HandlerPostRoutingTest(unittest.TestCase):
 
     def test_add_url_rejects_non_site_url(self):
         result = self._post("/add-url", {"url": "http://evil.example/x"})
-        self.assertTrue(result["msg"].startswith("Error: Invalid URL"))
+        self.assertTrue(result["msg"].startswith("Error: URL must be"))
 
     def test_search_empty_query_errors(self):
         result = self._post("/search", {"q": "  "})
@@ -4268,7 +4268,7 @@ class AddUrlClobberTest(unittest.TestCase):
         return captured
 
     def test_bot_write_during_scrape_survives_add_url_fallback_save(self):
-        url = "https://www.anime-loads.org/anime/new-show"
+        url = "https://www.anime-loads.org/media/new-show"
         result = {}
 
         def do_add_url():
@@ -4351,7 +4351,7 @@ class ThreadedServerConcurrencyTest(unittest.TestCase):
 
         def do_slow_post():
             results["post_status"] = self._request(
-                "POST", "/add-url", body="url=" + quote("https://www.anime-loads.org/anime/x"))
+                "POST", "/add-url", body="url=" + quote("https://www.anime-loads.org/media/x"))
 
         poster = threading.Thread(target=do_slow_post)
         poster.start()
@@ -4447,7 +4447,7 @@ class AddFlowHiddenFieldsTest(unittest.TestCase):
         return html.unescape(m.group(1))
 
     def test_add_flow_scrapes_at_most_once(self):
-        url = "https://www.anime-loads.org/anime/x"
+        url = "https://www.anime-loads.org/media/x"
         add_url_result = self._post("/add-url", {"url": url})
         self.assertEqual(len(self.scrape_calls), 1)
         self.assertIn("Add this release", add_url_result["html"])
@@ -4473,7 +4473,7 @@ class AddFlowHiddenFieldsTest(unittest.TestCase):
         self.assertEqual(saved["anime"][0]["releaseID"], 111)
 
     def test_add_release_rejects_tampered_release_id(self):
-        url = "https://www.anime-loads.org/anime/x"
+        url = "https://www.anime-loads.org/media/x"
         self._post("/add-url", {"url": url})
         self.assertEqual(len(self.scrape_calls), 1)
 
@@ -4494,7 +4494,7 @@ class AddFlowHiddenFieldsTest(unittest.TestCase):
         self.assertEqual(saved["anime"], [])
 
     def test_add_release_rejects_tampered_episode_count(self):
-        url = "https://www.anime-loads.org/anime/x"
+        url = "https://www.anime-loads.org/media/x"
         self._post("/add-url", {"url": url})
         self.assertEqual(len(self.scrape_calls), 1)
 
@@ -7066,3 +7066,132 @@ class HandlerPostMoveStuckAssignTest(unittest.TestCase):
                              {"key": "nope", "entry": "http://x/kaiju", "season": "1", "episode": "1"})
         self.assertEqual(result["msg"], "Error: stuck item not found")
         self.assertEqual(result.get("level"), "err")
+
+
+class IsValidAnimeUrlTest(unittest.TestCase):
+    """is_valid_anime_url gates every point a NEW anime-loads url is
+    accepted (see card 4c647325): http(s) scheme, hostname exactly
+    anime-loads.org or a subdomain of it (exact suffix match — a
+    lookalike/tacked-on host never matches), path starting with /media/."""
+
+    ACCEPT = [
+        ("plain host", "https://anime-loads.org/media/one-piece"),
+        ("www subdomain", "https://www.anime-loads.org/media/one-piece"),
+        ("http scheme", "http://anime-loads.org/media/one-piece"),
+        ("arbitrary subdomain", "https://mirror.anime-loads.org/media/one-piece"),
+        ("uppercase host", "HTTPS://WWW.ANIME-LOADS.ORG/media/one-piece"),
+        ("query string kept", "https://anime-loads.org/media/one-piece?x=1"),
+        ("trailing slash", "https://anime-loads.org/media/one-piece/"),
+    ]
+
+    REJECT = [
+        ("empty", ""),
+        ("not a url", "not a url"),
+        ("query-string trick", "https://x.example/?anime-loads.org"),
+        ("userinfo trick", "https://anime-loads.org@evil.example/media/one-piece"),
+        ("missing /media/", "https://anime-loads.org/anime/one-piece"),
+        ("root path", "https://anime-loads.org/"),
+        ("suffix trick", "https://anime-loads.org.evil.example/media/one-piece"),
+        ("prefix trick", "https://evil-anime-loads.org/media/one-piece"),
+        ("wrong host", "https://evil.example/media/one-piece"),
+        ("non-http(s) scheme", "ftp://anime-loads.org/media/one-piece"),
+        ("scheme-relative", "//anime-loads.org/media/one-piece"),
+    ]
+
+    def test_accepts_valid_media_urls(self):
+        for label, url in self.ACCEPT:
+            with self.subTest(case=label, url=url):
+                self.assertTrue(app.is_valid_anime_url(url))
+
+    def test_rejects_invalid_urls(self):
+        for label, url in self.REJECT:
+            with self.subTest(case=label, url=url):
+                self.assertFalse(app.is_valid_anime_url(url))
+
+
+class AddUrlValidatorIntegrationTest(unittest.TestCase):
+    """/add-url end-to-end: is_valid_anime_url gates the request before any
+    scrape happens, so a rejected url never reaches get_releases (the
+    Selenium-backed fetch) and a valid one always does."""
+
+    def setUp(self):
+        fd, self._ani_path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        with open(self._ani_path, "w", encoding="utf-8") as f:
+            json.dump({"settings": {}, "anime": []}, f)
+        self._orig_ani = app.ANI_JSON
+        app.ANI_JSON = self._ani_path
+
+        self._orig_get_releases = app.get_releases
+        self.scrape_calls = []
+
+        def stub_get_releases(url):
+            self.scrape_calls.append(url)
+            return None, "stubbed: unavailable"
+
+        app.get_releases = stub_get_releases
+
+    def tearDown(self):
+        app.get_releases = self._orig_get_releases
+        app.ANI_JSON = self._orig_ani
+        try:
+            os.remove(self._ani_path)
+        except OSError:
+            pass
+
+    def _post(self, path, params):
+        captured = {}
+        h = app.Handler.__new__(app.Handler)
+        h.path = path
+        h._read_post = lambda: params
+        h._redirect_msg = lambda msg, level=None, **kw: captured.update(msg=msg, level=level, **kw)
+        h._redirect = _capture_redirect(captured)
+        h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
+        h.do_POST()
+        return captured
+
+    REJECT_CASES = [
+        ("query-string trick", "https://x.example/?anime-loads.org"),
+        ("userinfo trick", "https://anime-loads.org@evil.example/media/one-piece"),
+        ("missing /media/", "https://anime-loads.org/anime/one-piece"),
+        ("uppercase host, wrong path", "HTTPS://WWW.ANIME-LOADS.ORG/anime/one-piece"),
+    ]
+
+    def test_rejects_bad_urls_without_scraping(self):
+        for label, url in self.REJECT_CASES:
+            with self.subTest(case=label, url=url):
+                result = self._post("/add-url", {"url": url})
+                self.assertEqual(result.get("level"), "err")
+                self.assertTrue(result["msg"].startswith("Error: URL must be"))
+        self.assertEqual(self.scrape_calls, [],
+                          "an invalid url must never reach get_releases")
+
+    def test_accepts_valid_urls_and_scrapes(self):
+        cases = [
+            ("plain www", "https://www.anime-loads.org/media/x1"),
+            ("uppercase host", "HTTPS://WWW.ANIME-LOADS.ORG/media/x2"),
+        ]
+        for label, url in cases:
+            with self.subTest(case=label, url=url):
+                self.scrape_calls.clear()
+                result = self._post("/add-url", {"url": url})
+                self.assertEqual(len(self.scrape_calls), 1)
+                self.assertNotIn("URL must be", result.get("msg", ""))
+
+    def test_existing_odd_url_entry_still_renders_and_is_removable(self):
+        # An entry saved before this validator existed (or added by some
+        # other path) with a url that would now fail is_valid_anime_url —
+        # it must keep rendering and stay removable; only NEW input is
+        # gated, never an already-stored entry.
+        odd_url = "https://anime-loads.org/anime/legacy-entry"
+        app.save_ani({"settings": {}, "anime": [
+            {"name": "Legacy", "url": odd_url, "episodes": 0, "missing": []},
+        ]})
+        self.assertFalse(app.is_valid_anime_url(odd_url))
+
+        card_html = app.render_watchlist(app.load_ani()["anime"])
+        self.assertIn("Legacy", card_html)
+
+        result = self._post("/remove", {"key": odd_url})
+        self.assertEqual(result.get("msg"), "Removed: Legacy")
+        self.assertEqual(app.load_ani()["anime"], [])

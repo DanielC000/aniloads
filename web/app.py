@@ -2288,6 +2288,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .wl-status-dot { align-self: center; flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); }
   .wl-status-head { color: var(--text-heading); font-weight: 600; }
   .wl-status-detail + .wl-status-detail::before, .wl-status-head + .wl-status-detail::before { content: "·"; margin-right: var(--s2); color: var(--text-faint); }
+  .wl-checked { margin-top: var(--s1); font-size: var(--fs-xs); color: var(--text-muted); overflow-wrap: anywhere; }
+  .wl-status + .wl-checked { margin-top: var(--s2); }
+  .wl-checked--danger { color: var(--danger-text); }
+  .run-more { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s3); margin-top: var(--s4); padding-top: var(--s3); border-top: 1px solid var(--border); }
+  .run-more .hint { margin-right: auto; }
   .wl-status--ok .wl-status-dot { background: var(--ok-text); }
   .wl-status--ok .wl-status-head { color: var(--ok-text); }
   .wl-status--danger .wl-status-dot { background: var(--danger-text); }
@@ -2564,7 +2569,9 @@ function scrapeBusy(form, label) {
   var ids = ['bot-status','last-run','next-run','run-history','health',
              'move-status','move-last-run','move-history','move-stuck'];
   function refresh() {
-    fetch('/api/status')
+    // Keep the reader's "Show older cycles" depth across polls.
+    var runs = /[?&]runs=([0-9]+)/.exec(location.search);
+    fetch('/api/status' + (runs ? '?runs=' + runs[1] : ''))
       .then(function(r) { return r.json(); })
       .then(function(d) {
         ids.forEach(function(id) {
@@ -2961,7 +2968,41 @@ def _log_run_day(run):
     return ts.date() if ts else None
 
 
-def render_run_history(runs, state_runs=None, max_runs=20, now=None):
+RUN_HISTORY_PAGE = 20
+# The bot keeps 50 run-state records; the cap only bounds a hand-typed ?runs=.
+RUN_HISTORY_MAX = 500
+
+
+def parse_runs_param(qs):
+    """How many cycles Run History shows, from a parsed ``?runs=`` query:
+    the default page when absent or garbage, clamped to the allowed range."""
+    try:
+        n = int((qs.get("runs") or [""])[0])
+    except (TypeError, ValueError):
+        return RUN_HISTORY_PAGE
+    return max(RUN_HISTORY_PAGE, min(n, RUN_HISTORY_MAX))
+
+
+def render_run_history_more(total, max_runs):
+    """The paging row under the feed: "Show older cycles" while records beyond
+    ``max_runs`` exist, and a way back once the reader has paged. Plain links,
+    so paging works without script and survives the 10s poll (which passes
+    ``runs`` along)."""
+    links = ""
+    if total > max_runs:
+        links += ('<a class="btn btn-ghost btn-sm" href="/?runs={}#run-history-panel">'
+                  'Show older cycles</a>').format(max_runs + RUN_HISTORY_PAGE)
+    if max_runs > RUN_HISTORY_PAGE:
+        links += ('<a class="btn btn-ghost btn-sm" href="/#run-history-panel">'
+                  'Show recent only</a>')
+    if not links:
+        return ""
+    shown = min(total, max_runs)
+    return ('<div class="run-more"><span class="hint">Showing the latest {} of {} cycles</span>'
+            '{}</div>').format(shown, total, links)
+
+
+def render_run_history(runs, state_runs=None, max_runs=RUN_HISTORY_PAGE, now=None):
     """Render the run history feed.
 
     Prefers the bot's persisted run-state records (`state_runs`) — one concise
@@ -2973,7 +3014,7 @@ def render_run_history(runs, state_runs=None, max_runs=20, now=None):
     if state_runs:
         state_html = render_run_state_history(state_runs, max_runs=max_runs, now=now)
         if state_html:
-            return state_html
+            return state_html + render_run_history_more(len(state_runs), max_runs)
 
     if not runs:
         if not docker.available:
@@ -3022,7 +3063,7 @@ def render_run_history(runs, state_runs=None, max_runs=20, now=None):
             html += "</div>"
         html += "</div>"
 
-    return html
+    return html + render_run_history_more(len(runs), max_runs)
 
 
 def render_move_status(now=None):
@@ -3174,7 +3215,25 @@ def find_entry_by_url(entries, url):
     return -1, None
 
 
-def render_watchlist(anime_list, pending_list=None):
+def pending_resolve_error(entry, now=None):
+    """The pending card's failure line from ``resolve_error`` (written by
+    resolve_pending): "Last attempt 18:44 failed: <reason>. Retrying
+    automatically." Returns "" when the last attempt did not fail."""
+    err = entry.get("resolve_error")
+    if not isinstance(err, dict) or not err.get("reason"):
+        return ""
+    when = _local_ts(err.get("ts"))
+    head = "Last attempt {} failed".format(
+        format_day_time(when, fmt="%H:%M", now=now)) if when else "Last attempt failed"
+    return "{}: {}. Retrying automatically.".format(
+        head, " ".join(str(err["reason"]).split()).rstrip("."))
+
+
+def render_watchlist(anime_list, pending_list=None, entry_outcomes=None):
+    """``entry_outcomes`` is run_state.json's per-entry map, keyed by URL;
+    absent (an older bot) the cards simply carry no last-check line."""
+    if not isinstance(entry_outcomes, dict):
+        entry_outcomes = {}
     if not anime_list and not pending_list:
         return '<div class="empty">No anime in watchlist. Add some above!</div>'
     html = ""
@@ -3201,6 +3260,10 @@ def render_watchlist(anime_list, pending_list=None):
                     '<div class="anime-meta muted">No release matches your '
                     'language preference &mdash; adjust Preferences, or remove.</div>'
                 )
+            elif pending_resolve_error(a):
+                status_badge = '<span class="badge badge-warn">Resolve failed</span>'
+                no_match_line = '<p class="wl-checked wl-checked--danger">{}</p>'.format(
+                    escape(pending_resolve_error(a)))
             else:
                 status_badge = '<span class="badge badge-accent">Resolving</span>'
                 no_match_line = ""
@@ -3224,7 +3287,7 @@ def render_watchlist(anime_list, pending_list=None):
                              remove_confirm=remove_confirm)
 
     for i, a in enumerate(anime_list):
-        html += render_watchlist_card(i, a)
+        html += render_watchlist_card(i, a, entry_outcomes.get(a.get("url")))
     return html
 
 
@@ -3329,6 +3392,92 @@ def watchlist_status(entry, today=None):
             when = "{} {}".format(what, format_airdate(day, today))
         return "neutral", "Airing", [when, _plural(eps, "episode")]
     return "neutral", site or "Watching", [_plural(eps, "episode")]
+
+
+_ISO_DAY_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+
+
+def _humanize_reason(reason, today):
+    """A bot-written reason as card copy: ISO dates read as "Sat 20 Sep", the
+    two machine-shaped skip reasons get words, and a leading capital drops so
+    the reason flows after "Checked 18:44 · " (an acronym-led "JDownloader"
+    keeps its case)."""
+    reason = " ".join(str(reason or "").split())
+    if reason == "complete":
+        reason = "series complete"
+    m = re.fullmatch(r"skip_until \((.*)\)", reason)
+    if m:
+        reason = "next check {}".format(m.group(1)) if m.group(1) else "throttled"
+
+    def day(match):
+        parsed = _parse_airdate(match.group(1))
+        return format_airdate(parsed, today) if parsed else match.group(1)
+
+    reason = _ISO_DAY_RE.sub(day, reason)
+    if len(reason) > 1 and reason[0].isupper() and reason[1].islower():
+        reason = reason[0].lower() + reason[1:]
+    return reason
+
+
+def entry_check_lines(outcome, now=None):
+    """The quiet "last check" lines under a watchlist card's status, from the
+    bot's per-entry record in run_state.json (see ENTRY_RESULTS in
+    bot/anibot.py). Returns ``(check, error)``, each plain text or "":
+
+    - ``check``: "Checked 18:44 · waiting for airdate Sat 20 Sep".
+    - ``error``: "Last error: JDownloader unreachable (Tue 8 Sep)", shown only
+      when that error is not this check's own result (the check line already
+      says it) and the latest check was not a download, which supersedes it.
+
+    A missing or malformed record renders nothing, so an older bot or a
+    never-checked entry keeps the card as it was. So does a "paused" result:
+    the card's status line already says Paused."""
+    if not isinstance(outcome, dict) or outcome.get("result") == "paused":
+        return "", ""
+    now = now or _utc_now()
+    today = _to_local(now).date()
+    result = outcome.get("result")
+    checked = _local_ts(outcome.get("checked_ts"))
+
+    reason = _humanize_reason(outcome.get("reason"), today)
+    episode = outcome.get("episode")
+    if not isinstance(episode, int) or isinstance(episode, bool):
+        episode = None
+    if result == "downloaded" and episode is not None:
+        extra = reason.split(";", 1)[1].strip() if ";" in reason else ""
+        reason = "downloaded episode {}".format(episode) + ("; " + extra if extra else "")
+    elif episode is not None and "episode" not in reason.lower():
+        reason = "{} (episode {})".format(reason, episode) if reason else "episode {}".format(episode)
+    if not reason and isinstance(result, str):
+        reason = result
+
+    check = ""
+    if reason:
+        when = format_day_time(checked, fmt="%H:%M", now=now) if checked else ""
+        check = "{} · {}".format("Checked " + when if when else "Last check", reason)
+
+    error = ""
+    last_error = outcome.get("last_error")
+    if isinstance(last_error, dict) and last_error.get("reason") and result != "downloaded":
+        same_check = (result == "error"
+                      and last_error.get("checked_ts") == outcome.get("checked_ts"))
+        if not same_check:
+            err_day = _local_ts(last_error.get("checked_ts"))
+            error = "Last error: {}".format(" ".join(str(last_error["reason"]).split()))
+            if err_day:
+                error += " ({})".format(format_day(err_day.date(), now))
+    return check, error
+
+
+def render_entry_check(outcome, now=None):
+    check, error = entry_check_lines(outcome, now)
+    html = ""
+    if check:
+        tone = " wl-checked--danger" if outcome.get("result") == "error" else ""
+        html += '<p class="wl-checked{}">{}</p>'.format(tone, escape(check))
+    if error:
+        html += '<p class="wl-checked wl-checked--danger">{}</p>'.format(escape(error))
+    return html
 
 
 def compact_ranges(numbers):
@@ -3708,7 +3857,7 @@ def _render_edit_panel(i, entry, key, name):
                 sr=_sr(" " + name), rows=rows)
 
 
-def render_watchlist_card(i, a):
+def render_watchlist_card(i, a, outcome=None):
     name = a.get("name", "Unknown")
     url = a.get("url", "")
     # Mutations target this entry by its unique URL (see find_entry_by_url),
@@ -3771,13 +3920,14 @@ def render_watchlist_card(i, a):
             </div>
             {head_action}
           </div>
-          {status_html}
+          {status_html}{check_html}
           {facts_html}
           <div class="wl-panels">{ep_panel}{edit_panel}</div>
         </article>""".format(
         i=i, name=escape(name), url_html=_watchlist_url_html(url),
         head_action=head_action,
-        status_html=status_html, facts_html=facts_html,
+        status_html=status_html,
+        check_html="" if a.get("paused") else render_entry_check(outcome), facts_html=facts_html,
         ep_panel=_render_episode_panel(i, a, key, name),
         edit_panel=_render_edit_panel(i, a, key, name),
     )
@@ -4422,7 +4572,8 @@ def validate_settings_form(params, auth_enabled):
     return updates, errors
 
 
-def render_page(status="", search_html="", prefs_open=False, ani_data=None, search_query=""):
+def render_page(status="", search_html="", prefs_open=False, ani_data=None, search_query="",
+                max_runs=RUN_HISTORY_PAGE):
     data = ani_data if ani_data is not None else load_ani()
     anime_list = data.get("anime", [])
     pending_list = data.get("pending", [])
@@ -4431,8 +4582,9 @@ def render_page(status="", search_html="", prefs_open=False, ani_data=None, sear
 
     activity = get_activity()
     bot_status_html, last_run_html, next_run_html = render_activity(activity)
-    history_html = render_run_history(
-        activity["runs"], activity.get("run_state", {}).get("runs"))
+    run_state = activity.get("run_state")
+    run_state = run_state if isinstance(run_state, dict) else {}
+    history_html = render_run_history(activity["runs"], run_state.get("runs"), max_runs=max_runs)
 
     move_status_html, move_last_html = render_move_status()
     move_history_html = render_move_history()
@@ -4459,7 +4611,8 @@ def render_page(status="", search_html="", prefs_open=False, ani_data=None, sear
     page = page.replace("%%MOVE_HISTORY%%", move_history_html)
     page = page.replace("%%MOVE_STUCK%%", move_stuck_html)
     page = page.replace("%%SEARCH_RESULTS%%", search_html)
-    page = page.replace("%%WATCHLIST%%", render_watchlist(anime_list, pending_list))
+    page = page.replace("%%WATCHLIST%%", render_watchlist(
+        anime_list, pending_list, run_state.get("entries")))
     page = page.replace("%%SETTINGS_CARD%%", render_settings_card(data.get("settings"), AUTH_ENABLED))
     page = page.replace("%%COUNT%%", str(total))
     page = page.replace("%%PREFS_OPEN%%", "open" if prefs_open else "")
@@ -4649,11 +4802,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
 
+        qs = parse_qs(parsed.query)
         if parsed.path == "/api/status":
             activity = get_activity()
             bot_status_html, last_run_html, next_run_html = render_activity(activity)
             history_html = render_run_history(
-                activity["runs"], activity.get("run_state", {}).get("runs"))
+                activity["runs"], activity.get("run_state", {}).get("runs"),
+                max_runs=parse_runs_param(qs))
             move_status_html, move_last_html = render_move_status()
             move_history_html = render_move_history()
             move_stuck_html = render_move_stuck()
@@ -4678,7 +4833,6 @@ class Handler(BaseHTTPRequestHandler):
 
         status = ""
 
-        qs = parse_qs(parsed.query)
         if "msg" in qs:
             msg = qs["msg"][0]
             level = qs.get("level", [None])[0]
@@ -4688,7 +4842,7 @@ class Handler(BaseHTTPRequestHandler):
             status = '<div class="status-msg {}" id="status-msg">{}</div>'.format(cls, escape(msg))
 
         try:
-            page = render_page(status=status)
+            page = render_page(status=status, max_runs=parse_runs_param(qs))
         except anistore.CorruptStoreError as e:
             _log.error("[watchlist] ani.json is corrupt, refusing to render it: %s", e)
             status = '<div class="status-msg status-err" id="status-msg">Error: ani.json is corrupt — the watchlist can\'t be shown or edited until it is fixed or restored.</div>'
@@ -5501,7 +5655,8 @@ class Handler(BaseHTTPRequestHandler):
             self._redirect("/")
 
 
-def apply_resolved_pending(data, resolved_entries, no_match_urls=()):
+def apply_resolved_pending(data, resolved_entries, no_match_urls=(), failures=None,
+                           cleared_urls=()):
     """Merge resolve_pending()'s per-cycle scrape results onto a FRESH
     ani.json snapshot, instead of saving the whole stale "pending"/"anime"
     snapshot the resolver started its (multi-second, per-entry) scrape pass
@@ -5521,6 +5676,12 @@ def apply_resolved_pending(data, resolved_entries, no_match_urls=()):
     `no_match_urls`: URLs whose fresh `pending` entry should be flagged
     `no_match = True` (silently skipped if no longer pending).
 
+    `failures`: ``{url: {"reason": ..., "ts": ...}}`` for entries whose
+    resolve attempt failed this pass, stored as the pending entry's
+    `resolve_error` so its card can say why instead of "Resolving" forever.
+    `cleared_urls`: entries whose scrape succeeded this pass; any stale
+    `resolve_error` on them is dropped.
+
     A `pending` entry the dashboard added after the scrape started, and any
     entry named in neither argument, is left untouched.
     """
@@ -5539,9 +5700,20 @@ def apply_resolved_pending(data, resolved_entries, no_match_urls=()):
             continue
         if url in no_match_urls:
             p["no_match"] = True
+        if failures and url in failures:
+            p["resolve_error"] = failures[url]
+        elif url in cleared_urls or url in no_match_urls:
+            p.pop("resolve_error", None)
         remaining.append(p)
     data["pending"] = remaining
     return data
+
+
+def resolve_failure(reason):
+    """A pending entry's ``resolve_error`` record: the reason (bounded, like
+    the bot's run-state reasons) plus when the attempt failed, in UTC."""
+    return {"reason": " ".join(str(reason).split())[:200],
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
 
 
 def resolve_pending():
@@ -5560,6 +5732,8 @@ def resolve_pending():
             prefs = load_prefs()
             resolved_entries = []
             no_match_urls = set()
+            failures = {}
+            cleared_urls = set()
 
             for entry in pending:
                 url = entry.get("url", "")
@@ -5571,7 +5745,10 @@ def resolve_pending():
                     info, err = get_releases(url)
                     if err or not info or not info.get("releases"):
                         _log.warning("[resolver] Failed for %s: %s", url, err)
+                        failures[url] = resolve_failure(err or "no releases found on the site")
                         continue
+                    if entry.get("resolve_error"):
+                        cleared_urls.add(url)
 
                     entry_prefs = dict(prefs)
                     audio_override = entry.get("pref_audio_language", entry.get("pref_language"))
@@ -5603,11 +5780,13 @@ def resolve_pending():
                         _log.info("[resolver] No release matches prefs for %s", info["name"])
                 except Exception as e:
                     _log.error("[resolver] Error resolving %s: %s", url, e)
+                    failures[url] = resolve_failure("{}: {}".format(type(e).__name__, e))
 
                 time.sleep(RESOLVE_PENDING_PER_ENTRY_DELAY)
 
-            if resolved_entries or no_match_urls:
-                update_ani(lambda d: apply_resolved_pending(d, resolved_entries, no_match_urls))
+            if resolved_entries or no_match_urls or failures or cleared_urls:
+                update_ani(lambda d: apply_resolved_pending(
+                    d, resolved_entries, no_match_urls, failures, cleared_urls))
                 if resolved_entries:
                     _log.info("[resolver] Moved %d entries to anime list", len(resolved_entries))
 

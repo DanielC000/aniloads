@@ -5610,5 +5610,252 @@ class PausedCheckNowTest(unittest.TestCase):
         self.assertNotIn("force_check", app.load_ani()["anime"][0])
         self.assertFalse(os.path.isfile(app.RUN_NOW_FILE))
 
+class EntryCheckLineTest(unittest.TestCase):
+    """Each watchlist card says when the bot last checked it and what came of
+    it, from run_state.json's per-entry map (card 7bc5a4f0)."""
+
+    NOW = datetime(2026, 9, 17, 18, 50)
+
+    def lines(self, **outcome):
+        return app.entry_check_lines(outcome, now=self.NOW)
+
+    def test_skipped_waiting_for_airdate_reads_the_date(self):
+        check, error = self.lines(checked_ts="2026-09-17T18:44:00Z", result="skipped",
+                                  reason="waiting for airdate 2026-09-20")
+        self.assertEqual(check, "Checked 18:44 · waiting for airdate Sun 20 Sep")
+        self.assertEqual(error, "")
+
+    def test_downloaded_names_the_episode(self):
+        check, _ = self.lines(checked_ts="2026-09-17T18:44:00Z", result="downloaded",
+                              reason="episode downloaded", episode=12)
+        self.assertEqual(check, "Checked 18:44 · downloaded episode 12")
+
+    def test_downloaded_keeps_completion_suffix(self):
+        check, _ = self.lines(checked_ts="2026-09-17T18:44:00Z", result="downloaded",
+                              reason="episode downloaded; series complete", episode=24)
+        self.assertEqual(check, "Checked 18:44 · downloaded episode 24; series complete")
+
+    def test_batch_download_without_episode_uses_reason(self):
+        check, _ = self.lines(checked_ts="2026-09-17T18:44:00Z", result="downloaded",
+                              reason="3 episode(s) batch-downloaded")
+        self.assertEqual(check, "Checked 18:44 · 3 episode(s) batch-downloaded")
+
+    def test_unavailable_appends_episode(self):
+        check, _ = self.lines(checked_ts="2026-09-17T18:44:00Z", result="unavailable",
+                              reason="No download links available", episode=8)
+        self.assertEqual(check, "Checked 18:44 · no download links available (episode 8)")
+
+    def test_machine_reasons_get_words(self):
+        self.assertEqual(self.lines(checked_ts="2026-09-17T18:44:00Z", result="skipped",
+                                    reason="complete")[0],
+                         "Checked 18:44 · series complete")
+        self.assertEqual(self.lines(checked_ts="2026-09-17T18:44:00Z", result="skipped",
+                                    reason="skip_until (2026-09-19)")[0],
+                         "Checked 18:44 · next check Sat 19 Sep")
+
+    def test_mismatch_shows_reason(self):
+        self.assertEqual(self.lines(checked_ts="2026-09-17T18:44:00Z", result="mismatch",
+                                    reason="episode numbering mismatch")[0],
+                         "Checked 18:44 · episode numbering mismatch")
+
+    def test_paused_stays_quiet(self):
+        # The status line already says Paused; the check line must not repeat it.
+        self.assertEqual(self.lines(checked_ts="2026-09-17T18:44:00Z", result="paused",
+                                    reason="paused from dashboard",
+                                    last_error={"reason": "JDownloader unreachable",
+                                                "checked_ts": "2026-09-08T14:00:00Z"}),
+                         ("", ""))
+        url = "https://www.anime-loads.org/media/x"
+        stale = {"checked_ts": "2026-09-17T18:44:00Z", "result": "skipped", "reason": "no new episode"}
+        card = app.render_watchlist_card(0, {"name": "X", "url": url, "episodes": 2, "paused": True}, stale)
+        self.assertIn("Paused", card)
+        self.assertNotIn("wl-checked", card)
+        self.assertIn("wl-checked", app.render_watchlist_card(
+            0, {"name": "X", "url": url, "episodes": 2}, stale))
+
+    def test_older_check_carries_day(self):
+        check, _ = self.lines(checked_ts="2026-09-16T09:05:00Z", result="skipped",
+                              reason="no new episode")
+        self.assertEqual(check, "Checked Yesterday 09:05 · no new episode")
+
+    def test_error_result_does_not_repeat_as_last_error(self):
+        ts = "2026-09-17T18:44:00Z"
+        check, error = self.lines(checked_ts=ts, result="error", episode=5,
+                                  reason="JDownloader unreachable",
+                                  last_error={"reason": "JDownloader unreachable", "checked_ts": ts})
+        self.assertEqual(check, "Checked 18:44 · JDownloader unreachable (episode 5)")
+        self.assertEqual(error, "")
+
+    def test_older_error_survives_a_clean_skip(self):
+        _, error = self.lines(checked_ts="2026-09-17T18:44:00Z", result="skipped",
+                              reason="no new episode",
+                              last_error={"reason": "JDownloader unreachable",
+                                          "checked_ts": "2026-09-08T14:00:00Z"})
+        self.assertEqual(error, "Last error: JDownloader unreachable (Tue 8 Sep)")
+
+    def test_download_supersedes_older_error(self):
+        _, error = self.lines(checked_ts="2026-09-17T18:44:00Z", result="downloaded",
+                              reason="episode downloaded", episode=3,
+                              last_error={"reason": "JDownloader unreachable",
+                                          "checked_ts": "2026-09-08T14:00:00Z"})
+        self.assertEqual(error, "")
+
+    def test_absent_or_malformed_renders_nothing(self):
+        self.assertEqual(app.entry_check_lines(None), ("", ""))
+        self.assertEqual(app.entry_check_lines("junk"), ("", ""))
+        self.assertEqual(app.render_entry_check({}), "")
+
+    def test_garbage_timestamp_falls_back_to_last_check(self):
+        check, _ = self.lines(checked_ts="nope", result="skipped", reason="no new episode")
+        self.assertEqual(check, "Last check · no new episode")
+
+    def test_reason_is_escaped_on_the_card(self):
+        entry = {"name": "X", "url": "https://www.anime-loads.org/media/x", "episodes": 2}
+        outcome = {"checked_ts": "2026-09-17T18:44:00Z", "result": "error",
+                   "reason": "<script>boom</script>",
+                   "last_error": {"reason": "<b>old</b>", "checked_ts": "2026-09-08T14:00:00Z"}}
+        html_out = app.render_watchlist_card(0, entry, outcome)
+        self.assertNotIn("<script>", html_out)
+        self.assertNotIn("<b>old</b>", html_out)
+        self.assertIn("&lt;script&gt;", html_out)
+        self.assertIn('class="wl-checked wl-checked--danger"', html_out)
+
+    def test_watchlist_looks_up_outcome_by_url(self):
+        url = "https://www.anime-loads.org/media/x"
+        entries = {url: {"checked_ts": "2026-09-17T18:44:00Z", "result": "skipped",
+                         "reason": "no new episode"}}
+        entry = {"name": "X", "url": url, "episodes": 2}
+        self.assertIn("no new episode", app.render_watchlist([entry], [], entries))
+        self.assertNotIn("wl-checked", app.render_watchlist([entry], [], None))
+
+
+class RunHistoryOlderCyclesTest(unittest.TestCase):
+    """Run History shows 20 cycles by default with a link to page further back."""
+
+    def state_runs(self, n):
+        start = datetime(2026, 9, 17, 0, 0)
+        return [{"finished_ts": (start + timedelta(minutes=10 * i)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                 "counts": {"entries": 3, "checked": 3, "downloaded": 1, "errors": 0},
+                 "events": [{"kind": "download", "anime": "Show{}".format(i), "episodes": [i]}]}
+                for i in range(n)]
+
+    def test_link_only_when_older_cycles_exist(self):
+        self.assertNotIn("Show older cycles", app.render_run_history([], self.state_runs(20)))
+        html_out = app.render_run_history([], self.state_runs(45))
+        self.assertIn('href="/?runs=40#run-history-panel"', html_out)
+        self.assertIn("Showing the latest 20 of 45 cycles", html_out)
+        self.assertIn("Show44 —", html_out)
+        self.assertNotIn("Show24 —", html_out)
+        self.assertNotIn("Show recent only", html_out)
+
+    def test_paged_view_shows_more_and_a_way_back(self):
+        html_out = app.render_run_history([], self.state_runs(45), max_runs=40)
+        self.assertIn("Show24 —", html_out)
+        self.assertNotIn("Show4 —", html_out)
+        self.assertIn('href="/?runs=60#run-history-panel"', html_out)
+        self.assertIn("Show recent only", html_out)
+        last = app.render_run_history([], self.state_runs(45), max_runs=60)
+        self.assertNotIn("Show older cycles", last)
+        self.assertIn("Showing the latest 45 of 45 cycles", last)
+
+    def test_log_feed_pages_too(self):
+        runs = [{"time": "19:{:02d}".format(i), "anime": "Log{}".format(i),
+                 "events": [{"type": "download", "msg": "x"}]} for i in range(25)]
+        self.assertIn("Show older cycles", app.render_run_history(runs, None))
+
+    def test_parse_runs_param_clamps(self):
+        self.assertEqual(app.parse_runs_param({}), 20)
+        self.assertEqual(app.parse_runs_param({"runs": ["abc"]}), 20)
+        self.assertEqual(app.parse_runs_param({"runs": ["5"]}), 20)
+        self.assertEqual(app.parse_runs_param({"runs": ["40"]}), 40)
+        self.assertEqual(app.parse_runs_param({"runs": ["99999"]}), app.RUN_HISTORY_MAX)
+
+    def test_get_passes_runs_to_page(self):
+        captured = {}
+        h = app.Handler.__new__(app.Handler)
+        h.path = "/?runs=40"
+        h._respond = lambda code, body: None
+        orig = app.render_page
+        app.render_page = lambda **kw: captured.update(kw) or ""
+        try:
+            h.do_GET()
+        finally:
+            app.render_page = orig
+        self.assertEqual(captured["max_runs"], 40)
+
+    def test_poll_keeps_runs_depth(self):
+        self.assertIn("runs=([0-9]+)", app.HTML_TEMPLATE)
+
+
+class PendingResolveErrorTest(unittest.TestCase):
+    """A pending entry whose resolve keeps failing says why, instead of
+    showing "Resolving" forever."""
+
+    URL = "https://www.anime-loads.org/media/p"
+
+    def test_card_shows_failure_reason(self):
+        entry = {"name": "P", "url": self.URL,
+                 "resolve_error": {"reason": "Timeout <loading>", "ts": "2026-09-17T18:44:00Z"}}
+        html_out = app.render_watchlist([], [entry])
+        self.assertIn("Resolve failed", html_out)
+        self.assertNotIn(">Resolving<", html_out)
+        self.assertIn("failed: Timeout &lt;loading&gt;. Retrying automatically.", html_out)
+        self.assertEqual(app.pending_resolve_error(entry, now=datetime(2026, 9, 17, 19, 0)),
+                         "Last attempt 18:44 failed: Timeout <loading>. Retrying automatically.")
+
+    def test_card_without_error_still_resolving(self):
+        html_out = app.render_watchlist([], [{"name": "P", "url": self.URL}])
+        self.assertIn(">Resolving<", html_out)
+        self.assertNotIn("wl-checked", html_out)
+
+    def test_apply_sets_and_clears_resolve_error(self):
+        data = {"anime": [], "pending": [{"url": self.URL},
+                                         {"url": "u2", "resolve_error": {"reason": "x"}}]}
+        failure = {"reason": "boom", "ts": "2026-09-17T18:44:00Z"}
+        out = app.apply_resolved_pending(data, [], (), {self.URL: failure}, {"u2"})
+        by_url = {p["url"]: p for p in out["pending"]}
+        self.assertEqual(by_url[self.URL]["resolve_error"], failure)
+        self.assertNotIn("resolve_error", by_url["u2"])
+
+    def test_resolve_failure_is_bounded(self):
+        rec = app.resolve_failure("x" * 500)
+        self.assertEqual(len(rec["reason"]), 200)
+        self.assertIsNotNone(app._parse_state_ts(rec["ts"]))
+
+    def test_resolver_pass_persists_failure_through_update_ani(self):
+        class Stop(BaseException):
+            pass
+
+        def fake_sleep(seconds):
+            if seconds == app.RESOLVE_PENDING_BATCH_INTERVAL:
+                raise Stop()
+
+        store = {"anime": [], "pending": [{"name": "P", "url": self.URL}]}
+        calls = []
+
+        def fake_update(fn):
+            calls.append(fn)
+            fn(store)
+
+        patches = {"load_ani": lambda: json.loads(json.dumps(store)),
+                   "load_prefs": lambda: {},
+                   "get_releases": lambda url: (None, "site timed out"),
+                   "update_ani": fake_update}
+        originals = {name: getattr(app, name) for name in patches}
+        orig_sleep = app.time.sleep
+        for name, fn in patches.items():
+            setattr(app, name, fn)
+        app.time.sleep = fake_sleep
+        try:
+            with self.assertRaises(Stop):
+                app.resolve_pending()
+        finally:
+            app.time.sleep = orig_sleep
+            for name, fn in originals.items():
+                setattr(app, name, fn)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(store["pending"][0]["resolve_error"]["reason"], "site timed out")
+
+
 if __name__ == "__main__":
     unittest.main()

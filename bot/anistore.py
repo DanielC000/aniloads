@@ -20,9 +20,11 @@ import os
 import stat
 import sys
 import tempfile
+import threading
 
 if sys.platform == "win32":
     import msvcrt
+    fcntl = None
 else:
     import fcntl
 
@@ -146,49 +148,97 @@ def save(path, data):
         raise
 
 
+# Module-level per-lock-path threading.RLock registry, guarded by its own
+# lock. The homelab's /config is NFS without local_lock, so flock()/fcntl
+# locks are emulated with POSIX byte-range locks there -- and those are
+# owned per PROCESS, not per fd: two threads in this same process can each
+# "acquire" LOCK_EX at once, and closing ANY fd for the file drops every one
+# of this process's locks on it. The dashboard is multithreaded
+# (ThreadingHTTPServer request threads, the resolver thread, the mover
+# thread), so the OS-level lock alone does not serialize concurrent
+# `update_ani` calls within this process on NFS -- this RLock is what does.
+_PATH_LOCKS_GUARD = threading.Lock()
+_PATH_LOCKS = {}
+
+# Per-thread reentrancy depth, keyed by lock_path. A thread already holding
+# `locked(path)` that calls it again (directly or via a helper) must not
+# open a second fd or flock/close again -- an inner close would drop the
+# outer POSIX lock on NFS. Only the outermost call for a given thread+path
+# actually opens/locks/closes; a nested call just extends the RLock hold.
+_THREAD_LOCAL = threading.local()
+
+
+def _process_lock_for(lock_path):
+    with _PATH_LOCKS_GUARD:
+        rlock = _PATH_LOCKS.get(lock_path)
+        if rlock is None:
+            rlock = threading.RLock()
+            _PATH_LOCKS[lock_path] = rlock
+        return rlock
+
+
+def _thread_lock_depths():
+    depths = getattr(_THREAD_LOCAL, "depths", None)
+    if depths is None:
+        depths = {}
+        _THREAD_LOCAL.depths = depths
+    return depths
+
+
+def _describe_lock_file(lock_path):
+    try:
+        st = os.stat(lock_path)
+    except OSError:
+        return "unknown owner/mode (could not stat it)"
+    return "owned by uid {}, mode {:o}".format(st.st_uid, stat.S_IMODE(st.st_mode))
+
+
 @contextlib.contextmanager
-def locked(path):
-    """Advisory exclusive lock on a sibling ``<path>.lock`` file, held for
-    the duration of the ``with`` block.
-
-    The bot and dashboard containers bind-mount the same host directory, so
-    this lock (held on a real file in that directory) is visible across both
-    processes, not just within one of them — and one of those processes runs
-    as root, the other as a configured PUID/PGID, so whichever one creates
-    the lock file first must not leave it in a mode the other can't even
-    open. ``fcntl.flock`` on POSIX; ``msvcrt.locking`` on Windows (the
-    platform this test suite runs on), locking a single byte of the lock
-    file.
-    """
-    lock_path = str(path) + ".lock"
-    d = os.path.dirname(lock_path) or "."
-    os.makedirs(d, exist_ok=True)
-
-    if sys.platform == "win32":
-        f = open(lock_path, "a+b")
+def _open_and_flock_win32(lock_path):
+    f = open(lock_path, "a+b")
+    try:
+        f.seek(0, os.SEEK_END)
+        if f.tell() == 0:
+            f.write(b"0")
+            f.flush()
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
         try:
-            f.seek(0, os.SEEK_END)
-            if f.tell() == 0:
-                f.write(b"0")
-                f.flush()
-            f.seek(0)
-            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
-            try:
-                yield
-            finally:
-                f.seek(0)
-                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            yield
         finally:
-            f.close()
-        return
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        f.close()
 
-    # POSIX: open O_RDONLY (flock only needs a valid fd, not write access —
-    # a non-owner with just read permission on the lock file can still
-    # acquire it). If we're the one creating it, open it world-writable so
-    # neither container's user is later locked out, and hand ownership to
-    # whoever owns the shared directory when we're root.
+
+@contextlib.contextmanager
+def _open_and_flock_posix(lock_path, d):
+    """Open the lock file read-write and hold an exclusive flock on it.
+
+    Opened O_RDWR, never O_RDONLY: on NFS without local_lock, flock() is
+    emulated with POSIX byte-range locks, and taking an exclusive lock on a
+    read-only fd raises EBADF there -- every caller then fails the same way.
+    If we're the one creating the file, open it world-writable so neither
+    container's user is later locked out, and hand ownership to whoever
+    owns the shared directory when we're root.
+
+    If the write-open itself fails with EACCES/EPERM (PermissionError), we
+    do NOT fall back to O_RDONLY -- that would just reproduce the same EBADF
+    on NFS. Instead this raises a clear, actionable error naming the lock
+    path and how to fix it.
+    """
     created = not os.path.exists(lock_path)
-    fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT, 0o666)
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+    except PermissionError as e:
+        raise PermissionError(
+            "cannot open {} read-write ({}); currently {} -- make {} "
+            "writable by both containers: chmod 666 {}".format(
+                lock_path, e.strerror or e, _describe_lock_file(lock_path),
+                lock_path, lock_path,
+            )
+        ) from e
     try:
         if created:
             try:
@@ -208,6 +258,56 @@ def locked(path):
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
+
+
+@contextlib.contextmanager
+def locked(path):
+    """Advisory exclusive lock on a sibling ``<path>.lock`` file, held for
+    the duration of the ``with`` block.
+
+    The bot and dashboard containers bind-mount the same host directory, so
+    this lock (held on a real file in that directory) is visible across both
+    processes, not just within one of them — and one of those processes runs
+    as root, the other as a configured PUID/PGID, so whichever one creates
+    the lock file first must not leave it in a mode the other can't even
+    open. ``fcntl.flock`` on POSIX; ``msvcrt.locking`` on Windows (the
+    platform this test suite runs on), locking a single byte of the lock
+    file.
+
+    Also holds a module-level, per-lock-path ``threading.RLock`` for the
+    duration of the block, on both POSIX and Windows -- see
+    ``_PATH_LOCKS``'s comment above for why the OS-level lock alone isn't
+    enough once a single process (the multithreaded dashboard) can have more
+    than one thread in here at once. Reentrant-safe: a thread already
+    holding the lock for this path that calls ``locked(path)`` again just
+    extends the hold instead of opening a second fd.
+    """
+    lock_path = str(path) + ".lock"
+    d = os.path.dirname(lock_path) or "."
+    os.makedirs(d, exist_ok=True)
+
+    process_lock = _process_lock_for(lock_path)
+    process_lock.acquire()
+    depths = _thread_lock_depths()
+    depth = depths.get(lock_path, 0)
+    depths[lock_path] = depth + 1
+    try:
+        if depth == 0:
+            if sys.platform == "win32":
+                with _open_and_flock_win32(lock_path):
+                    yield
+            else:
+                with _open_and_flock_posix(lock_path, d):
+                    yield
+        else:
+            yield
+    finally:
+        remaining = depths[lock_path] - 1
+        if remaining:
+            depths[lock_path] = remaining
+        else:
+            del depths[lock_path]
+        process_lock.release()
 
 
 def seed_if_missing(path, default_factory):

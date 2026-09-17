@@ -1,11 +1,14 @@
 """Tests for bot/anistore.py — the shared atomic load/save/lock primitives
 for ani.json used by both the bot and the dashboard."""
 
+import errno
 import json
 import os
 import stat
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -221,17 +224,28 @@ class LockedTest(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(os, "chmod") and sys.platform != "win32",
                           "POSIX permission bits only")
-    def test_lock_acquirable_when_lock_file_not_writable_by_caller(self):
-        # flock only needs a valid fd, not write access — anistore.locked()
-        # opens O_RDONLY specifically so a caller with only read permission
-        # on the lock file (e.g. the PUID dashboard user against a lock file
-        # the root bot created and left non-writable) can still acquire it.
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                      "root bypasses POSIX permission bits")
+    def test_lock_unwritable_by_caller_raises_clear_error_not_silent_fallback(self):
+        # anistore.locked() opens O_RDWR, not O_RDONLY: on NFS without
+        # local_lock, flock() is emulated with POSIX byte-range locks, and
+        # an exclusive lock on a read-only fd raises EBADF there (the
+        # outage this module exists to prevent). A lock file the caller
+        # can't write to must surface a clear, actionable error instead of
+        # silently falling back to a read-only open that would reproduce
+        # that same EBADF.
         lock_path = self._path + ".lock"
         with anistore.locked(self._path):
             pass
         os.chmod(lock_path, 0o444)
-        with anistore.locked(self._path):
-            pass
+        try:
+            with self.assertRaises(PermissionError) as cm:
+                with anistore.locked(self._path):
+                    pass
+            self.assertIn(lock_path, str(cm.exception))
+            self.assertIn("chmod 666", str(cm.exception))
+        finally:
+            os.chmod(lock_path, 0o666)
 
     def test_lock_released_even_on_exception(self):
         lock_path = self._path + ".lock"
@@ -473,6 +487,198 @@ class MergeEntryFieldsTest(unittest.TestCase):
         self.assertEqual(entry["customPackage"], "New Folder")
         self.assertEqual(entry["tvdb_id"], 99)
         self.assertEqual(entry["episodes"], 1)
+
+
+class _FakeFcntl:
+    """Stands in for the real `fcntl` module so the POSIX branch of
+    anistore.locked() can be exercised on any host, including this Windows
+    one -- and so its flock() can be made to fail exactly like it does
+    against NFS's POSIX-lock emulation.
+
+    `writable_fds=None` (the default) means flock() always succeeds -- this
+    is what real NFS actually does for LOCK_EX from two different fds/
+    threads in the SAME process: it grants both, because those locks are
+    owned per-process, not per-fd. Passing a `set()` instead restricts
+    success to fds recorded in it (see `_track_rdwr_fds` below), so a
+    read-only-opened fd raises OSError(EBADF) -- the exact failure 75f16d0
+    shipped with.
+    """
+
+    LOCK_EX = 2
+    LOCK_UN = 8
+
+    def __init__(self, writable_fds=None):
+        self._writable_fds = writable_fds
+
+    def flock(self, fd, op):
+        if (op == self.LOCK_EX and self._writable_fds is not None
+                and fd not in self._writable_fds):
+            raise OSError(errno.EBADF, "Bad file descriptor")
+
+
+def _track_rdwr_fds(writable_fds):
+    """A real os.open() wrapper that records which fds it opened O_RDWR,
+    for `_FakeFcntl` above to consult. Uses the real os.open (and thus real
+    fds) so the rest of anistore.locked() -- os.close, os.chmod, etc. --
+    keeps working unmodified; only fcntl.flock's NFS-emulation is faked."""
+    real_open = os.open
+
+    def opener(path, flags, mode=0o777):
+        fd = real_open(path, flags, mode)
+        if flags & os.O_RDWR:
+            writable_fds.add(fd)
+        return fd
+
+    return opener
+
+
+class NfsLockRegressionTest(unittest.TestCase):
+    """Regression coverage for the NFS /config outage fixed by 27485ae3:
+    anistore.locked()'s POSIX branch opened O_RDONLY, and an exclusive
+    flock() on a read-only fd raises EBADF once flock is emulated with
+    POSIX byte-range locks (as it is for NFS without local_lock) -- every
+    dashboard request and bot call site then 500s. Every test in this class
+    would be RED against 75f16d0 (before the fix)."""
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp(prefix="anistore-nfs-tests-")
+        self._path = os.path.join(self._dir, "ani.json")
+
+    def tearDown(self):
+        for name in os.listdir(self._dir):
+            os.remove(os.path.join(self._dir, name))
+        os.rmdir(self._dir)
+
+    def test_posix_branch_opens_with_read_write_flags(self):
+        # (a) Would be RED on 75f16d0: the old code opened
+        # `os.O_RDONLY | os.O_CREAT`, so this flags check fails against it.
+        open_calls = []
+        real_open = os.open
+
+        def capturing_open(path, flags, mode=0o777):
+            open_calls.append(flags)
+            return real_open(path, flags, mode)
+
+        with mock.patch.object(anistore.sys, "platform", "linux"), \
+                mock.patch.object(anistore, "fcntl", _FakeFcntl()), \
+                mock.patch.object(anistore.os, "open", side_effect=capturing_open):
+            with anistore.locked(self._path):
+                pass
+
+        self.assertTrue(open_calls)
+        for flags in open_calls:
+            self.assertTrue(flags & os.O_RDWR, "expected O_RDWR in {!r}".format(flags))
+
+    def test_flock_ebadf_on_readonly_fd_is_avoided_by_rw_open(self):
+        # (b) Would be RED on 75f16d0: opening O_RDONLY there means the fd
+        # is never in `writable_fds`, so the fake NFS flock() below would
+        # raise EBADF for it instead of succeeding.
+        writable_fds = set()
+        fake_fcntl = _FakeFcntl(writable_fds)
+
+        with mock.patch.object(anistore.sys, "platform", "linux"), \
+                mock.patch.object(anistore, "fcntl", fake_fcntl), \
+                mock.patch.object(anistore.os, "open",
+                                   side_effect=_track_rdwr_fds(writable_fds)):
+            with anistore.locked(self._path):
+                pass  # must not raise
+
+        # Demonstrate the failure mode this avoids: flock() against a fd
+        # that was never opened O_RDWR (as the pre-fix O_RDONLY open would
+        # produce) raises EBADF under this same fake NFS emulation. Use a
+        # sentinel fd number guaranteed absent from `writable_fds` rather
+        # than a fresh real fd -- real fd numbers get reused after close,
+        # so a newly-opened fd could collide with one already recorded.
+        never_writable_fd = max(writable_fds, default=0) + 1000
+        with self.assertRaises(OSError) as cm:
+            fake_fcntl.flock(never_writable_fd, fake_fcntl.LOCK_EX)
+        self.assertEqual(cm.exception.errno, errno.EBADF)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                      "root bypasses POSIX permission bits")
+    def test_write_open_eacces_raises_clear_error_never_silent_fallback(self):
+        # (c) Would be RED on 75f16d0: the old code opened O_RDONLY, which
+        # would have succeeded here instead of raising -- this test only
+        # makes sense once the open is O_RDWR.
+        lock_path = self._path + ".lock"
+        open(lock_path, "a").close()
+
+        open_calls = []
+
+        def denying_open(path, flags, mode=0o777):
+            open_calls.append(flags)
+            raise PermissionError(errno.EACCES, "Permission denied")
+
+        with mock.patch.object(anistore.sys, "platform", "linux"), \
+                mock.patch.object(anistore, "fcntl", _FakeFcntl()), \
+                mock.patch.object(anistore.os, "open", side_effect=denying_open):
+            with self.assertRaises(PermissionError) as cm:
+                with anistore.locked(self._path):
+                    pass
+
+        self.assertEqual(len(open_calls), 1, "must not retry with O_RDONLY")
+        self.assertTrue(open_calls[0] & os.O_RDWR)
+        self.assertIn(lock_path, str(cm.exception))
+        self.assertIn("chmod 666", str(cm.exception))
+
+    def test_concurrent_threads_never_overlap_in_critical_section(self):
+        # (d) Would be RED on 75f16d0's design (no process-local
+        # serialization at all): with a fake flock that grants LOCK_EX to
+        # every fd unconditionally -- emulating NFS's per-PROCESS lock
+        # ownership, where two threads in this process can each "acquire"
+        # successfully -- only anistore.locked()'s own threading.RLock can
+        # still keep two threads out of the critical section at once.
+        active = 0
+        max_active = 0
+        counter_lock = threading.Lock()
+        errors = []
+
+        def worker():
+            nonlocal active, max_active
+            try:
+                with anistore.locked(self._path):
+                    with counter_lock:
+                        active += 1
+                        max_active = max(max_active, active)
+                    try:
+                        time.sleep(0.05)
+                    finally:
+                        with counter_lock:
+                            active -= 1
+            except Exception as e:  # pragma: no cover - surfaced via errors
+                errors.append(e)
+
+        with mock.patch.object(anistore.sys, "platform", "linux"), \
+                mock.patch.object(anistore, "fcntl", _FakeFcntl()):
+            threads = [threading.Thread(target=worker) for _ in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(max_active, 1)
+
+    def test_nested_same_thread_lock_does_not_deadlock_and_opens_one_fd(self):
+        # (e) Would hang (deadlock) on a naive fix that reuses a plain
+        # (non-reentrant) lock per path without depth tracking; would open
+        # a second fd (and, on the old code, drop the outer POSIX lock on
+        # close) without the depth guard.
+        open_calls = []
+        real_open = os.open
+
+        def counting_open(path, flags, mode=0o777):
+            open_calls.append(flags)
+            return real_open(path, flags, mode)
+
+        with mock.patch.object(anistore.sys, "platform", "linux"), \
+                mock.patch.object(anistore, "fcntl", _FakeFcntl()), \
+                mock.patch.object(anistore.os, "open", side_effect=counting_open):
+            with anistore.locked(self._path):
+                with anistore.locked(self._path):
+                    pass
+
+        self.assertEqual(len(open_calls), 1)
 
 
 if __name__ == "__main__":

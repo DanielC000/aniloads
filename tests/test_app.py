@@ -8168,3 +8168,42 @@ class ApiBotLogEndpointTest(unittest.TestCase):
         h.do_GET()
         payload = json.loads(captured["body"].decode("utf-8"))
         self.assertNotIn("bot_log", payload)
+
+
+class RenderActivityWaitingForConfigWithoutDockerTest(unittest.TestCase):
+    """render_activity: waiting_for_config comes from run_state.json, not
+    Docker, so it must still surface when the socket isn't mounted/reachable
+    instead of being hidden behind the "Unknown" line — card 205ba5b4."""
+
+    def test_marker_with_docker_unavailable_shows_waiting(self):
+        act = {
+            "status": {"docker_available": False, "running": False},
+            "runs": [], "last_run": None,
+            "waiting_for_config": {"reason": "no download backend configured",
+                                    "since": "2026-09-17T00:00:00Z"},
+        }
+        status_html, _last, _next = app.render_activity(act)
+        self.assertIn("Waiting for configuration", status_html)
+        self.assertIn("no download backend configured", status_html)
+        self.assertIn('<a href="/?at=settings#settings">Go to Settings</a>', status_html)
+        self.assertNotIn("Unknown", status_html)
+
+    def test_no_marker_with_docker_unavailable_shows_unknown_unchanged(self):
+        act = {"status": {"docker_available": False, "running": False},
+               "runs": [], "last_run": None}
+        status_html, _last, _next = app.render_activity(act)
+        self.assertIn("Unknown", status_html)
+        self.assertIn("Docker socket unavailable", status_html)
+        self.assertNotIn("Waiting for configuration", status_html)
+
+    def test_marker_with_docker_available_unchanged(self):
+        act = {
+            "status": {"docker_available": True, "running": True},
+            "runs": [], "last_run": None,
+            "waiting_for_config": {"reason": "no download backend configured",
+                                    "since": "2026-09-17T00:00:00Z"},
+        }
+        status_html, _last, _next = app.render_activity(act)
+        self.assertEqual(
+            status_html,
+            '<span class="status-dot running"></span>Waiting for configuration')

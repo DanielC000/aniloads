@@ -3561,18 +3561,31 @@ function restoreRunKeys(el, keys) {
 def render_activity(activity, now=None):
     """Render the activity status bar values."""
     status = activity["status"]
+    waiting = activity.get("waiting_for_config")
 
-    if status.get("docker_available") is False:
+    if status.get("docker_available") is False and not isinstance(waiting, dict):
         # The container status comes only from Docker — when the socket isn't
         # reachable we genuinely don't know whether the bot is running, so a
         # red "Stopped" here would be a false signal. run_state-derived
         # Last/Next Run (below) stay authoritative regardless.
         status_text = ('<span class="status-dot unknown"></span>Unknown '
                         '<span class="hint">&mdash; Docker socket unavailable</span>')
+    elif status.get("docker_available") is False:
+        # waiting_for_config comes from run_state.json, not Docker, so it's
+        # still the most useful fact even when the socket is unreachable and
+        # container status is otherwise unknown (card 205ba5b4) — reason +
+        # Settings link presented the same way as Health's Download Backend
+        # row (check_download_backend_health).
+        reason = waiting.get("reason") or "no download backend configured"
+        href = "/?" + urlencode({"at": ANCHOR_SETTINGS}) + "#" + ANCHOR_SETTINGS
+        status_text = (
+            '<span class="status-dot unknown"></span>Waiting for configuration '
+            '<span class="hint">&mdash; {} &mdash; <a href="{}">Go to Settings</a>'
+            ' &mdash; container status unknown</span>'
+        ).format(escape(reason), escape(href))
     else:
         bot_running = status.get("running", False)
         dot_class = "running" if bot_running else "stopped"
-        waiting = activity.get("waiting_for_config")
         if isinstance(waiting, dict):
             # The container/process is up but stuck in its boot backoff loop
             # (see bot/anibot.py's write_waiting_for_config) -- a plain

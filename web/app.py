@@ -2256,31 +2256,67 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .run-detail { display: none; }
   .run-detail.run-detail-open { display: block; margin-top: var(--s1); padding-left: var(--s3); border-left: 2px solid var(--border-light); }
 
-  /* Episode management panel */
-  .ep-panel { margin-top: var(--s3); border-top: 1px solid var(--border); padding-top: var(--s2); }
-  .ep-panel summary { font-size: var(--fs-xs); color: var(--text-muted); font-weight: 500; }
-  .ep-panel summary:hover { color: var(--accent); }
-  .ep-panel[open] summary { margin-bottom: var(--s2); }
+  /* Watchlist card: title + Check now, one status line, fact badges, then
+     two quiet disclosures (Episodes, Edit) that hold every other action. */
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+  .wl-head { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--s3); }
+  .wl-title { min-width: 0; flex: 1 1 auto; }
+  .wl-url { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-faint); font-size: var(--fs-xs); text-decoration: none; }
+  a.wl-url:hover { color: var(--accent); text-decoration: underline; }
+  .wl-check { margin: 0; flex: none; }
+  .wl-status { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: var(--s2); row-gap: 2px; margin-top: var(--s3); font-size: var(--fs-sm); color: var(--text-muted); }
+  .wl-status-dot { align-self: center; flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); }
+  .wl-status-head { color: var(--text-heading); font-weight: 600; }
+  .wl-status-detail + .wl-status-detail::before, .wl-status-head + .wl-status-detail::before { content: "·"; margin-right: var(--s2); color: var(--text-faint); }
+  .wl-status--ok .wl-status-dot { background: var(--ok-text); }
+  .wl-status--ok .wl-status-head { color: var(--ok-text); }
+  .wl-status--danger .wl-status-dot { background: var(--danger-text); }
+  .wl-status--danger .wl-status-head { color: var(--danger-text); }
+  .wl-card .anime-meta { margin-top: var(--s2); }
+
+  .wl-panels { display: flex; flex-wrap: wrap; column-gap: var(--s5); margin-top: var(--s3); padding-top: var(--s1); border-top: 1px solid var(--border); }
+  .wl-panel[open] { flex-basis: 100%; }
+  .wl-panel > summary { list-style: none; display: flex; align-items: center; gap: var(--s2); min-height: 36px; font-size: var(--fs-xs); font-weight: 500; color: var(--text-muted); }
+  .wl-panel > summary::-webkit-details-marker { display: none; }
+  .wl-panel > summary::before { content: ""; flex: none; width: 6px; height: 6px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(-45deg); margin-right: 2px; transition: transform var(--tr); }
+  .wl-panel[open] > summary::before { transform: rotate(45deg); }
+  .wl-panel > summary:hover { color: var(--accent); }
+  .wl-panel[open] > summary { margin-bottom: 0; color: var(--text); }
+  .wl-panel-detail { color: var(--text-faint); font-weight: 400; }
+  .wl-panel-body { padding: var(--s1) 0 var(--s3); display: flex; flex-direction: column; gap: var(--s3); }
+
+  .ep-ok-line { font-size: var(--fs-xs); color: var(--text); }
+  .ep-label, .wl-edit-label { display: block; color: var(--text-muted); font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 2px; }
+  .ep-ranges { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .ep-retry-list { list-style: none; }
   .ep-row { display: flex; align-items: center; gap: var(--s2); padding: var(--s1) 0; border-bottom: 1px solid var(--border); }
   .ep-row:last-child { border-bottom: none; }
-  /* OK episodes collapse behind this toggle; rows are built on demand in JS */
-  .ep-ok-toggle { padding: var(--s1) 0; }
-  .ep-expand-btn { background: none; border: none; cursor: pointer; color: var(--accent); font-size: var(--fs-xs); font-family: inherit; padding: var(--s1) 0; }
-  .ep-expand-btn:hover { color: var(--accent-hover); }
-  .ep-ok-group { display: none; }
-  .ep-ok-group.ep-ok-open { display: block; }
-  .ep-num { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: var(--fs-xs); min-width: 50px; color: var(--text-muted); }
-  .ep-add-row { display: flex; gap: var(--s2); margin-top: var(--s2); padding-top: var(--s2); border-top: 1px solid var(--border); align-items: center; }
-  .ep-add-row input[type=number] { width: 90px; padding: 6px 8px; border-radius: 4px; border: 1px solid var(--border-light); background: var(--surface-2); color: var(--text); font-size: var(--fs-xs); margin: 0; min-height: 32px; }
+  .ep-row-action { margin: 0 0 0 auto; }
+  .ep-num { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: var(--fs-xs); min-width: 64px; color: var(--text); }
+  .ep-add-row { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; margin: 0; font-size: var(--fs-xs); color: var(--text-muted); }
+  .ep-add-row input[type=number] { width: 96px; padding: 6px 8px; margin: 0; min-height: 32px; font-size: var(--fs-xs); }
 
-  .folder-row { margin-top: var(--s1); font-size: var(--fs-xs); color: var(--text-muted); }
-  .folder-input { background: var(--surface-3); border: 1px solid var(--border-light); color: var(--text); padding: 5px 8px; border-radius: 4px; font-size: var(--fs-xs); width: 220px; margin: 0; }
+  .wl-edit-row { margin: 0; }
+  .wl-inline { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2); }
+  .wl-inline form { margin: 0; }
+  .wl-edit-note { font-size: var(--fs-xs); color: var(--text); }
+  .wl-card .folder-input { flex: 1 1 220px; max-width: 360px; width: auto; padding: 6px 10px; margin: 0; min-height: 32px; font-size: var(--fs-xs); }
+  .wl-remove { padding-top: var(--s3); border-top: 1px solid var(--border); }
+  .wl-remove > summary { list-style: none; width: fit-content; }
+  .wl-remove > summary::-webkit-details-marker { display: none; }
+  .btn-danger-quiet { background: transparent; color: var(--danger-text); border: 1px solid var(--danger-bg); }
+  .btn-danger-quiet:hover { background: var(--danger-bg); color: var(--danger-text); }
+  .wl-remove[open] > summary { display: none; }
+  .wl-remove-confirm { display: flex; flex-direction: column; gap: var(--s2); padding: var(--s3); border-radius: var(--radius-sm); background: var(--danger-bg); font-size: var(--fs-sm); }
+  .wl-remove-confirm strong { color: var(--text-heading); }
 
   @media (max-width: 600px) {
     .activity-grid { grid-template-columns: 1fr 1fr; gap: var(--s3); }
     .form-row { flex-wrap: wrap; }
     .form-row select { flex: 1 1 100%; }
-    .folder-input { width: 100%; }
+    /* 44px touch targets on phones */
+    .wl-card .btn, .wl-panel > summary, .wl-card .folder-input, .ep-add-row input[type=number] { min-height: 44px; }
+    .wl-card .folder-input { max-width: none; flex-basis: 100%; }
   }
   @media (prefers-reduced-motion: reduce) {
     * { transition: none !important; animation: none !important; }
@@ -2288,8 +2324,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>Anime-Loads Dashboard</h1>
+<header>
+  <h1>Anime-Loads Dashboard</h1>
+</header>
 
+<main>
 %%STATUS_MSG%%
 
 <div class="section">
@@ -2325,12 +2364,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </div>
 
 <div class="section">
-  <details open>
+  <details open id="run-history-panel">
     <summary>Run History</summary>
     <div class="card" id="run-history">
       %%RUN_HISTORY%%
     </div>
   </details>
+  <script>
+  // Phones: start Run History collapsed so the watchlist isn't a long scroll away.
+  (function() {
+    var d = document.getElementById('run-history-panel');
+    if (d && window.matchMedia && window.matchMedia('(max-width: 600px)').matches) d.open = false;
+  })();
+  </script>
 </div>
 
 <div class="section">
@@ -2419,9 +2465,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <h2>Add Anime</h2>
   <div class="card">
     <form method="POST" action="/add-url" onsubmit="return scrapeBusy(this, 'Fetching releases… this can take up to a minute');">
-      <label class="hint">Paste an anime-loads.org URL to see available releases:</label>
+      <label class="hint" for="add-url">Paste an anime-loads.org URL to see available releases:</label>
       <div class="form-row" style="margin-top:6px;">
-        <input type="url" name="url" placeholder="https://www.anime-loads.org/media/..." required>
+        <input type="url" id="add-url" name="url" placeholder="https://www.anime-loads.org/media/..." required>
         <button type="submit" class="btn btn-primary">Fetch Releases</button>
       </div>
     </form>
@@ -2443,6 +2489,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <h2>Watchlist (%%COUNT%% anime)</h2>
   %%WATCHLIST%%
 </div>
+</main>
 
 <script>
 // Scrape-backed forms (add-url, search) hit Selenium server-side and can
@@ -2487,69 +2534,6 @@ function scrapeBusy(form, label) {
   setInterval(refresh, 10000);
 })();
 
-// Build the OK-episode rows on demand the first time the toggle is opened, then
-// just show/hide them. Keeps long-series watchlist cards light on first paint.
-function expandEps(btn) {
-  var group = btn.parentNode.nextElementSibling;
-  if (!group) return;
-  if (!btn.dataset.built) {
-    var key = btn.dataset.key, eps = parseInt(btn.dataset.eps, 10) || 0;
-    var miss = {};
-    try {
-      JSON.parse(btn.dataset.missing || '[]').forEach(function(e) { miss[e] = 1; });
-    } catch (e) {}
-    // Built as real DOM nodes, not an HTML string — key is the attribute-
-    // decoded watchlist URL, and concatenating it into markup would let a
-    // URL containing HTML metacharacters inject content into the page.
-    var frag = document.createDocumentFragment();
-    for (var n = 1; n <= eps; n++) {
-      if (miss[n]) continue;
-      var row = document.createElement('div');
-      row.className = 'ep-row';
-      var numSpan = document.createElement('span');
-      numSpan.className = 'ep-num';
-      numSpan.textContent = 'Ep ' + n;
-      row.appendChild(numSpan);
-      row.appendChild(document.createTextNode(' '));
-      var okBadge = document.createElement('span');
-      okBadge.className = 'badge badge-ok';
-      okBadge.textContent = 'OK';
-      row.appendChild(okBadge);
-      row.appendChild(document.createTextNode(' '));
-      var form = document.createElement('form');
-      form.setAttribute('method', 'POST');
-      form.setAttribute('action', '/ep-add');
-      form.style.margin = '0';
-      var keyInput = document.createElement('input');
-      keyInput.type = 'hidden';
-      keyInput.name = 'key';
-      keyInput.value = key;
-      form.appendChild(keyInput);
-      var epInput = document.createElement('input');
-      epInput.type = 'hidden';
-      epInput.name = 'ep';
-      epInput.value = n;
-      form.appendChild(epInput);
-      var submitBtn = document.createElement('button');
-      submitBtn.type = 'submit';
-      submitBtn.className = 'btn btn-ghost btn-sm';
-      submitBtn.textContent = 'Retry';
-      form.appendChild(submitBtn);
-      row.appendChild(form);
-      frag.appendChild(row);
-    }
-    group.appendChild(frag);
-    btn.dataset.built = '1';
-  }
-  var open = group.classList.toggle('ep-ok-open');
-  var count = btn.dataset.count;
-  btn.textContent = (open ? 'Hide ' : 'Show ') + count + ' OK episode' + (count === '1' ? '' : 's');
-}
-
-// Show/hide a run cycle's detail panel: the low-signal events (unavailable /
-// complete) and the cycles folded into a quiet group. Everything inside the
-// panel is server-rendered and already escaped, so this only flips a class —
-// no feed data ever reaches a JS string literal.
 function setRunDetail(btn, open) {
   var panel = btn.parentNode.nextElementSibling;
   if (!panel) return;
@@ -3185,174 +3169,339 @@ def render_watchlist(anime_list, pending_list=None):
                              remove_confirm=remove_confirm)
 
     for i, a in enumerate(anime_list):
-        name = a.get("name", "Unknown")
-        url = a.get("url", "")
-        # Mutations target this entry by its unique URL (see find_entry_by_url),
-        # not by array index — the resolver shifts indices concurrently.
-        key = escape(url)
-        eps = a.get("episodes", a.get("episodes_downloaded", 0))
-        missing = a.get("missing", [])
-        remove_confirm = confirm_attr("Remove {}?".format(name))
-
-        url_html = '<div class="anime-url">{}</div>'.format(escape(url)) if url else ""
-
-        pref_audio = a.get("pref_audio_language", a.get("pref_language", ""))
-        pref_sub = a.get("pref_sub_language", "")
-        pref_res = a.get("pref_resolution", "")
-        pref_badges = ""
-        if pref_audio:
-            pref_badges += '<span class="badge badge-lang">Dub: {}</span> '.format(escape(pref_audio.title()))
-        if pref_sub:
-            pref_badges += '<span class="badge badge-sub">Sub: {}</span> '.format(escape(pref_sub.title()))
-        if pref_res:
-            pref_badges += '<span class="badge badge-res">{}p</span> '.format(escape(str(pref_res)))
-
-        missing_badge = ""
-        if missing:
-            missing_badge = ' <span class="badge badge-danger">{} retry</span>'.format(len(missing))
-
-        # Movie entries route to MOVIE_MEDIA_DIR, not AnimeName/SXX/ — a neutral
-        # badge makes that routing visible at a glance (UI-6).
-        type_badge = ""
-        if a.get("media_type") == "movie":
-            type_badge = ' <span class="badge badge-neutral">Movie</span>'
-
-        # TVDB badges — neutral tone (informational, not state that needs the eye)
-        tvdb_badges = ""
-        if a.get("tvdb_id"):
-            if a.get("tvdb_season"):
-                tvdb_badges += ' <span class="badge badge-neutral">S{:02d}</span>'.format(
-                    a["tvdb_season"])
-            else:
-                tvdb_badges += ' <span class="badge badge-neutral">TVDB</span>'
-            if a.get("episode_offset", 0) != 0:
-                tvdb_badges += ' <span class="badge badge-neutral">Offset {:+d}</span>'.format(
-                    a["episode_offset"])
-            tvdb_badges += (' <form method="POST" action="/tvdb-unlink" style="margin:0;display:inline;">'
-                            '<input type="hidden" name="key" value="{}">'
-                            '<button type="submit" class="btn btn-ghost btn-sm" '
-                            'onclick="return confirm(\'Remove TVDB link?\')">Unlink TVDB</button>'
-                            '</form>').format(key)
-        elif tvdb.available:
-            tvdb_badges += (' <form method="POST" action="/tvdb-link" style="margin:0;display:inline;">'
-                            '<input type="hidden" name="key" value="{}">'
-                            '<button type="submit" class="btn btn-ghost btn-sm">Link TVDB</button>'
-                            '</form>').format(key)
-
-        # Completion / skip badges — color reserved for meaningful state
-        status_badges = ""
-        if a.get("complete"):
-            status_badges += ' <span class="badge badge-ok">Complete</span>'
-            status_badges += (' <form method="POST" action="/mark-incomplete" style="margin:0;display:inline;">'
-                              '<input type="hidden" name="key" value="{}">'
-                              '<button type="submit" class="btn btn-ghost btn-sm">Mark incomplete</button>'
-                              '</form>').format(key)
-        elif a.get("skip_until"):
-            status_badges += ' <span class="badge badge-warn">Next: {}</span>'.format(
-                escape(str(a["skip_until"])))
-        if a.get("al_status"):
-            status_badges += ' <span class="badge badge-neutral">{}</span>'.format(
-                escape(a["al_status"]))
-
-        # Folder name (editable)
-        folder = a.get("customPackage", name)
-        folder_html = (
-            '<div class="folder-row">'
-            'Folder: <form method="POST" action="/update-folder" style="display:inline;margin:0;">'
-            '<input type="hidden" name="key" value="{key}">'
-            '<input type="text" name="folder" value="{folder}" class="folder-input">'
-            ' <button type="submit" class="btn btn-ghost btn-sm">Save folder</button>'
-            '</form></div>').format(key=key, folder=escape(folder))
-
-        # Build episode detail panel
-        eps_count = int(eps) if isinstance(eps, (int, float)) else 0
-        missing_set = set(missing)
-        retry_label = ", {} retrying".format(len(missing)) if missing else ""
-
-        # Retrying episodes are always rendered. OK episodes are collapsed
-        # behind an "expand" toggle and built on demand in JS, so a 1000+ episode
-        # series emits only its retrying rows up front instead of 1000+ DOM rows
-        # (UI-2). Nothing is lost: any OK episode can still be re-queued via the
-        # Add-to-retry box below.
-        ep_rows = ""
-        ok_count = 0
-        for ep_num in range(1, eps_count + 1):
-            if ep_num in missing_set:
-                action = ('<form method="POST" action="/ep-remove" style="margin:0;">'
-                          '<input type="hidden" name="key" value="{}"><input type="hidden" name="ep" value="{}">'
-                          '<button type="submit" class="btn btn-ghost btn-sm">Skip</button>'
-                          '</form>').format(key, ep_num)
-                ep_rows += ('<div class="ep-row"><span class="ep-num">Ep {}</span> '
-                            '<span class="badge badge-retry">Retrying</span> {}</div>').format(ep_num, action)
-            else:
-                ok_count += 1
-
-        # Show missing episodes beyond the current count (manually added)
-        for ep_num in sorted(missing):
-            if ep_num > eps_count:
-                ep_rows += ('<div class="ep-row"><span class="ep-num">Ep {}</span>'
-                            ' <span class="badge badge-retry">Retrying</span>'
-                            ' <span class="badge badge-auto">Queued</span>'
-                            ' <form method="POST" action="/ep-remove" style="margin:0;">'
-                            '<input type="hidden" name="key" value="{}"><input type="hidden" name="ep" value="{}">'
-                            '<button type="submit" class="btn btn-ghost btn-sm">Skip</button>'
-                            '</form></div>').format(ep_num, key, ep_num)
-
-        ok_toggle = ""
-        if ok_count:
-            missing_in_range = json.dumps(sorted(m for m in missing_set if 1 <= m <= eps_count))
-            ok_toggle = (
-                '<div class="ep-ok-toggle">'
-                '<button type="button" class="ep-expand-btn" data-key="{key}" '
-                'data-eps="{eps}" data-count="{n}" data-missing=\'{miss}\' '
-                'onclick="expandEps(this)">Show {n} OK episode{s}</button>'
-                '</div><div class="ep-ok-group"></div>'
-            ).format(key=key, eps=eps_count, n=ok_count, miss=missing_in_range,
-                     s="" if ok_count == 1 else "s")
-
-        ep_add_form = ('<div class="ep-add-row">'
-                       '<form method="POST" action="/ep-add" style="margin:0;display:flex;gap:8px;align-items:center;">'
-                       '<input type="hidden" name="key" value="{}">'
-                       '<input type="number" name="ep" min="1" placeholder="Ep #" required>'
-                       '<button type="submit" class="btn btn-primary btn-sm">Add to retry</button>'
-                       '</form></div>').format(key)
-
-        ep_panel = ('<details class="ep-panel"><summary>Episodes ({} total{})</summary>'
-                    '{}{}{}</details>').format(eps_count, retry_label, ep_rows, ok_toggle, ep_add_form)
-
-        html += """
-        <div class="card">
-          <div style="display:flex;justify-content:space-between;align-items:start;gap:12px;">
-            <div>
-              <div class="anime-name">{name}</div>
-              {url_html}
-              <div class="anime-meta">
-                <span class="badge badge-ep">{eps} eps</span>{type_badge}{missing_badge}
-                {pref_badges}{tvdb_badges}{status_badges}
-              </div>
-              {folder_html}
-            </div>
-            <div style="display:flex;gap:8px;">
-              <form method="POST" action="/check-now" style="margin:0;">
-                <input type="hidden" name="key" value="{key}">
-                <button type="submit" class="btn btn-ghost btn-sm">Check now</button>
-              </form>
-              <form method="POST" action="/remove" style="margin:0;">
-                <input type="hidden" name="key" value="{key}">
-                <button type="submit" class="btn btn-danger btn-sm" onclick="{remove_confirm}">Remove</button>
-              </form>
-            </div>
-          </div>
-          {ep_panel}
-        </div>""".format(
-            name=escape(name), url_html=url_html, eps=escape(str(eps)),
-            type_badge=type_badge, missing_badge=missing_badge, pref_badges=pref_badges,
-            tvdb_badges=tvdb_badges, status_badges=status_badges,
-            folder_html=folder_html, key=key, ep_panel=ep_panel,
-            remove_confirm=remove_confirm,
-        )
+        html += render_watchlist_card(i, a)
     return html
 
+
+# anime-loads.org reports a series' status in German ("Laufend"); the rest of
+# the dashboard is English, so the card shows a translated label. Unknown
+# values fall through verbatim rather than being hidden.
+_AL_STATUS_LABELS = {
+    "laufend": "Airing",
+    "abgeschlossen": "Finished",
+    "completed": "Finished",
+    "complete": "Finished",
+    "pausiert": "Paused",
+    "abgebrochen": "Cancelled",
+    "geplant": "Announced",
+    "angekündigt": "Announced",
+}
+
+# Show at most this many "downloaded" ranges before summarizing the rest, so a
+# long series with scattered retries can't grow the episode panel unbounded.
+_MAX_EP_RANGES = 12
+
+
+def translate_al_status(raw):
+    """The site's raw status cell as dashboard wording ("Laufend" -> "Airing")."""
+    raw = str(raw or "").strip()
+    if not raw:
+        return ""
+    return _AL_STATUS_LABELS.get(raw.lower(), raw)
+
+
+def _plural(n, word):
+    return "{} {}{}".format(n, word, "" if n == 1 else "s")
+
+
+def _episode_count(entry):
+    eps = entry.get("episodes", entry.get("episodes_downloaded", 0))
+    return int(eps) if isinstance(eps, (int, float)) and eps > 0 else 0
+
+
+def _parse_airdate(value):
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def format_airdate(day, today):
+    """A date as "Sat 26 Sep", with the year only when it isn't this year."""
+    label = "{} {} {}".format(day.strftime("%a"), day.day, day.strftime("%b"))
+    if day.year != today.year:
+        label += " {}".format(day.year)
+    return label
+
+
+def watchlist_status(entry, today=None):
+    """The one human status line for a watchlist card.
+
+    Returns ``(tone, headline, details)``: ``tone`` is ok / danger / neutral,
+    ``headline`` the state in a few words and ``details`` a list of short
+    supporting facts. Precedence follows what needs the reader: retries first,
+    then movie, complete, never-downloaded, a known next date, and finally the
+    site status."""
+    if today is None:
+        today = _to_local(_utc_now()).date()
+    eps = _episode_count(entry)
+    missing = entry.get("missing") or []
+    site = translate_al_status(entry.get("al_status"))
+    is_movie = entry.get("media_type") == "movie"
+
+    if missing:
+        if is_movie:
+            return "danger", "Download retrying", []
+        return ("danger", "{} retrying".format(_plural(len(missing), "episode")),
+                [_plural(eps, "episode")])
+    if is_movie:
+        year = _parse_year(entry.get("year"))
+        headline = "Movie ({})".format(year) if year else "Movie"
+        if eps:
+            return "ok", headline, ["Downloaded"]
+        return "neutral", headline, ["Waiting for download"]
+    if entry.get("complete"):
+        return "ok", "Complete", [_plural(eps, "episode")]
+    if not eps:
+        return "neutral", "Waiting for first download", (
+            ["{} on site".format(site)] if site else [])
+    if entry.get("skip_until"):
+        day = _parse_airdate(entry["skip_until"])
+        what = "next episode" if entry.get("skip_real_airdate") else "next check"
+        if day is None:
+            when = "{} {}".format(what, entry["skip_until"])
+        elif day < today:
+            when = "{} was due {}".format(what, format_airdate(day, today))
+        else:
+            when = "{} {}".format(what, format_airdate(day, today))
+        return "neutral", "Airing", [when, _plural(eps, "episode")]
+    return "neutral", site or "Watching", [_plural(eps, "episode")]
+
+
+def compact_ranges(numbers):
+    """Sorted ints as inclusive ``(start, end)`` runs: [1,2,3,5] -> [(1,3),(5,5)]."""
+    ranges = []
+    for n in sorted(set(numbers)):
+        if ranges and n == ranges[-1][1] + 1:
+            ranges[-1] = (ranges[-1][0], n)
+        else:
+            ranges.append((n, n))
+    return ranges
+
+
+def _format_range(start, end):
+    return str(start) if start == end else "{}–{}".format(start, end)
+
+
+def ep_add_max(entry):
+    """Highest episode number /ep-add accepts for this entry.
+
+    Bound to the site's known ANNOUNCED total (al_max_episodes) — NOT
+    entry["episodes"] (highest already downloaded) and NOT al_available_max
+    (the currently-published cap): adding the next, not-yet-published episode
+    number is the documented manual override for one that went up early — by
+    definition beyond al_available_max — so bounding on either of those would
+    block exactly that. animeloads.py uses 999999 as its "unknown announced
+    total" sentinel, so that value means unknown here too, falling through to
+    a generous sanity cap."""
+    al_max_episodes = entry.get("al_max_episodes")
+    if isinstance(al_max_episodes, (int, float)) and 0 < al_max_episodes < 999999:
+        return int(al_max_episodes)
+    return 5000
+
+
+def _sr(text):
+    """Visually hidden text that completes a control's accessible name."""
+    return '<span class="sr-only">{}</span>'.format(escape(text))
+
+
+def _key_input(key):
+    return '<input type="hidden" name="key" value="{}">'.format(key)
+
+
+def _watchlist_url_html(url):
+    if not url:
+        return ""
+    shown = re.sub(r"^https?://(www\.)?", "", url)
+    if urlparse(url).scheme.lower() in ("http", "https"):
+        return ('<a class="wl-url" href="{href}" target="_blank" rel="noopener noreferrer" '
+                'title="{href}">{shown}{sr}</a>').format(
+                    href=escape(url), shown=escape(shown), sr=_sr(" (opens in new tab)"))
+    return '<span class="wl-url" title="{0}">{0}</span>'.format(escape(url))
+
+
+def _render_episode_panel(i, entry, key, name):
+    eps = _episode_count(entry)
+    missing = sorted({m for m in (entry.get("missing") or []) if isinstance(m, int)})
+    missing_set = set(missing)
+    ok_nums = [n for n in range(1, eps + 1) if n not in missing_set]
+    ranges = compact_ranges(ok_nums)
+
+    summary_bits = []
+    if len(ranges) == 1:
+        summary_bits.append("{} OK".format(_format_range(*ranges[0])))
+    elif ok_nums:
+        summary_bits.append("{} OK".format(len(ok_nums)))
+    if missing:
+        summary_bits.append("{} retrying".format(len(missing)))
+    if not summary_bits:
+        summary_bits.append("none downloaded yet")
+
+    body = ""
+    if ranges:
+        shown = ", ".join(_format_range(s, e) for s, e in ranges[:_MAX_EP_RANGES])
+        if len(ranges) > _MAX_EP_RANGES:
+            shown += " and {} more ranges".format(len(ranges) - _MAX_EP_RANGES)
+        body += ('<p class="ep-ok-line"><span class="ep-label">Downloaded</span> '
+                 '<span class="ep-ranges">{}</span></p>').format(shown)
+
+    if missing:
+        rows = ""
+        for ep_num in missing:
+            queued = (' <span class="badge badge-auto" title="Not downloaded yet">Queued</span>'
+                      if ep_num > eps else "")
+            rows += (
+                '<li class="ep-row"><span class="ep-num">Ep {n}</span>'
+                '<span class="badge badge-retry">Retrying</span>{queued}'
+                '<form method="POST" action="/ep-remove" class="ep-row-action">{key}'
+                '<input type="hidden" name="ep" value="{n}">'
+                '<button type="submit" class="btn btn-ghost btn-sm">Stop retrying{sr}</button>'
+                '</form></li>').format(
+                    n=ep_num, queued=queued, key=_key_input(key),
+                    sr=_sr(" episode {} of {}".format(ep_num, name)))
+        body += '<ul class="ep-retry-list" aria-label="Episodes retrying">{}</ul>'.format(rows)
+
+    body += (
+        '<form method="POST" action="/ep-add" class="ep-add-row">{key}'
+        '<label for="ep-add-{i}">Retry episode</label>'
+        '<input type="number" id="ep-add-{i}" name="ep" min="1" max="{max}" '
+        'inputmode="numeric" placeholder="#" required>'
+        '<button type="submit" class="btn btn-ghost btn-sm">Add to retry{sr}</button>'
+        '</form>').format(key=_key_input(key), i=i, max=ep_add_max(entry),
+                          sr=_sr(" for {}".format(name)))
+
+    return ('<details class="wl-panel ep-panel"><summary>Episodes'
+            '<span class="wl-panel-detail">{}</span></summary>'
+            '<div class="wl-panel-body">{}</div></details>').format(
+                escape(" · ".join(summary_bits)), body)
+
+
+def _render_edit_panel(i, entry, key, name):
+    folder = entry.get("customPackage", entry.get("name", "Unknown"))
+    rows = (
+        '<form method="POST" action="/update-folder" class="wl-edit-row">{key}'
+        '<label class="wl-edit-label" for="folder-{i}">Download folder</label>'
+        '<div class="wl-inline">'
+        '<input type="text" id="folder-{i}" name="folder" value="{folder}" class="folder-input">'
+        '<button type="submit" class="btn btn-ghost btn-sm">Save folder{sr}</button>'
+        '</div></form>').format(key=_key_input(key), i=i, folder=escape(folder),
+                                sr=_sr(" for {}".format(name)))
+
+    if entry.get("tvdb_id"):
+        linked = []
+        if entry.get("tvdb_season"):
+            linked.append("season {}".format(entry["tvdb_season"]))
+        if entry.get("episode_offset", 0):
+            linked.append("offset {:+d}".format(entry["episode_offset"]))
+        rows += (
+            '<div class="wl-edit-row"><span class="wl-edit-label">TVDB</span>'
+            '<div class="wl-inline"><span class="wl-edit-note">Linked{detail}</span>'
+            '<form method="POST" action="/tvdb-unlink">{key}'
+            '<button type="submit" class="btn btn-ghost btn-sm" onclick="{confirm}">'
+            'Unlink TVDB{sr}</button></form></div></div>').format(
+                detail=escape(", " + ", ".join(linked)) if linked else "",
+                key=_key_input(key),
+                confirm=confirm_attr("Unlink {} from TVDB?".format(name)),
+                sr=_sr(" for {}".format(name)))
+    elif tvdb.available:
+        rows += (
+            '<div class="wl-edit-row"><span class="wl-edit-label">TVDB</span>'
+            '<div class="wl-inline"><span class="wl-edit-note">Not linked</span>'
+            '<form method="POST" action="/tvdb-link">{key}'
+            '<button type="submit" class="btn btn-ghost btn-sm">Link TVDB{sr}</button>'
+            '</form></div></div>').format(key=_key_input(key), sr=_sr(" for {}".format(name)))
+
+    if entry.get("complete"):
+        rows += (
+            '<div class="wl-edit-row"><span class="wl-edit-label">Completion</span>'
+            '<div class="wl-inline"><span class="wl-edit-note">Marked complete, so the bot skips it</span>'
+            '<form method="POST" action="/mark-incomplete">{key}'
+            '<button type="submit" class="btn btn-ghost btn-sm">Mark incomplete{sr}</button>'
+            '</form></div></div>').format(key=_key_input(key), sr=_sr(" for {}".format(name)))
+
+    # Two-step remove, in the page rather than a window.confirm(): the first
+    # click only opens a panel that names the series; Cancel closes it again.
+    rows += (
+        '<details class="wl-remove"><summary class="btn btn-sm btn-danger-quiet">'
+        'Remove from watchlist{sr}</summary>'
+        '<div class="wl-remove-confirm" role="group" aria-label="Confirm removal of {name}">'
+        '<p>Remove <strong>{name}</strong> from the watchlist? '
+        'Episodes already downloaded stay on disk.</p>'
+        '<div class="wl-inline">'
+        '<form method="POST" action="/remove">{key}'
+        '<button type="submit" class="btn btn-danger btn-sm">Remove {name}</button></form>'
+        '<button type="button" class="btn btn-ghost btn-sm" '
+        'onclick="this.closest(\'details\').open = false">Cancel</button>'
+        '</div></div></details>').format(
+            sr=_sr(" " + name), name=escape(name), key=_key_input(key))
+
+    return ('<details class="wl-panel wl-edit"><summary>Edit{sr}</summary>'
+            '<div class="wl-panel-body">{rows}</div></details>').format(
+                sr=_sr(" " + name), rows=rows)
+
+
+def render_watchlist_card(i, a):
+    name = a.get("name", "Unknown")
+    url = a.get("url", "")
+    # Mutations target this entry by its unique URL (see find_entry_by_url),
+    # not by array index — the resolver shifts indices concurrently. ``i``
+    # only makes element ids unique on the page.
+    key = escape(url)
+
+    tone, headline, details = watchlist_status(a)
+    status_html = (
+        '<p class="wl-status wl-status--{tone}">'
+        '<span class="wl-status-dot" aria-hidden="true"></span>'
+        '<span class="wl-status-head">{head}</span>{details}</p>').format(
+            tone=tone, head=escape(headline),
+            details="".join('<span class="wl-status-detail">{}</span>'.format(escape(d))
+                            for d in details))
+
+    # Badges carry facts only; every action lives in a panel below.
+    facts = []
+    site = translate_al_status(a.get("al_status"))
+    if site and site != headline and not (site == "Finished" and headline == "Complete"):
+        facts.append(("Site: {}".format(site), "Status on anime-loads.org"))
+    if a.get("tvdb_id"):
+        facts.append(("TVDB S{:02d}".format(a["tvdb_season"]) if a.get("tvdb_season") else "TVDB",
+                      "Linked to TVDB"))
+        if a.get("episode_offset", 0) != 0:
+            facts.append(("Offset {:+d}".format(a["episode_offset"]), "TVDB episode offset"))
+    pref_audio = a.get("pref_audio_language", a.get("pref_language", ""))
+    if pref_audio:
+        facts.append(("Dub: {}".format(pref_audio.title()), "Preferred audio"))
+    if a.get("pref_sub_language"):
+        facts.append(("Sub: {}".format(a["pref_sub_language"].title()), "Preferred subtitles"))
+    if a.get("pref_resolution"):
+        facts.append(("{}p".format(a["pref_resolution"]), "Preferred resolution"))
+    facts_html = ""
+    if facts:
+        facts_html = '<div class="anime-meta">{}</div>'.format(" ".join(
+            '<span class="badge badge-neutral" title="{}">{}</span>'.format(escape(t), escape(label))
+            for label, t in facts))
+
+    return """
+        <article class="card wl-card" aria-labelledby="wl-name-{i}">
+          <div class="wl-head">
+            <div class="wl-title">
+              <h3 class="anime-name" id="wl-name-{i}">{name}</h3>
+              {url_html}
+            </div>
+            <form method="POST" action="/check-now" class="wl-check">
+              {key_input}
+              <button type="submit" class="btn btn-ghost btn-sm">Check now{sr}</button>
+            </form>
+          </div>
+          {status_html}
+          {facts_html}
+          <div class="wl-panels">{ep_panel}{edit_panel}</div>
+        </article>""".format(
+        i=i, name=escape(name), url_html=_watchlist_url_html(url),
+        key_input=_key_input(key), sr=_sr(" for {}".format(name)),
+        status_html=status_html, facts_html=facts_html,
+        ep_panel=_render_episode_panel(i, a, key, name),
+        edit_panel=_render_edit_panel(i, a, key, name),
+    )
 
 _ADD_STEPS = ("Release", "TVDB", "Save")
 
@@ -4449,21 +4598,7 @@ class Handler(BaseHTTPRequestHandler):
                 if entry is None:
                     outcome["result"] = "invalid"
                     return
-                # Bound to the site's known ANNOUNCED total (al_max_episodes)
-                # — NOT entry["episodes"] (highest already downloaded) and
-                # NOT al_available_max (the currently-published cap): adding
-                # the next, not-yet-published episode number is the
-                # documented manual override for one that went up early —
-                # by definition beyond al_available_max — so bounding on
-                # either of those would block exactly that. animeloads.py
-                # uses 999999 as its "unknown announced total" sentinel, so
-                # that value means unknown here too, falling through to a
-                # generous sanity cap.
-                al_max_episodes = entry.get("al_max_episodes")
-                if isinstance(al_max_episodes, (int, float)) and 0 < al_max_episodes < 999999:
-                    ep_max = al_max_episodes
-                else:
-                    ep_max = 5000
+                ep_max = ep_add_max(entry)
                 if ep <= 0 or ep > ep_max:
                     outcome["result"] = "invalid"
                     return

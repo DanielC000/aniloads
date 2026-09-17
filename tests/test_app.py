@@ -566,22 +566,20 @@ class RenderWatchlistMovieBadgeTest(unittest.TestCase):
 
 
 class RenderWatchlistEpisodeCollapseTest(unittest.TestCase):
-    """OK episodes collapse behind a toggle; retrying rows render up front (UI-2)."""
+    """OK episodes render as compact ranges, never one row per episode; only
+    retrying episodes get their own row (UI-2)."""
 
     def test_long_series_does_not_emit_all_ok_rows(self):
         out = app.render_watchlist([{"name": "Long", "episodes": 500, "missing": [7]}])
-        # The lazy toggle reports the OK count instead of rendering 499 rows.
-        self.assertIn("Show 499 OK episodes", out)
-        self.assertIn("expandEps", out)
-        # The OK rows are NOT in the server-rendered HTML (built in JS on demand).
+        self.assertIn("1–6, 8–500", out)
         self.assertNotIn("Ep 250", out)
         # Retrying episodes are always rendered up front.
         self.assertIn("Ep 7", out)
         self.assertIn("badge-retry", out)
 
-    def test_all_ok_series_has_no_retry_rows_but_has_toggle(self):
+    def test_all_ok_series_has_no_retry_rows(self):
         out = app.render_watchlist([{"name": "Clean", "episodes": 3, "missing": []}])
-        self.assertIn("Show 3 OK episodes", out)
+        self.assertIn("1–3 OK", out)
         self.assertNotIn("badge-retry", out)
 
 
@@ -605,28 +603,6 @@ class RenderWatchlistOffsetBadgeTest(unittest.TestCase):
         out = app.render_watchlist([{
             "name": "A", "url": "http://x/a", "tvdb_id": 1, "episode_offset": 0}])
         self.assertNotIn("Offset", out)
-
-
-class ExpandEpsDomSafetyTest(unittest.TestCase):
-    """expandEps() used to build the OK-episode rows by string-concatenating
-    the attribute-decoded data-key straight into innerHTML — a watchlist URL
-    containing HTML metacharacters could inject markup into the page. It must
-    build DOM nodes (createElement/textContent/setAttribute) instead."""
-
-    def _expand_eps_source(self):
-        start = app.HTML_TEMPLATE.index("function expandEps")
-        end = app.HTML_TEMPLATE.index("function setRunDetail", start)
-        return app.HTML_TEMPLATE[start:end]
-
-    def test_does_not_assign_key_into_innerhtml(self):
-        src = self._expand_eps_source()
-        self.assertNotIn("innerHTML", src)
-
-    def test_builds_rows_via_dom_apis(self):
-        src = self._expand_eps_source()
-        self.assertIn("createElement", src)
-        self.assertIn("textContent", src)
-        self.assertIn("group.appendChild", src)
 
 
 def _iso(dt):
@@ -1545,11 +1521,12 @@ class ConfirmAttrTest(unittest.TestCase):
 
     def test_render_watchlist_apostrophe_button_is_safe(self):
         out = app.render_watchlist(
-            [{"name": "Frieren: Beyond Journey's End", "url": "http://x"}])
-        # The onclick now uses the entity-encoded confirm string …
+            [{"name": "Frieren: Beyond Journey's End", "url": "http://x", "tvdb_id": 1}])
+        # Unlink TVDB uses the entity-encoded confirm string …
         self.assertIn('onclick="return confirm(', out)
-        # … and never the old single-quoted form a `'` would break.
-        self.assertNotIn("confirm('Remove", out)
+        # … and never the old single-quoted form a `'` would break. Remove
+        # itself confirms in the page (see RenderWatchlistCardTest).
+        self.assertNotIn("confirm('", out)
 
     def test_render_watchlist_pending_apostrophe_button_is_safe(self):
         out = app.render_watchlist(
@@ -4841,6 +4818,238 @@ class AddAnimeFlowTest(unittest.TestCase):
         self.assertIn('B <span class="badge badge-accent">Pending</span>', out)
         results = out.split("<h2>Search Results</h2>", 1)[1]
         self.assertEqual(results.count("Add to watchlist"), 1)
+
+
+class WatchlistStatusLineTest(unittest.TestCase):
+    """Each watchlist card leads with one human status line (tone, headline,
+    details) instead of a row of equal-weight badges."""
+
+    TODAY = date(2026, 9, 17)
+
+    def status(self, **entry):
+        entry.setdefault("name", "X")
+        return app.watchlist_status(entry, today=self.TODAY)
+
+    def test_retrying_takes_precedence(self):
+        self.assertEqual(
+            self.status(episodes=12, missing=[3, 4], complete=True, skip_until="2026-09-26"),
+            ("danger", "2 episodes retrying", ["12 episodes"]))
+
+    def test_single_retry_is_singular(self):
+        self.assertEqual(self.status(episodes=1, missing=[1])[1], "1 episode retrying")
+
+    def test_movie_with_year(self):
+        self.assertEqual(self.status(media_type="movie", episodes=1, year=1988),
+                         ("ok", "Movie (1988)", ["Downloaded"]))
+
+    def test_movie_not_downloaded_yet(self):
+        self.assertEqual(self.status(media_type="movie", episodes=0),
+                         ("neutral", "Movie", ["Waiting for download"]))
+
+    def test_movie_retry(self):
+        self.assertEqual(self.status(media_type="movie", episodes=0, missing=[1]),
+                         ("danger", "Download retrying", []))
+
+    def test_complete(self):
+        self.assertEqual(self.status(episodes=28, complete=True),
+                         ("ok", "Complete", ["28 episodes"]))
+
+    def test_new_entry(self):
+        self.assertEqual(self.status(episodes=0),
+                         ("neutral", "Waiting for first download", []))
+        self.assertEqual(self.status(episodes=0, al_status="Laufend")[2], ["Airing on site"])
+
+    def test_airing_with_real_airdate_is_neutral(self):
+        self.assertEqual(
+            self.status(episodes=15, skip_until="2026-09-26", skip_real_airdate=True),
+            ("neutral", "Airing", ["next episode Sat 26 Sep", "15 episodes"]))
+
+    def test_throttled_date_is_a_check_not_an_episode(self):
+        self.assertEqual(self.status(episodes=15, skip_until="2026-09-26")[2][0],
+                         "next check Sat 26 Sep")
+
+    def test_other_year_and_past_dates(self):
+        self.assertEqual(self.status(episodes=1, skip_until="2027-01-02",
+                                     skip_real_airdate=True)[2][0],
+                         "next episode Sat 2 Jan 2027")
+        self.assertEqual(self.status(episodes=1, skip_until="2026-09-10",
+                                     skip_real_airdate=True)[2][0],
+                         "next episode was due Thu 10 Sep")
+
+    def test_unparseable_date_shown_verbatim(self):
+        self.assertEqual(self.status(episodes=1, skip_until="soon")[2][0], "next check soon")
+
+    def test_falls_back_to_translated_site_status(self):
+        self.assertEqual(self.status(episodes=5, al_status="Pausiert"),
+                         ("neutral", "Paused", ["5 episodes"]))
+        self.assertEqual(self.status(episodes=5)[1], "Watching")
+
+    def test_translate_al_status(self):
+        self.assertEqual(app.translate_al_status("Laufend"), "Airing")
+        self.assertEqual(app.translate_al_status("Abgeschlossen"), "Finished")
+        self.assertEqual(app.translate_al_status(""), "")
+        self.assertEqual(app.translate_al_status("Irgendwas"), "Irgendwas")
+
+
+from html.parser import HTMLParser  # noqa: E402 — only the label check below needs it
+
+
+class _ControlCollector(HTMLParser):
+    """Collects form controls, <label for> targets and element ids."""
+
+    def __init__(self):
+        super().__init__()
+        self.controls, self.label_for, self.ids = [], set(), []
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if "id" in a:
+            self.ids.append(a["id"])
+        if tag == "label" and a.get("for"):
+            self.label_for.add(a["for"])
+        if tag in ("input", "select", "textarea") and a.get("type") != "hidden":
+            self.controls.append(a)
+
+
+class RenderWatchlistCardTest(unittest.TestCase):
+    """Watchlist card redesign: status line, facts-only badges, actions in an
+    Edit disclosure, in-page remove confirm, compact episode ranges, labels."""
+
+    def render(self, **entry):
+        entry.setdefault("name", "One Piece")
+        entry.setdefault("url", "https://www.anime-loads.org/media/one-piece")
+        return app.render_watchlist([entry])
+
+    def test_name_and_url_are_escaped(self):
+        out = self.render(name='<img src=x onerror="a()"> & Co',
+                          url='https://x.org/a"><script>b()</script>')
+        self.assertNotIn("<img src=x", out)
+        self.assertNotIn("<script>", out)
+        self.assertIn("&lt;img src=x onerror=&quot;a()&quot;&gt; &amp; Co", out)
+        self.assertIn('href="https://x.org/a&quot;&gt;&lt;script&gt;', out)
+
+    def test_url_opens_in_new_tab_safely(self):
+        out = self.render()
+        self.assertIn('<a class="wl-url" href="https://www.anime-loads.org/media/one-piece" '
+                      'target="_blank" rel="noopener noreferrer"', out)
+        self.assertIn(">anime-loads.org/media/one-piece<", out)
+
+    def test_non_http_url_is_not_a_link(self):
+        out = self.render(url="javascript:alert(1)")
+        self.assertNotIn("href=", out)
+        self.assertIn('<span class="wl-url"', out)
+
+    def test_movie_copy_has_no_episode_count(self):
+        out = self.render(name="Akira", media_type="movie", episodes=1, year=1988)
+        self.assertIn(">Movie (1988)</span>", out)
+        self.assertNotIn("1 eps", out)
+        self.assertNotIn("1 episodes", out)
+
+    def test_new_entry_copy(self):
+        out = self.render(episodes=0)
+        self.assertIn("Waiting for first download", out)
+        self.assertIn("none downloaded yet", out)
+        self.assertNotIn("0 eps", out)
+
+    def test_next_date_is_not_a_warning(self):
+        out = self.render(episodes=3, skip_until="2099-01-01", skip_real_airdate=True)
+        self.assertIn("wl-status--neutral", out)
+        self.assertNotIn("badge-warn", out)
+        self.assertNotIn("Next:", out)
+
+    def test_site_status_translated_and_not_duplicated(self):
+        out = self.render(episodes=3, al_status="Laufend", missing=[2])
+        self.assertIn("Site: Airing", out)
+        self.assertNotIn("Laufend", out)
+        airing = self.render(episodes=3, al_status="Laufend")
+        self.assertNotIn("Site: Airing", airing)
+        done = self.render(episodes=3, al_status="Abgeschlossen", complete=True)
+        self.assertNotIn("Site: Finished", done)
+
+    def test_large_series_compacts_ok_episodes_into_ranges(self):
+        out = self.render(episodes=1118, missing=[1080, 1119])
+        self.assertIn("1–1079, 1081–1118", out)
+        self.assertEqual(out.count('<li class="ep-row">'), 2)
+        self.assertNotIn("Ep 500", out)
+        self.assertIn("Ep 1119", out)
+        self.assertIn(">Queued<", out)
+
+    def test_single_range_summary(self):
+        out = self.render(episodes=1116)
+        self.assertIn("1–1116 OK", out)
+        self.assertNotIn("ep-row", out)
+
+    def test_scattered_retries_cap_the_range_list(self):
+        out = self.render(episodes=100, missing=list(range(2, 100, 2)))
+        self.assertIn("and {} more ranges".format(50 - app._MAX_EP_RANGES), out)
+
+    def test_retry_by_number_uses_ep_add_bound(self):
+        out = self.render(episodes=10, al_max_episodes=24)
+        self.assertIn('action="/ep-add"', out)
+        self.assertIn('max="24"', out)
+        self.assertIn('max="5000"', self.render(episodes=10, al_max_episodes=999999))
+        self.assertIn('max="5000"', self.render(episodes=10))
+
+    def test_every_control_has_a_label_and_ids_are_unique(self):
+        out = app.render_watchlist([
+            {"name": "A", "url": "https://x/a", "episodes": 3, "missing": [2],
+             "tvdb_id": 1, "complete": True},
+            {"name": "B", "url": "https://x/b", "episodes": 0},
+        ])
+        c = _ControlCollector()
+        c.feed(out)
+        self.assertEqual(len(c.ids), len(set(c.ids)))
+        self.assertEqual(len(c.controls), 4)  # folder + retry number, per card
+        for ctl in c.controls:
+            self.assertTrue(ctl.get("id") in c.label_for or ctl.get("aria-label"), ctl)
+
+    def test_actions_carry_the_series_name(self):
+        out = self.render(episodes=3, missing=[2], tvdb_id=1, complete=True)
+        for text in ("Check now", "Save folder", "Add to retry", "Unlink TVDB",
+                     "Mark incomplete"):
+            self.assertIn(text + '<span class="sr-only"> for One Piece</span>', out)
+        self.assertIn('Stop retrying<span class="sr-only"> episode 2 of One Piece</span>', out)
+        self.assertIn('Edit<span class="sr-only"> One Piece</span>', out)
+
+    def test_actions_live_in_edit_panel_and_check_now_stays_primary(self):
+        out = self.render(episodes=3, tvdb_id=1, complete=True)
+        head, edit = out.split('<details class="wl-panel wl-edit">', 1)
+        self.assertIn('action="/check-now"', head)
+        for action in ("/update-folder", "/tvdb-unlink", "/mark-incomplete", "/remove"):
+            self.assertNotIn('action="{}"'.format(action), head)
+            self.assertIn('action="{}"'.format(action), edit)
+
+    def test_remove_confirms_in_page_naming_the_series(self):
+        out = self.render(name="Frieren: Beyond Journey's End", episodes=3)
+        edit = out.split('<details class="wl-remove">', 1)[1]
+        self.assertIn("Remove <strong>Frieren: Beyond Journey&#x27;s End</strong> from the watchlist?", edit)
+        self.assertIn(">Remove Frieren: Beyond Journey&#x27;s End</button>", edit)
+        self.assertIn(">Cancel</button>", edit)
+        self.assertNotIn("confirm(", out)
+
+    def test_offset_badge_signed(self):
+        self.assertIn("Offset +2", self.render(tvdb_id=1, episode_offset=2))
+        self.assertIn("Offset -1", self.render(tvdb_id=1, episode_offset=-1))
+
+    def test_compact_ranges(self):
+        self.assertEqual(app.compact_ranges([5, 1, 2, 3, 7, 8]), [(1, 3), (5, 5), (7, 8)])
+        self.assertEqual(app.compact_ranges([]), [])
+
+
+class DashboardLandmarksTest(unittest.TestCase):
+    def test_header_and_main_landmarks(self):
+        t = app.HTML_TEMPLATE
+        self.assertLess(t.index("<header>"), t.index("<h1>"))
+        self.assertLess(t.index("<main>"), t.index("%%WATCHLIST%%"))
+        self.assertLess(t.index("%%WATCHLIST%%"), t.index("</main>"))
+
+    def test_run_history_collapses_on_narrow_screens(self):
+        t = app.HTML_TEMPLATE
+        self.assertIn('<details open id="run-history-panel">', t)
+        self.assertIn("matchMedia('(max-width: 600px)')", t)
+
+    def test_per_episode_js_builder_is_gone(self):
+        self.assertNotIn("expandEps", app.HTML_TEMPLATE)
 
 
 if __name__ == "__main__":

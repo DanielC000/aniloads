@@ -199,6 +199,189 @@ class WriteRunStateTest(unittest.TestCase):
                          {"kind", "anime", "episodes"})
 
 
+class RecordEntryOutcomeTest(unittest.TestCase):
+    """_record_entry_outcome builds the per-entry outcome record that
+    write_run_state persists under run_state.json's "entries" key."""
+
+    def test_records_result_and_reason(self):
+        outcomes = {}
+        anibot._record_entry_outcome(outcomes, "http://x/a", "skipped", "complete")
+        self.assertEqual(outcomes["http://x/a"]["result"], "skipped")
+        self.assertEqual(outcomes["http://x/a"]["reason"], "complete")
+        self.assertIn("checked_ts", outcomes["http://x/a"])
+        self.assertNotIn("episode", outcomes["http://x/a"])
+
+    def test_episode_included_when_given(self):
+        outcomes = {}
+        anibot._record_entry_outcome(outcomes, "http://x/a", "downloaded", "episode downloaded", episode=7)
+        self.assertEqual(outcomes["http://x/a"]["episode"], 7)
+
+    def test_reason_truncated_to_200_chars(self):
+        outcomes = {}
+        anibot._record_entry_outcome(outcomes, "http://x/a", "error", "x" * 300)
+        self.assertEqual(len(outcomes["http://x/a"]["reason"]), 200)
+
+    def test_later_call_overwrites_earlier_one_same_cycle(self):
+        # Last-write-wins within a cycle — e.g. the bottom-of-loop completion
+        # detection overwriting an earlier "downloaded" outcome for the same URL.
+        outcomes = {}
+        anibot._record_entry_outcome(outcomes, "http://x/a", "downloaded", "episode downloaded", episode=3)
+        anibot._record_entry_outcome(outcomes, "http://x/a", "skipped", "complete")
+        self.assertEqual(outcomes["http://x/a"]["result"], "skipped")
+        self.assertNotIn("episode", outcomes["http://x/a"])
+
+
+class RecordCompleteOutcomeTest(unittest.TestCase):
+    """_record_complete_outcome (the bottom-of-loop auto-complete check)
+    must not erase a "downloaded" outcome already recorded this cycle — a
+    series/movie completing on the exact cycle its last episode downloads
+    should still show "downloaded", not silently become "skipped"."""
+
+    def test_falls_back_to_skipped_complete_when_nothing_recorded_yet(self):
+        outcomes = {}
+        anibot._record_complete_outcome(outcomes, "http://x/a")
+        self.assertEqual(outcomes["http://x/a"]["result"], "skipped")
+        self.assertEqual(outcomes["http://x/a"]["reason"], "complete")
+
+    def test_falls_back_when_prior_outcome_this_cycle_was_not_downloaded(self):
+        outcomes = {}
+        anibot._record_entry_outcome(outcomes, "http://x/a", "skipped", "no new episode")
+        anibot._record_complete_outcome(outcomes, "http://x/a")
+        self.assertEqual(outcomes["http://x/a"]["result"], "skipped")
+        self.assertEqual(outcomes["http://x/a"]["reason"], "complete")
+
+    def test_preserves_downloaded_result_appending_series_complete(self):
+        outcomes = {}
+        anibot._record_entry_outcome(outcomes, "http://x/a", "downloaded", "episode downloaded", episode=12)
+        anibot._record_complete_outcome(outcomes, "http://x/a")
+        self.assertEqual(outcomes["http://x/a"]["result"], "downloaded")
+        self.assertEqual(outcomes["http://x/a"]["reason"], "episode downloaded; series complete")
+        self.assertEqual(outcomes["http://x/a"]["episode"], 12)
+
+    def test_preserves_downloaded_result_appending_movie_complete(self):
+        outcomes = {}
+        anibot._record_entry_outcome(outcomes, "http://x/a", "downloaded", "episode downloaded", episode=1)
+        anibot._record_complete_outcome(outcomes, "http://x/a", movie=True)
+        self.assertEqual(outcomes["http://x/a"]["result"], "downloaded")
+        self.assertEqual(outcomes["http://x/a"]["reason"], "episode downloaded; movie complete")
+
+    def test_preserves_batch_downloaded_reason(self):
+        outcomes = {}
+        anibot._record_entry_outcome(outcomes, "http://x/a", "downloaded", "3 episode(s) batch-downloaded")
+        anibot._record_complete_outcome(outcomes, "http://x/a")
+        self.assertEqual(outcomes["http://x/a"]["result"], "downloaded")
+        self.assertEqual(outcomes["http://x/a"]["reason"], "3 episode(s) batch-downloaded; series complete")
+        self.assertNotIn("episode", outcomes["http://x/a"])
+
+
+class MergeEntryOutcomesTest(unittest.TestCase):
+    """_merge_entry_outcomes folds one cycle's outcomes onto the previously
+    persisted per-entry map: pruned to the current watchlist, carrying
+    forward unvisited entries and a survives-a-later-skip last_error."""
+
+    def test_prunes_entries_no_longer_on_watchlist(self):
+        prev = {"http://x/gone": {"checked_ts": "t", "result": "skipped", "reason": "complete"}}
+        merged = anibot._merge_entry_outcomes(prev, {}, ["http://x/a"])
+        self.assertNotIn("http://x/gone", merged)
+
+    def test_unvisited_entry_keeps_previous_record(self):
+        prev = {"http://x/a": {"checked_ts": "t1", "result": "skipped", "reason": "complete"}}
+        merged = anibot._merge_entry_outcomes(prev, {}, ["http://x/a"])
+        self.assertEqual(merged["http://x/a"], prev["http://x/a"])
+
+    def test_new_outcome_replaces_previous_record(self):
+        prev = {"http://x/a": {"checked_ts": "t1", "result": "skipped", "reason": "complete"}}
+        new = {"http://x/a": {"checked_ts": "t2", "result": "downloaded", "reason": "episode downloaded", "episode": 5}}
+        merged = anibot._merge_entry_outcomes(prev, new, ["http://x/a"])
+        self.assertEqual(merged["http://x/a"]["result"], "downloaded")
+        self.assertEqual(merged["http://x/a"]["episode"], 5)
+
+    def test_last_error_survives_a_later_non_error_outcome(self):
+        prev = {"http://x/a": {"checked_ts": "t1", "result": "error", "reason": "JDownloader unreachable",
+                                "last_error": {"reason": "JDownloader unreachable", "checked_ts": "t1"}}}
+        new = {"http://x/a": {"checked_ts": "t2", "result": "skipped", "reason": "no new episode"}}
+        merged = anibot._merge_entry_outcomes(prev, new, ["http://x/a"])
+        self.assertEqual(merged["http://x/a"]["result"], "skipped")
+        self.assertEqual(merged["http://x/a"]["last_error"]["reason"], "JDownloader unreachable")
+        self.assertEqual(merged["http://x/a"]["last_error"]["checked_ts"], "t1")
+
+    def test_new_error_becomes_the_last_error(self):
+        prev = {}
+        new = {"http://x/a": {"checked_ts": "t2", "result": "error", "reason": "JDownloader unreachable"}}
+        merged = anibot._merge_entry_outcomes(prev, new, ["http://x/a"])
+        self.assertEqual(merged["http://x/a"]["last_error"],
+                         {"reason": "JDownloader unreachable", "checked_ts": "t2"})
+
+    def test_no_prior_last_error_and_no_new_error_omits_the_key(self):
+        merged = anibot._merge_entry_outcomes(
+            {}, {"http://x/a": {"checked_ts": "t2", "result": "skipped", "reason": "complete"}},
+            ["http://x/a"])
+        self.assertNotIn("last_error", merged["http://x/a"])
+
+
+class WriteRunStateEntryOutcomesTest(unittest.TestCase):
+    """write_run_state's additive "entries" key (see ENTRY_RESULTS /
+    _merge_entry_outcomes) — the per-entry check outcome the (later) web
+    card renders. Old run_state.json files (written before this key
+    existed) must still load fine with the key simply absent."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-runstate-entries-")
+        self._orig_botfile = anibot.botfile
+        anibot.botfile = os.path.join(self.tmp, "ani.json")
+        self.path = os.path.join(self.tmp, "run_state.json")
+
+    def tearDown(self):
+        anibot.botfile = self._orig_botfile
+
+    def _read(self):
+        with open(self.path, "r") as f:
+            return json.load(f)
+
+    def test_entries_persisted_when_watchlist_urls_given(self):
+        outcomes = {"http://x/a": {"checked_ts": "t", "result": "downloaded", "reason": "episode downloaded"}}
+        anibot.write_run_state(
+            "2026-06-13T19:00:00Z", "2026-06-13T19:01:00Z", 600, {"checked": 1},
+            entry_outcomes=outcomes, watchlist_urls=["http://x/a"])
+        self.assertEqual(self._read()["entries"]["http://x/a"]["result"], "downloaded")
+
+    def test_entries_key_absent_when_watchlist_urls_omitted(self):
+        anibot.write_run_state("2026-06-13T19:00:00Z", "2026-06-13T19:01:00Z", 600, {"checked": 1})
+        self.assertNotIn("entries", self._read())
+
+    def test_prior_entries_carried_forward_when_watchlist_urls_omitted(self):
+        # A corrupt-ani.json cycle can't know the real watchlist — it must not
+        # blank out (or otherwise touch) a previously-persisted entries map.
+        anibot.write_run_state(
+            "2026-06-13T19:00:00Z", "2026-06-13T19:01:00Z", 600, {"checked": 1},
+            entry_outcomes={"http://x/a": {"checked_ts": "t", "result": "downloaded", "reason": "r"}},
+            watchlist_urls=["http://x/a"])
+        anibot.write_run_state("2026-06-13T19:10:00Z", "2026-06-13T19:11:00Z", 600, {"checked": 0})
+        self.assertEqual(self._read()["entries"]["http://x/a"]["result"], "downloaded")
+
+    def test_entries_pruned_to_current_watchlist_on_next_write(self):
+        anibot.write_run_state(
+            "2026-06-13T19:00:00Z", "2026-06-13T19:01:00Z", 600, {"checked": 1},
+            entry_outcomes={"http://x/a": {"checked_ts": "t", "result": "downloaded", "reason": "r"},
+                             "http://x/gone": {"checked_ts": "t", "result": "skipped", "reason": "complete"}},
+            watchlist_urls=["http://x/a", "http://x/gone"])
+        anibot.write_run_state(
+            "2026-06-13T19:10:00Z", "2026-06-13T19:11:00Z", 600, {"checked": 1},
+            entry_outcomes={}, watchlist_urls=["http://x/a"])
+        entries = self._read()["entries"]
+        self.assertIn("http://x/a", entries)
+        self.assertNotIn("http://x/gone", entries)
+
+    def test_old_run_state_without_entries_key_still_loads(self):
+        # Simulates a run_state.json written before this feature existed.
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"schema": 1, "last_run": {}, "runs": []}, f)
+        anibot.write_run_state("2026-06-13T19:00:00Z", "2026-06-13T19:01:00Z", 600, {"checked": 1})
+        state = self._read()
+        self.assertNotIn("entries", state)
+        self.assertEqual(state["last_run"]["counts"]["checked"], 1)
+
+
 class WriteLoginStateTest(unittest.TestCase):
     """The bot records the anime-loads.org login outcome as an additive
     top-level `login` key in run_state.json, independent of per-cycle

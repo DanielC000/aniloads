@@ -484,6 +484,102 @@ def _record_event(events, kind, anime, episodes=None, detail=None):
         event["detail"] = str(detail)[:200]
     events.append(event)
 
+# Per-entry check outcome, persisted in run_state.json's additive top-level
+# "entries" key (NOT ani.json — the watchlist store the dashboard also
+# writes; keeping this in run_state.json avoids write contention with it).
+# Answers "why didn't X download?" (UX audit finding 3, card 7bc5a4f0) without
+# scraping logs. Shape, keyed by entry URL:
+#
+#   "entries": {
+#     "<url>": {
+#       "checked_ts": "2026-09-17T02:00:00Z",   # this cycle's check, RFC3339 UTC
+#       "result": "skipped",                     # see ENTRY_RESULTS below
+#       "reason": "waiting for airdate 2026-09-20",  # human-readable, <=200 chars
+#       "episode": 12,                            # optional: the episode a
+#                                                  # downloaded/unavailable/error
+#                                                  # result concerns
+#       "last_error": {                           # optional: survives a LATER
+#         "reason": "JDownloader unreachable",    # non-error result, so "last
+#         "checked_ts": "2026-09-16T14:00:00Z"    # error" stays visible after
+#       }                                          # a subsequent clean skip
+#     }, ...
+#   }
+#
+# One entry per URL (latest outcome only, not a list) — bounded to the
+# current watchlist size since entries no longer on the watchlist are pruned
+# on every write (see _merge_entry_outcomes). Additive: a reader (the web
+# dashboard's later card) must tolerate both the key's absence (older
+# run_state.json) and any per-entry sub-key's absence (episode/last_error are
+# optional).
+ENTRY_RESULTS = ("downloaded", "skipped", "unavailable", "error", "mismatch", "paused")
+
+def _record_entry_outcome(entry_outcomes, url, result, reason, episode=None):
+    """Record one entry's outcome for this cycle into `entry_outcomes`
+    (mutated in place, keyed by watchlist entry URL — see ENTRY_RESULTS
+    above for the shape written to run_state.json).
+
+    Called once per entry per cycle, at whichever branch is the entry's
+    final outcome for the cycle (an early skip/error `continue`, or the
+    bottom of the per-entry loop body for anything that scrapes through).
+    `reason` is truncated to 200 chars; never pass a URL, credential, or JD
+    host/port (run_state.json is dashboard-visible)."""
+    outcome = {"checked_ts": _utcnow_iso(), "result": result, "reason": str(reason)[:200]}
+    if episode is not None:
+        outcome["episode"] = episode
+    entry_outcomes[url] = outcome
+
+def _record_complete_outcome(entry_outcomes, url, movie=False):
+    """Record a completion newly detected at the bottom of the per-entry
+    loop (the movie / anime-loads-status auto-complete checks).
+
+    Unlike a plain `_record_entry_outcome` call, this one must NOT blindly
+    overwrite: when the SAME entry already recorded a "downloaded" outcome
+    earlier in THIS cycle (e.g. its last episode just downloaded, which is
+    exactly what triggered the completion check to pass), overwriting it
+    with "skipped"/"complete" would erase the one fact — "it downloaded" —
+    the dashboard most needs to show for this cycle. So a "downloaded"
+    outcome is kept as "downloaded", with the completion appended onto its
+    existing reason instead; only when nothing else was recorded this cycle
+    (nothing to lose) does this fall back to "skipped"/"complete"."""
+    existing = entry_outcomes.get(url)
+    if existing and existing.get("result") == "downloaded":
+        suffix = "movie complete" if movie else "series complete"
+        _record_entry_outcome(entry_outcomes, url, "downloaded",
+                               existing["reason"] + "; " + suffix,
+                               episode=existing.get("episode"))
+    else:
+        _record_entry_outcome(entry_outcomes, url, "skipped", "complete")
+
+def _merge_entry_outcomes(prev_entries, entry_outcomes, watchlist_urls):
+    """Fold this cycle's `entry_outcomes` onto the previously-persisted
+    per-entry map, producing the map to persist this write.
+
+    - Pruned to `watchlist_urls` (the current watchlist) — an entry removed
+      from the watchlist is dropped instead of accumulating forever.
+    - A URL not visited this cycle (not in `entry_outcomes`) keeps its
+      previous record unchanged, so a partial cycle never blanks entries it
+      didn't reach.
+    - `last_error` survives a later non-error outcome: a fresh "error"
+      result sets it from this cycle's own outcome; otherwise it carries
+      forward from the previous record untouched.
+    """
+    merged = {}
+    for url in watchlist_urls:
+        prev_record = prev_entries.get(url) if isinstance(prev_entries, dict) else None
+        new_outcome = entry_outcomes.get(url) if entry_outcomes else None
+        if new_outcome is None:
+            if isinstance(prev_record, dict):
+                merged[url] = prev_record
+            continue
+        record = dict(new_outcome)
+        if new_outcome["result"] == "error":
+            record["last_error"] = {"reason": new_outcome["reason"],
+                                     "checked_ts": new_outcome["checked_ts"]}
+        elif isinstance(prev_record, dict) and isinstance(prev_record.get("last_error"), dict):
+            record["last_error"] = prev_record["last_error"]
+        merged[url] = record
+    return merged
+
 def _format_cycle_summary(events, login_error=None):
     """Build one English notification message from a cycle's `events` list,
     or return None when nothing noteworthy happened (a quiet cycle).
@@ -536,7 +632,8 @@ def _notify_cycle(targets, pushbullet, events, login_error=None):
             pass
 
 
-def write_run_state(started_ts, finished_ts, timedelay, counts, events=None, trigger=None):
+def write_run_state(started_ts, finished_ts, timedelay, counts, events=None, trigger=None,
+                     entry_outcomes=None, watchlist_urls=None):
     """Persist one per-cycle run-state record and append it to a bounded history.
 
     Best-effort: a write failure must never break the bot loop, so all errors
@@ -549,7 +646,17 @@ def write_run_state(started_ts, finished_ts, timedelay, counts, events=None, tri
     authoritative regardless of clipping. `trigger` is additive: omitted (the
     default) for a routine timer-driven cycle, or "manual" when this cycle was
     woken early by the dashboard's run-now trigger file — see
-    consume_run_now_trigger()."""
+    consume_run_now_trigger().
+
+    `entry_outcomes`/`watchlist_urls` are additive (see ENTRY_RESULTS /
+    _record_entry_outcome / _merge_entry_outcomes above for the persisted
+    "entries" shape). `watchlist_urls` is the deliberate signal for whether
+    to touch the "entries" key at all: omitted (the default, `None`) means
+    "the caller has no reliable watchlist this call" (e.g. a corrupt-ani.json
+    or pre-login cycle) — the previous "entries" map is carried forward
+    untouched. Pass an explicit list (empty or not) once the watchlist is
+    known, and the map is pruned to exactly those URLs, merging in
+    `entry_outcomes` for this cycle (see _merge_entry_outcomes)."""
     try:
         next_run_ts = ""
         if isinstance(timedelay, int) and timedelay > 0:
@@ -597,6 +704,16 @@ def write_run_state(started_ts, finished_ts, timedelay, counts, events=None, tri
         # every per-cycle rewrite instead of silently dropping it.
         if "login" in prev:
             state["login"] = prev["login"]
+        # `entries` (per-entry check outcomes) is likewise independent of the
+        # per-cycle record above — see this function's docstring for when it
+        # is touched vs. carried forward untouched.
+        if watchlist_urls is not None:
+            prev_entries = prev.get("entries")
+            if not isinstance(prev_entries, dict):
+                prev_entries = {}
+            state["entries"] = _merge_entry_outcomes(prev_entries, entry_outcomes, watchlist_urls)
+        elif "entries" in prev:
+            state["entries"] = prev["entries"]
         d = os.path.dirname(path)
         if d:
             os.makedirs(d, exist_ok=True)
@@ -1465,11 +1582,15 @@ def startbot():
         run_counts = {"entries": 0, "checked": 0, "downloaded": 0, "errors": 0,
                       "skipped": 0, "unavailable": 0, "mismatch": 0}
         events = []
+        entry_outcomes = {}
         os.makedirs(os.path.dirname(botfolder), exist_ok=True)
         data, corrupt_err = load_ani_cycle_start(botfile)
         if corrupt_err is not None:
             _log.error("ani.json ist beschaedigt, ueberspringe Zyklus: %s", corrupt_err)
             recheck = timedelay if isinstance(timedelay, int) and timedelay > 0 else 600
+            # watchlist_urls omitted: a corrupt ani.json means we don't actually
+            # know the real watchlist this cycle — carry the persisted "entries"
+            # map forward untouched rather than pruning against an empty list.
             write_run_state(run_started, _utcnow_iso(), recheck, run_counts, events, trigger=trigger)
             sleep_until_next_cycle(recheck, _run_now_path())
             continue
@@ -1486,7 +1607,10 @@ def startbot():
             # dashboard are picked up without a manual container restart.
             recheck = timedelay if isinstance(timedelay, int) and timedelay > 0 else 600
             _log.info("Keine Anime in der Liste — erneute Pruefung in " + str(recheck) + " Sekunden")
-            write_run_state(run_started, _utcnow_iso(), recheck, run_counts, events, trigger=trigger)
+            # watchlist_urls=[]: unlike the corrupt-file case above, we DO know
+            # the watchlist here (it's genuinely empty) — prune "entries" to match.
+            write_run_state(run_started, _utcnow_iso(), recheck, run_counts, events, trigger=trigger,
+                             entry_outcomes=entry_outcomes, watchlist_urls=[])
             sleep_until_next_cycle(recheck, _run_now_path())
             continue
 
@@ -1565,6 +1689,17 @@ def startbot():
                     if not save_ani(): continue
                 if decision["skip"]:
                     run_counts["skipped"] += 1
+                    # By this point Step 1 ("already complete") and Step 2
+                    # ("al_status complete", mark_complete above) are the only
+                    # ways `complete` can be set — Step 3 (skip_until) returns
+                    # before ever touching it. So `complete` alone tells them apart.
+                    if animeentry.get('complete'):
+                        reason = "complete"
+                    elif animeentry.get('skip_real_airdate') and animeentry.get('skip_until'):
+                        reason = "waiting for airdate " + animeentry['skip_until']
+                    else:
+                        reason = "skip_until (" + str(animeentry.get('skip_until') or '') + ")"
+                    _record_entry_outcome(entry_outcomes, url, "skipped", reason)
                     continue
 
                 # Step 4: TVDB-based checks (lightweight HTTP, no Selenium)
@@ -1601,6 +1736,12 @@ def startbot():
                             getattr(_log, level)("[" + tag + "] " + name + " — " + message)
                         if decision["terminal"]:
                             run_counts["skipped"] += 1
+                            # decision["log"][1] is already a human reason for
+                            # every terminal case tvdb_skip_decision can return
+                            # (complete / waiting-for-airdate / TVDB past-due
+                            # recheck throttle / no-airdate-known synthetic skip).
+                            reason = decision["log"][1] if decision["log"] else "TVDB skip"
+                            _record_entry_outcome(entry_outcomes, url, "skipped", reason)
                             continue
                     except Exception as e:
                         _log.warning("[TVDB] Error checking " + name + ": " + str(e))
@@ -1614,6 +1755,7 @@ def startbot():
                     run_counts["checked"] += 1
                     run_counts["errors"] += 1
                     _record_event(events, "error", name, detail="Failed to fetch anime data")
+                    _record_entry_outcome(entry_outcomes, url, "error", "Failed to fetch anime data")
                     continue
 
                 now = datetime.now()
@@ -1689,6 +1831,7 @@ def startbot():
                         log("[ERROR] " + name + ": Login erforderlich für Batch-CNL (" + str(len(all_wanted)) + " Episoden) — überspringe", pb)
                         _record_event(events, "error", name, episodes=all_wanted,
                                       detail="Login required for batch download")
+                        _record_entry_outcome(entry_outcomes, url, "error", "Login required for batch download")
                     else:
                         try:
                             log("[BATCH] Versuche Batch-Download für " + str(len(all_wanted)) + " Episoden von " + name, pb)
@@ -1705,6 +1848,8 @@ def startbot():
                                 run_counts["downloaded"] += len(batch_sent)
                                 log("[BATCH] " + str(len(batch_sent)) + " Episoden von " + name + " zu JDownloader hinzugefügt", pb)
                                 _record_event(events, "download", name, episodes=sorted(batch_sent))
+                                _record_entry_outcome(entry_outcomes, url, "downloaded",
+                                                       str(len(batch_sent)) + " episode(s) batch-downloaded")
                                 # Record actual available max from CNL data (authoritative; DOM may over-report)
                                 batch_max = batch_result.get("available_max")
                                 if batch_max is not None:
@@ -1733,6 +1878,23 @@ def startbot():
                                 # Decide error-vs-benign and refresh the cap in one place
                                 # (see handle_failed_batch). save_ani() stays here so the
                                 # helper remains pure/testable.
+                                # Mirrors handle_failed_batch's own classification (kept in
+                                # sync with it — see that function's docstring) so the
+                                # persisted entry outcome matches the [MISMATCH]/
+                                # [UNAVAILABLE]/[ERROR] tag it actually logged.
+                                _batch_max = batch_result.get("available_max")
+                                _all_phantom = (_batch_max is not None and
+                                                all(_e > _batch_max for _e in all_wanted))
+                                if batch_result.get("reason_code") == "episode_numbering_mismatch":
+                                    _record_entry_outcome(entry_outcomes, url, "mismatch",
+                                                           batch_result.get("reason", "episode numbering mismatch"))
+                                elif _all_phantom:
+                                    _record_entry_outcome(entry_outcomes, url, "unavailable",
+                                                           "No download links available (max episode "
+                                                           + str(_batch_max) + ")")
+                                else:
+                                    _record_entry_outcome(entry_outcomes, url, "error",
+                                                           batch_result.get("reason", "batch download failed"))
                                 if handle_failed_batch(batch_result, all_wanted, animeentry,
                                                        run_counts, today_iso, name, pb,
                                                        events=events):
@@ -1743,6 +1905,8 @@ def startbot():
                             log("[ERROR] Batch-CNL fehlgeschlagen für " + name + ": " + str(e) + " — überspringe", pb)
                             _record_event(events, "error", name, episodes=all_wanted,
                                           detail="Batch-CNL failed: " + type(e).__name__)
+                            _record_entry_outcome(entry_outcomes, url, "error",
+                                                   "Batch-CNL failed: " + type(e).__name__)
 
                 elif len(all_wanted) == 1:
                     # Single episode: use per-episode download
@@ -1775,12 +1939,15 @@ def startbot():
                         if release_pattern:
                             animeentry['download_folder_pattern'] = release_pattern
                         _record_event(events, "download", name, episodes=[ep])
+                        _record_entry_outcome(entry_outcomes, url, "downloaded", "episode downloaded", episode=ep)
                         if not save_ani(): continue
                     elif ep_unavailable:
                         log("[UNAVAILABLE] Episode " + str(ep) + " von " + name + " — keine Downloadlinks, markiere als nicht verfügbar", pb)
                         run_counts["unavailable"] += 1
                         _record_event(events, "unavailable", name, episodes=[ep],
                                       detail="No download links available")
+                        _record_entry_outcome(entry_outcomes, url, "unavailable",
+                                               "No download links available", episode=ep)
                         # Cap al_available_max so we stop asking for this (or higher) ep
                         prev_max = animeentry.get('al_available_max')
                         new_max = ep - 1
@@ -1799,14 +1966,18 @@ def startbot():
                         log("[ERROR] Episode " + str(ep) + " von " + name + ": " + str(dl_ret), pb)
                         _record_event(events, "error", name, episodes=[ep],
                                       detail="Download failed: " + type(dl_ret).__name__)
+                        _record_entry_outcome(entry_outcomes, url, "error",
+                                               "Download failed: " + type(dl_ret).__name__, episode=ep)
                     else:
                         run_counts["errors"] += 1
                         log("[ERROR] Episode " + str(ep) + " von " + name + ": JDownloader nicht erreichbar?", pb)
                         _record_event(events, "error", name, episodes=[ep], detail="JDownloader unreachable")
+                        _record_entry_outcome(entry_outcomes, url, "error", "JDownloader unreachable", episode=ep)
                         # Transient failure: don't mutate state — next run will retry naturally
 
                 else:
                     _log.info("[INFO] " + name + " hat keine neuen Folgen verfügbar")
+                    _record_entry_outcome(entry_outcomes, url, "skipped", "no new episode")
 
                 # Auto-detect completion from anime-loads.org status
                 updated_missing = animeentry.get('missing', [])
@@ -1817,6 +1988,7 @@ def startbot():
                         _log.info("[COMPLETE] " + name + " — movie release downloaded")
                         animeentry['complete'] = True
                         _record_event(events, "complete", name)
+                        _record_complete_outcome(entry_outcomes, url, movie=True)
                         save_ani()
                 elif anime.status in ("Abgeschlossen", "Completed") \
                         and anime.maxEpisodes != 999999 \
@@ -1825,8 +1997,11 @@ def startbot():
                     _log.info("[COMPLETE] " + name + " — anime-loads status: " + anime.status)
                     animeentry['complete'] = True
                     _record_event(events, "complete", name)
+                    _record_complete_outcome(entry_outcomes, url)
                     save_ani()
-            write_run_state(run_started, _utcnow_iso(), timedelay, run_counts, events, trigger=trigger)
+            write_run_state(run_started, _utcnow_iso(), timedelay, run_counts, events, trigger=trigger,
+                             entry_outcomes=entry_outcomes,
+                             watchlist_urls=[e['url'] for e in anidata])
             _notify_cycle(notify_targets, pb, events)
             _log.info("Schlafe " + str(timedelay) + " Sekunden")
             sleep_until_next_cycle(timedelay, _run_now_path())

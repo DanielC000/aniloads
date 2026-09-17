@@ -288,6 +288,7 @@ _restore_move_state()
 from tvdb import TVDBClient, TVDB_API_KEY  # noqa: E402 — path set above
 import anistore  # noqa: E402 — path set above
 import notify  # noqa: E402 — path set above
+import config_defaults  # noqa: E402 — path set above
 
 NOTIFY_TARGETS = notify.parse_targets(os.environ.get("NOTIFY_URL", ""))
 
@@ -738,9 +739,16 @@ def load_ani():
     from a POST handler would then persist that empty default over the real
     watchlist. Corrupt files propagate as anistore.CorruptStoreError; callers
     (do_GET/do_POST below) catch it centrally and show an error banner
-    instead of rendering/saving over a wiped-looking watchlist."""
+    instead of rendering/saving over a wiped-looking watchlist.
+
+    Seeds a fresh, fully-defaulted ani.json the first time anyone (dashboard
+    or bot) looks for it and finds none — never overwrites a real, existing
+    file (see anistore.seed_if_missing). Without this, "no ani.json yet"
+    used to mean the dashboard handed back {"settings": {}, ...}, a config
+    the bot could never boot with."""
+    anistore.seed_if_missing(ANI_JSON, config_defaults.default_ani_data)
     with anistore.locked(ANI_JSON):
-        return anistore.load(ANI_JSON, default={"settings": {}, "anime": []})
+        return anistore.load(ANI_JSON, default=config_defaults.default_ani_data())
 
 
 def save_ani(data):
@@ -756,8 +764,13 @@ def update_ani(fn):
     can land and then be silently overwritten by the handler's now-stale
     in-memory copy. fn(data) must be pure local mutation (in place, or by
     returning a replacement dict) — no network/scrape calls inside it, since
-    it runs while the lock is held; do any scraping before calling this."""
-    return anistore.update(ANI_JSON, fn, default={"settings": {}, "anime": []})
+    it runs while the lock is held; do any scraping before calling this.
+
+    Seeds a fresh, fully-defaulted ani.json first if none exists yet (see
+    load_ani's docstring) — a POST arriving before any GET has must not
+    persist a bare {"settings": {}, ...} skeleton."""
+    anistore.seed_if_missing(ANI_JSON, config_defaults.default_ani_data)
+    return anistore.update(ANI_JSON, fn, default=config_defaults.default_ani_data())
 
 
 # ---------------------------------------------------------------------------
@@ -2155,7 +2168,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .btn-ghost { background: var(--surface-2); color: var(--text-muted); border: 1px solid var(--border); }
   .btn-ghost:hover { background: var(--border); color: var(--text); }
 
-  input[type=text], input[type=url], input[type=number], select { width: 100%; padding: 10px 14px; border-radius: var(--radius-sm); border: 1px solid var(--border-light); background: var(--surface-2); color: var(--text); font-size: var(--fs-sm); margin-bottom: var(--s3); transition: border-color var(--tr); }
+  input[type=text], input[type=url], input[type=number], input[type=password], select { width: 100%; padding: 10px 14px; border-radius: var(--radius-sm); border: 1px solid var(--border-light); background: var(--surface-2); color: var(--text); font-size: var(--fs-sm); margin-bottom: var(--s3); transition: border-color var(--tr); }
+  input[disabled] { opacity: 0.6; cursor: not-allowed; }
   select { appearance: none; -webkit-appearance: none; }
   input:focus, select:focus { outline: none; border-color: var(--accent); }
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -2457,6 +2471,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <span class="badge badge-res">&ge; %%PREF_RES%%p</span>
         %%AUTO_BADGE%%
       </div>
+    </div>
+  </details>
+</div>
+
+<div class="section">
+  <details>
+    <summary>Settings</summary>
+    <div class="card">
+      %%SETTINGS_CARD%%
     </div>
   </details>
 </div>
@@ -3866,6 +3889,171 @@ def render_tvdb_step(anime_name, url, release_id, custom_folder,
     return html
 
 
+def render_settings_card(settings, auth_enabled):
+    """Render the collapsed Settings card's inner HTML.
+
+    Non-secret fields (hoster, timedelay, jdhost, myjd_user, myjd_device) are
+    editable and pre-filled. Secrets (myjd_pw, pushbullet_apikey) NEVER echo
+    their value — only a "set"/"not set" badge — and their replace/clear
+    inputs are rendered `disabled` (and hinted) unless `auth_enabled`, since
+    the dashboard has no way to protect them from a drive-by POST otherwise.
+    """
+    settings = settings if isinstance(settings, dict) else {}
+    filled, _ = config_defaults.fill_settings_defaults(settings)
+
+    try:
+        hoster_val = int(filled.get("hoster"))
+    except (TypeError, ValueError):
+        hoster_val = config_defaults.DEFAULT_SETTINGS["hoster"]
+    hoster_options = "".join(
+        '<option value="{}" {}>{}</option>'.format(
+            val, "selected" if val == hoster_val else "", escape(label))
+        for val, label in config_defaults.HOSTER_CHOICES
+    )
+
+    try:
+        timedelay = int(filled.get("timedelay"))
+        if timedelay <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        timedelay = config_defaults.DEFAULT_SETTINGS["timedelay"]
+    timedelay_minutes = max(1, round(timedelay / 60))
+
+    jdhost = escape(str(filled.get("jdhost") or ""))
+    myjd_user = escape(str(filled.get("myjd_user") or ""))
+    myjd_device = escape(str(filled.get("myjd_device") or ""))
+
+    myjd_pw_set = bool(filled.get("myjd_pw"))
+    pushbullet_set = bool(filled.get("pushbullet_apikey"))
+
+    if auth_enabled:
+        secret_disabled = ""
+        secret_hint = ""
+    else:
+        secret_disabled = "disabled"
+        secret_hint = ('<p class="hint">Enable dashboard login (DASHBOARD_USER + DASHBOARD_PASS) '
+                        'to edit secrets here.</p>')
+
+    def secret_badge(is_set):
+        return ('<span class="badge badge-ok">set</span>' if is_set
+                else '<span class="badge badge-neutral">not set</span>')
+
+    return """
+      <form method="POST" action="/save-settings">
+        <div class="form-grid">
+          <div class="form-group">
+            <label for="settings-hoster">Hoster</label>
+            <select name="hoster" id="settings-hoster">{hoster_options}</select>
+          </div>
+          <div class="form-group">
+            <label for="settings-timedelay">Poll interval (minutes)</label>
+            <input type="number" name="timedelay_minutes" id="settings-timedelay" min="1" max="1440" value="{timedelay_minutes}">
+          </div>
+          <div class="form-group">
+            <label for="settings-jdhost">JDownloader host</label>
+            <input type="text" name="jdhost" id="settings-jdhost" value="{jdhost}" placeholder="e.g. jdownloader or 127.0.0.1">
+          </div>
+          <div class="form-group">
+            <label for="settings-myjd-user">MyJDownloader user</label>
+            <input type="text" name="myjd_user" id="settings-myjd-user" value="{myjd_user}">
+          </div>
+          <div class="form-group">
+            <label for="settings-myjd-device">MyJDownloader device</label>
+            <input type="text" name="myjd_device" id="settings-myjd-device" value="{myjd_device}">
+          </div>
+        </div>
+        <div class="form-grid">
+          <div class="form-group">
+            <label for="settings-myjd-pw">MyJDownloader password {myjd_pw_badge}</label>
+            <input type="password" name="myjd_pw_new" id="settings-myjd-pw" placeholder="Replace…" autocomplete="new-password" {secret_disabled}>
+            <div class="toggle">
+              <input type="checkbox" name="myjd_pw_clear" id="myjd_pw_clear" {secret_disabled}>
+              <label for="myjd_pw_clear" style="font-size:0.85rem;">Clear</label>
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="settings-pushbullet-apikey">Pushbullet API key {pushbullet_badge}</label>
+            <input type="password" name="pushbullet_apikey_new" id="settings-pushbullet-apikey" placeholder="Replace…" autocomplete="new-password" {secret_disabled}>
+            <div class="toggle">
+              <input type="checkbox" name="pushbullet_apikey_clear" id="pushbullet_apikey_clear" {secret_disabled}>
+              <label for="pushbullet_apikey_clear" style="font-size:0.85rem;">Clear</label>
+            </div>
+          </div>
+        </div>
+        {secret_hint}
+        <div style="margin-top:14px;">
+          <button type="submit" class="btn btn-success">Save Settings</button>
+        </div>
+      </form>""".format(
+        hoster_options=hoster_options,
+        timedelay_minutes=timedelay_minutes,
+        jdhost=jdhost,
+        myjd_user=myjd_user,
+        myjd_device=myjd_device,
+        myjd_pw_badge=secret_badge(myjd_pw_set),
+        pushbullet_badge=secret_badge(pushbullet_set),
+        secret_disabled=secret_disabled,
+        secret_hint=secret_hint,
+    )
+
+
+def validate_settings_form(params, auth_enabled):
+    """Validate a raw /save-settings POST body.
+
+    Returns (updates, errors): ``updates`` is a {settings-key: value} dict
+    ready to merge into ani.json's "settings" block; ``errors`` is a list of
+    user-facing validation messages (empty means the form was valid).
+    Secret fields are only ever added to ``updates`` when ``auth_enabled`` —
+    a POST that tries to set/clear one while auth is off is rejected
+    outright rather than silently ignored, so a disabled-input bypass
+    attempt surfaces as an error instead of a no-op that looks like success.
+    Never puts a secret's VALUE into ``errors`` or anywhere else that gets
+    logged or rendered back.
+    """
+    errors = []
+    updates = {}
+
+    try:
+        hoster_val = int(params.get("hoster", ""))
+    except ValueError:
+        hoster_val = None
+    if hoster_val not in {val for val, _ in config_defaults.HOSTER_CHOICES}:
+        errors.append("Invalid hoster selection")
+    else:
+        updates["hoster"] = hoster_val
+
+    try:
+        minutes = int(params.get("timedelay_minutes", ""))
+    except ValueError:
+        minutes = None
+    if minutes is None or not (1 <= minutes <= 1440):
+        errors.append("Poll interval must be a whole number of minutes between 1 and 1440")
+    else:
+        updates["timedelay"] = minutes * 60
+
+    updates["jdhost"] = params.get("jdhost", "").strip()
+    updates["myjd_user"] = params.get("myjd_user", "").strip()
+    updates["myjd_device"] = params.get("myjd_device", "").strip()
+
+    wants_secret_change = (
+        bool(params.get("myjd_pw_new")) or "myjd_pw_clear" in params
+        or bool(params.get("pushbullet_apikey_new")) or "pushbullet_apikey_clear" in params
+    )
+    if wants_secret_change and not auth_enabled:
+        errors.append("Enable dashboard login (DASHBOARD_USER + DASHBOARD_PASS) to edit secrets")
+    elif auth_enabled:
+        if "myjd_pw_clear" in params:
+            updates["myjd_pw"] = ""
+        elif params.get("myjd_pw_new"):
+            updates["myjd_pw"] = params["myjd_pw_new"]
+        if "pushbullet_apikey_clear" in params:
+            updates["pushbullet_apikey"] = ""
+        elif params.get("pushbullet_apikey_new"):
+            updates["pushbullet_apikey"] = params["pushbullet_apikey_new"]
+
+    return updates, errors
+
+
 def render_page(status="", search_html="", prefs_open=False, ani_data=None, search_query=""):
     data = ani_data if ani_data is not None else load_ani()
     anime_list = data.get("anime", [])
@@ -3904,6 +4092,7 @@ def render_page(status="", search_html="", prefs_open=False, ani_data=None, sear
     page = page.replace("%%MOVE_STUCK%%", move_stuck_html)
     page = page.replace("%%SEARCH_RESULTS%%", search_html)
     page = page.replace("%%WATCHLIST%%", render_watchlist(anime_list, pending_list))
+    page = page.replace("%%SETTINGS_CARD%%", render_settings_card(data.get("settings"), AUTH_ENABLED))
     page = page.replace("%%COUNT%%", str(total))
     page = page.replace("%%PREFS_OPEN%%", "open" if prefs_open else "")
     page = page.replace("%%AUDIO_GER%%", 'selected' if audio_pref == "german" else "")
@@ -4369,6 +4558,23 @@ class Handler(BaseHTTPRequestHandler):
             }
             save_prefs(prefs)
             self._redirect_msg("Preferences saved")
+
+        elif parsed.path == "/save-settings":
+            updates, errors = validate_settings_form(params, AUTH_ENABLED)
+            if errors:
+                self._redirect_msg("Error: {}".format("; ".join(errors)), level="err")
+                return
+
+            def _apply(data):
+                settings = data.get("settings")
+                filled, _ = config_defaults.fill_settings_defaults(
+                    settings if isinstance(settings, dict) else {})
+                filled.update(updates)
+                data["settings"] = filled
+                return data
+
+            update_ani(_apply)
+            self._redirect_msg("Saved — restart the bot container to apply")
 
         elif parsed.path == "/add-url":
             url = params.get("url", "").strip()

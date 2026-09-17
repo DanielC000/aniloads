@@ -82,7 +82,7 @@ The ExternInterface settings are required for the anime-loads bot container to r
 
 ### 4. Anime-Loads Bot Config
 
-The bot config lives at `/config/ani.json` inside the container — i.e. the `ani.json` in the host directory you set as `ANIME_CONFIG_DIR`.
+The bot config lives at `/config/ani.json` inside the container — i.e. the `ani.json` in the host directory you set as `ANIME_CONFIG_DIR`. The bot (or the dashboard, whichever starts first) seeds this file automatically with the defaults below the first time it finds none — it never overwrites an existing file. Non-secret fields can also be edited from the dashboard's Settings card (see below) instead of hand-editing the file. The one thing that must still be set explicitly (either here or from the dashboard) before the bot can download anything is a backend: `jdhost` (a local JDownloader) or `myjd_user` (MyJDownloader).
 
 Settings in `ani.json > settings`:
 
@@ -105,6 +105,7 @@ Open http://SERVER_IP:8085. Features:
 - **Watchlist** — add/remove anime, see episode counts, retry status, TVDB season mapping, and completion status
 - **Check Now** (per watchlist card) — force one entry's next triggered cycle to bypass its skip logic
 - **Preferences** — default language, resolution, auto-select
+- **Settings** — edit non-secret bot config (hoster, poll interval, JDownloader/MyJDownloader host+user+device) without hand-editing `ani.json`; a first-ever run seeds it with sane defaults automatically. Secrets (`myjd_pw`, Pushbullet API key) only ever show "set"/"not set" and can be replaced/cleared from here once dashboard login (below) is enabled — a saved change takes effect on the bot's *next restart*, not live
 - **Add Anime** — paste an anime-loads.org URL or search by name, with TVDB season correlation
 - **TVDB Linking** — link/unlink existing watchlist entries to TVDB series and seasons
 - **Smart Skip Badges** — shows "Complete" (green), "Next: date" (orange), and anime-loads status per entry. "Mark Incomplete" button to force re-checking.

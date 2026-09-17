@@ -2035,6 +2035,306 @@ class AniJsonCorruptTest(unittest.TestCase):
         self.assertIn("Unknown", payload["health"])
 
 
+class LoadAniSeedsMissingConfigTest(unittest.TestCase):
+    """load_ani()/update_ani() must seed a brand-new ani.json with full
+    default settings the first time they find none — never a bare
+    {"settings": {}} the bot could never boot with — and must never
+    overwrite a real, existing file."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="aniloads-seed-")
+        self._path = os.path.join(self.tmp_dir, "ani.json")
+        self._orig_ani = app.ANI_JSON
+        app.ANI_JSON = self._path
+
+    def tearDown(self):
+        app.ANI_JSON = self._orig_ani
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_load_ani_seeds_full_defaults_when_file_missing(self):
+        self.assertFalse(os.path.exists(self._path))
+
+        data = app.load_ani()
+
+        self.assertTrue(os.path.exists(self._path))
+        self.assertEqual(data["settings"], app.config_defaults.DEFAULT_SETTINGS)
+        with open(self._path, "r", encoding="utf-8") as f:
+            on_disk = json.load(f)
+        self.assertEqual(on_disk["settings"], app.config_defaults.DEFAULT_SETTINGS)
+
+    def test_load_ani_never_overwrites_existing_file(self):
+        fixture = {"settings": {"jdhost": "custom-host"}, "anime": [{"name": "A", "url": "http://x/a"}]}
+        with open(self._path, "w", encoding="utf-8") as f:
+            json.dump(fixture, f)
+
+        data = app.load_ani()
+
+        self.assertEqual(data["settings"], {"jdhost": "custom-host"})
+        self.assertEqual(len(data["anime"]), 1)
+
+    def test_update_ani_seeds_before_a_post_arrives_first(self):
+        self.assertFalse(os.path.exists(self._path))
+
+        app.update_ani(lambda data: data)
+
+        self.assertTrue(os.path.exists(self._path))
+        with open(self._path, "r", encoding="utf-8") as f:
+            on_disk = json.load(f)
+        self.assertEqual(on_disk["settings"], app.config_defaults.DEFAULT_SETTINGS)
+
+
+class ValidateSettingsFormTest(unittest.TestCase):
+    """Pure validation for the /save-settings POST body."""
+
+    def test_valid_non_secret_fields_are_accepted(self):
+        params = {
+            "hoster": "1", "timedelay_minutes": "10",
+            "jdhost": "jdownloader", "myjd_user": "me", "myjd_device": "laptop",
+        }
+        updates, errors = app.validate_settings_form(params, auth_enabled=False)
+        self.assertEqual(errors, [])
+        self.assertEqual(updates["hoster"], 1)
+        self.assertEqual(updates["timedelay"], 600)
+        self.assertEqual(updates["jdhost"], "jdownloader")
+        self.assertEqual(updates["myjd_user"], "me")
+        self.assertEqual(updates["myjd_device"], "laptop")
+
+    def test_invalid_hoster_rejected(self):
+        params = {"hoster": "99", "timedelay_minutes": "10"}
+        updates, errors = app.validate_settings_form(params, auth_enabled=False)
+        self.assertIn("hoster", " ".join(errors).lower())
+        self.assertNotIn("hoster", updates)
+
+    def test_non_numeric_hoster_rejected(self):
+        updates, errors = app.validate_settings_form(
+            {"hoster": "not-a-number", "timedelay_minutes": "10"}, auth_enabled=False)
+        self.assertTrue(errors)
+        self.assertNotIn("hoster", updates)
+
+    def test_timedelay_out_of_range_rejected(self):
+        for minutes in ("0", "-5", "1441", "not-a-number", ""):
+            with self.subTest(minutes=minutes):
+                params = {"hoster": "1", "timedelay_minutes": minutes}
+                updates, errors = app.validate_settings_form(params, auth_enabled=False)
+                self.assertTrue(errors)
+                self.assertNotIn("timedelay", updates)
+
+    def test_timedelay_boundaries_accepted(self):
+        for minutes in ("1", "1440"):
+            with self.subTest(minutes=minutes):
+                params = {"hoster": "1", "timedelay_minutes": minutes}
+                updates, errors = app.validate_settings_form(params, auth_enabled=False)
+                self.assertEqual(errors, [])
+                self.assertEqual(updates["timedelay"], int(minutes) * 60)
+
+    def test_secret_replace_rejected_when_auth_disabled(self):
+        params = {"hoster": "1", "timedelay_minutes": "10", "myjd_pw_new": "hunter2"}
+        updates, errors = app.validate_settings_form(params, auth_enabled=False)
+        self.assertTrue(errors)
+        self.assertNotIn("myjd_pw", updates)
+        self.assertNotIn("hunter2", " ".join(errors))
+
+    def test_secret_clear_rejected_when_auth_disabled(self):
+        params = {"hoster": "1", "timedelay_minutes": "10", "pushbullet_apikey_clear": "on"}
+        updates, errors = app.validate_settings_form(params, auth_enabled=False)
+        self.assertTrue(errors)
+        self.assertNotIn("pushbullet_apikey", updates)
+
+    def test_secret_replace_accepted_when_auth_enabled(self):
+        params = {"hoster": "1", "timedelay_minutes": "10", "myjd_pw_new": "hunter2"}
+        updates, errors = app.validate_settings_form(params, auth_enabled=True)
+        self.assertEqual(errors, [])
+        self.assertEqual(updates["myjd_pw"], "hunter2")
+
+    def test_secret_clear_accepted_when_auth_enabled(self):
+        params = {"hoster": "1", "timedelay_minutes": "10", "myjd_pw_clear": "on"}
+        updates, errors = app.validate_settings_form(params, auth_enabled=True)
+        self.assertEqual(errors, [])
+        self.assertEqual(updates["myjd_pw"], "")
+
+    def test_clear_wins_over_replace_when_both_present(self):
+        params = {
+            "hoster": "1", "timedelay_minutes": "10",
+            "myjd_pw_new": "hunter2", "myjd_pw_clear": "on",
+        }
+        updates, errors = app.validate_settings_form(params, auth_enabled=True)
+        self.assertEqual(errors, [])
+        self.assertEqual(updates["myjd_pw"], "")
+
+    def test_blank_replace_leaves_secret_untouched(self):
+        params = {"hoster": "1", "timedelay_minutes": "10", "myjd_pw_new": ""}
+        updates, errors = app.validate_settings_form(params, auth_enabled=True)
+        self.assertEqual(errors, [])
+        self.assertNotIn("myjd_pw", updates)
+
+    def test_no_secret_fields_is_valid_regardless_of_auth(self):
+        params = {"hoster": "1", "timedelay_minutes": "10"}
+        for auth in (True, False):
+            with self.subTest(auth_enabled=auth):
+                updates, errors = app.validate_settings_form(params, auth_enabled=auth)
+                self.assertEqual(errors, [])
+                self.assertNotIn("myjd_pw", updates)
+                self.assertNotIn("pushbullet_apikey", updates)
+
+
+class RenderSettingsCardSecretsTest(unittest.TestCase):
+    """The Settings card must never echo a secret VALUE — only a set/not-set
+    badge — and must gate the replace/clear inputs on auth being enabled."""
+
+    def test_secret_value_never_rendered(self):
+        settings = {"myjd_pw": "super-secret-pw", "pushbullet_apikey": "pb-secret-key"}
+        html_out = app.render_settings_card(settings, auth_enabled=True)
+        self.assertNotIn("super-secret-pw", html_out)
+        self.assertNotIn("pb-secret-key", html_out)
+
+    def test_set_and_not_set_badges(self):
+        html_out = app.render_settings_card(
+            {"myjd_pw": "x", "pushbullet_apikey": ""}, auth_enabled=True)
+        self.assertIn("set", html_out)
+        self.assertIn("not set", html_out)
+
+    def test_secret_inputs_disabled_when_auth_off(self):
+        html_out = app.render_settings_card({}, auth_enabled=False)
+        self.assertIn("myjd_pw_new", html_out)
+        self.assertIn("disabled", html_out)
+        self.assertIn("Enable dashboard login", html_out)
+
+    def test_secret_inputs_enabled_when_auth_on(self):
+        html_out = app.render_settings_card({}, auth_enabled=True)
+        # The password/checkbox inputs for BOTH secrets must be free of
+        # `disabled` when auth is on (no hint shown either).
+        self.assertNotIn("disabled", html_out)
+        self.assertNotIn("Enable dashboard login", html_out)
+
+    def test_non_dict_settings_does_not_crash(self):
+        # The do_GET corrupt-file fallback renders with ani_data={"settings":
+        # {}, "anime": []} -- and a hand-edited ani.json could set "settings"
+        # to something that isn't even an object.
+        for bogus in (None, [], "oops"):
+            with self.subTest(bogus=bogus):
+                html_out = app.render_settings_card(bogus, auth_enabled=False)
+                self.assertIn("<form", html_out)
+
+    def test_editable_fields_prefilled(self):
+        settings = {"jdhost": "127.0.0.1", "myjd_user": "me", "myjd_device": "laptop", "timedelay": 300}
+        html_out = app.render_settings_card(settings, auth_enabled=True)
+        self.assertIn("127.0.0.1", html_out)
+        self.assertIn("me", html_out)
+        self.assertIn("laptop", html_out)
+        self.assertIn('value="5"', html_out)  # 300s -> 5 minutes
+
+    def test_every_visible_control_has_a_linked_label(self):
+        # Same a11y convention as the watchlist card redesign's
+        # _ControlCollector check: every input/select has a unique id and a
+        # <label for> that targets it (disabled controls still need one).
+        for auth_enabled in (True, False):
+            with self.subTest(auth_enabled=auth_enabled):
+                html_out = app.render_settings_card(
+                    {"myjd_pw": "x", "pushbullet_apikey": "y"}, auth_enabled=auth_enabled)
+                c = _ControlCollector()
+                c.feed(html_out)
+                self.assertEqual(len(c.ids), len(set(c.ids)))
+                self.assertTrue(c.controls)
+                for ctl in c.controls:
+                    self.assertTrue(ctl.get("id") in c.label_for, ctl)
+
+
+class SaveSettingsPostTest(unittest.TestCase):
+    """End-to-end /save-settings POST -> update_ani (through the anistore
+    lock), mirroring the existing _post-style handler tests above."""
+
+    def setUp(self):
+        fd, self._path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        with open(self._path, "w", encoding="utf-8") as f:
+            json.dump(app.config_defaults.default_ani_data(), f)
+        self._orig_ani = app.ANI_JSON
+        app.ANI_JSON = self._path
+        self._orig_auth = app.AUTH_ENABLED
+        self.log_records = []
+        self._log_handler = logging.Handler()
+        self._log_handler.emit = lambda record: self.log_records.append(record.getMessage())
+        app._log.addHandler(self._log_handler)
+
+    def tearDown(self):
+        app._log.removeHandler(self._log_handler)
+        app.ANI_JSON = self._orig_ani
+        app.AUTH_ENABLED = self._orig_auth
+        try:
+            os.remove(self._path)
+        except OSError:
+            pass
+
+    def _post(self, params):
+        captured = {}
+        h = app.Handler.__new__(app.Handler)
+        h.path = "/save-settings"
+        h._read_post = lambda: params
+        h._redirect_msg = lambda msg, level=None: captured.update(msg=msg, level=level)
+        h._redirect = lambda url: captured.__setitem__("url", url)
+        h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
+        h.do_POST()
+        return captured
+
+    def test_valid_save_persists_under_the_lock_and_reports_restart_needed(self):
+        app.AUTH_ENABLED = False
+        result = self._post({
+            "hoster": "0", "timedelay_minutes": "5",
+            "jdhost": "myhost", "myjd_user": "", "myjd_device": "",
+        })
+        self.assertEqual(result.get("level"), None)
+        self.assertIn("restart the bot container", result["msg"])
+
+        saved = app.load_ani()["settings"]
+        self.assertEqual(saved["hoster"], 0)
+        self.assertEqual(saved["timedelay"], 300)
+        self.assertEqual(saved["jdhost"], "myhost")
+        # Untouched keys survive the merge (defaults filled, not wiped).
+        self.assertIn("jd_deprecatedport", saved)
+
+    def test_invalid_save_shows_error_and_does_not_write(self):
+        before = app.load_ani()["settings"]
+        result = self._post({"hoster": "not-a-number", "timedelay_minutes": "10"})
+        self.assertEqual(result.get("level"), "err")
+        after = app.load_ani()["settings"]
+        self.assertEqual(before, after)
+
+    def test_secret_replace_rejected_and_not_saved_when_auth_off(self):
+        app.AUTH_ENABLED = False
+        result = self._post({
+            "hoster": "1", "timedelay_minutes": "10", "myjd_pw_new": "hunter2",
+        })
+        self.assertEqual(result.get("level"), "err")
+        saved = app.load_ani()["settings"]
+        self.assertEqual(saved.get("myjd_pw", ""), "")
+
+    def test_secret_replace_saved_when_auth_on(self):
+        app.AUTH_ENABLED = True
+        result = self._post({
+            "hoster": "1", "timedelay_minutes": "10", "myjd_pw_new": "hunter2",
+        })
+        self.assertIsNone(result.get("level"))
+        saved = app.load_ani()["settings"]
+        self.assertEqual(saved["myjd_pw"], "hunter2")
+
+    def test_secret_value_never_appears_in_logs(self):
+        app.AUTH_ENABLED = True
+        self._post({
+            "hoster": "1", "timedelay_minutes": "10",
+            "myjd_pw_new": "hunter2-secret", "pushbullet_apikey_new": "pb-secret-xyz",
+        })
+        combined = "\n".join(self.log_records)
+        self.assertNotIn("hunter2-secret", combined)
+        self.assertNotIn("pb-secret-xyz", combined)
+
+    def test_secret_never_in_rendered_page_after_save(self):
+        app.AUTH_ENABLED = True
+        self._post({"hoster": "1", "timedelay_minutes": "10", "myjd_pw_new": "hunter2-secret"})
+        page = app.render_page()
+        self.assertNotIn("hunter2-secret", page)
+        self.assertIn("badge-ok", page)  # now shows as "set"
+
+
 class ParseBotLogsBranchesTest(unittest.TestCase):
     """Coverage for parse_bot_logs branches beyond the BUG-3 standalone cases:
     docker-ts stripping, in-run event classification, the glued anime-name-prefix

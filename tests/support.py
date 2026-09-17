@@ -30,6 +30,7 @@ _anibot_cache = None
 _animeloads_cache = None
 _anistore_cache = None
 _notify_cache = None
+_config_defaults_cache = None
 
 
 def _load_from_path(name, path):
@@ -67,6 +68,17 @@ def load_notify():
             sys.path.insert(0, _BOT_DIR)
         _notify_cache = _load_from_path("aniloads_notify", os.path.join(_BOT_DIR, "notify.py"))
     return _notify_cache
+
+
+def load_config_defaults():
+    """Import bot/config_defaults.py once. Stdlib only — no stubs needed."""
+    global _config_defaults_cache
+    if _config_defaults_cache is None:
+        if _BOT_DIR not in sys.path:
+            sys.path.insert(0, _BOT_DIR)
+        _config_defaults_cache = _load_from_path(
+            "aniloads_config_defaults", os.path.join(_BOT_DIR, "config_defaults.py"))
+    return _config_defaults_cache
 
 
 def _install_anibot_stubs():

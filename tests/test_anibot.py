@@ -427,6 +427,99 @@ class ConfigUtf8Test(unittest.TestCase):
         self.assertEqual(len(state["runs"]), 2)
 
 
+class LoadConfigTest(unittest.TestCase):
+    """loadconfig() must seed a missing ani.json with full defaults, tolerate
+    a hand-edited file missing OPTIONAL keys, and only hard-fail when neither
+    download backend (jdhost / myjd_user) is configured."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-loadconfig-")
+        self._orig_botfile = anibot.botfile
+        self._orig_botfolder = anibot.botfolder
+        anibot.botfile = os.path.join(self.tmp, "ani.json")
+        anibot.botfolder = self.tmp
+
+    def tearDown(self):
+        anibot.botfile = self._orig_botfile
+        anibot.botfolder = self._orig_botfolder
+
+    def _write_settings(self, settings):
+        with open(anibot.botfile, "w", encoding="utf-8") as f:
+            json.dump({"settings": settings, "anime": []}, f)
+
+    def test_seeds_full_defaults_when_file_missing(self):
+        self.assertFalse(os.path.exists(anibot.botfile))
+
+        anibot.loadconfig()
+
+        self.assertTrue(os.path.exists(anibot.botfile))
+        with open(anibot.botfile, "r", encoding="utf-8") as f:
+            on_disk = json.load(f)
+        self.assertEqual(on_disk["settings"], anibot.config_defaults.DEFAULT_SETTINGS)
+        self.assertEqual(on_disk["anime"], [])
+
+    def test_seeding_never_overwrites_an_existing_file(self):
+        self._write_settings({
+            "jdhost": "127.0.0.1", "hoster": 0, "browserengine": 0,
+            "browserlocation": "", "pushbullet_apikey": "", "timedelay": 600,
+            "myjd_user": "", "myjd_pw": "", "myjd_device": "",
+            "jd_deprecated": False, "jd_deprecatedport": "",
+        })
+        with open(anibot.botfile, "r", encoding="utf-8") as f:
+            before = f.read()
+
+        anibot.loadconfig()
+
+        with open(anibot.botfile, "r", encoding="utf-8") as f:
+            after = f.read()
+        self.assertEqual(before, after)
+
+    def test_missing_optional_keys_fall_back_to_defaults_and_log_info(self):
+        # jdhost present (a chosen backend) but every optional key omitted.
+        self._write_settings({"jdhost": "127.0.0.1"})
+
+        with self.assertLogs(anibot._log, level="INFO") as cm:
+            result = anibot.loadconfig()
+
+        jdhost, hoster, browser, browserlocation, pushkey, timedelay = result[:6]
+        myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport = result[6:11]
+        self.assertEqual(jdhost, "127.0.0.1")
+        self.assertEqual(hoster, anibot.config_defaults.DEFAULT_SETTINGS["hoster"])
+        self.assertEqual(timedelay, anibot.config_defaults.DEFAULT_SETTINGS["timedelay"])
+        self.assertEqual(jd_deprecatedport, anibot.config_defaults.DEFAULT_SETTINGS["jd_deprecatedport"])
+        self.assertTrue(any("hoster" in msg for msg in cm.output))
+
+    def test_missing_download_backend_is_a_clear_fatal_error(self):
+        # Neither jdhost nor myjd_user set -- the one thing loadconfig()
+        # cannot default away.
+        self._write_settings({"hoster": 1, "timedelay": 600})
+
+        with self.assertLogs(anibot._log, level="ERROR") as cm:
+            result = anibot.loadconfig()
+
+        self.assertEqual(result, (False,) * 13)
+        self.assertTrue(any("jdhost" in msg and "myjd_user" in msg for msg in cm.output))
+
+    def test_myjd_user_alone_satisfies_the_backend_requirement(self):
+        # MyJDownloader mode: myjd_user set, jdhost empty, password left
+        # blank (entered interactively at startup) -- must NOT be treated as
+        # "no backend configured".
+        self._write_settings({"jdhost": "", "myjd_user": "myuser", "myjd_pw": ""})
+
+        result = anibot.loadconfig()
+
+        self.assertEqual(result[6], "myuser")  # myjd_user
+        self.assertNotEqual(result[0], False)  # jdhost is "" (valid), not the False sentinel
+
+    def test_no_settings_block_returns_false_tuple(self):
+        with open(anibot.botfile, "w", encoding="utf-8") as f:
+            json.dump({"anime": []}, f)
+
+        result = anibot.loadconfig()
+
+        self.assertEqual(result, (False,) * 13)
+
+
 class RecordEventTest(unittest.TestCase):
     """`_record_event` is the shared append helper every event call site uses."""
 

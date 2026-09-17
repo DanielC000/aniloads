@@ -210,6 +210,31 @@ def locked(path):
         os.close(fd)
 
 
+def seed_if_missing(path, default_factory):
+    """Create ``path`` with ``default_factory()`` if and only if it doesn't
+    already exist -- never overwrites a real config.
+
+    Callers (e.g. the dashboard's load_ani(), called on every GET) hit this
+    on every read once the file exists, which is nearly always -- so check
+    for existence WITHOUT the cross-container lock first and return early;
+    only the rare "still missing" path pays for taking it. The check is
+    re-done inside the lock (see below) so a concurrent creator racing this
+    same fast path can't still cause two writers to step on each other.
+
+    Runs under the same lock as every other read/write here, so a race
+    between the bot and the dashboard both seeding at startup can't produce
+    two writers stepping on each other. Returns True if it created the file,
+    False if one was already there.
+    """
+    if os.path.exists(path):
+        return False
+    with locked(path):
+        if os.path.exists(path):
+            return False
+        save(path, default_factory())
+        return True
+
+
 def merge_entry(data, collection, url, fields=None, unset=None, list_deltas=None):
     """Apply a field-level merge to ONE entry inside ``data[collection]``,
     matched by ``url``, in place.

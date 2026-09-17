@@ -291,6 +291,57 @@ class UpdateTest(unittest.TestCase):
             self.assertEqual(f.read(), "not json")
 
 
+class SeedIfMissingTest(unittest.TestCase):
+    def setUp(self):
+        self._dir = tempfile.mkdtemp(prefix="anistore-tests-")
+        self._path = os.path.join(self._dir, "ani.json")
+
+    def tearDown(self):
+        for name in os.listdir(self._dir):
+            os.remove(os.path.join(self._dir, name))
+        os.rmdir(self._dir)
+
+    def test_creates_file_from_default_factory_when_missing(self):
+        created = anistore.seed_if_missing(self._path, lambda: {"settings": {"x": 1}, "anime": []})
+        self.assertTrue(created)
+        self.assertEqual(anistore.load(self._path), {"settings": {"x": 1}, "anime": []})
+
+    def test_returns_false_and_never_overwrites_existing_file(self):
+        anistore.save(self._path, {"settings": {"jdhost": "custom"}, "anime": [{"name": "A"}]})
+
+        created = anistore.seed_if_missing(self._path, lambda: {"settings": {}, "anime": []})
+
+        self.assertFalse(created)
+        self.assertEqual(
+            anistore.load(self._path),
+            {"settings": {"jdhost": "custom"}, "anime": [{"name": "A"}]},
+        )
+
+    def test_default_factory_not_called_when_file_exists(self):
+        anistore.save(self._path, {"settings": {}, "anime": []})
+        factory = mock.Mock(side_effect=AssertionError("must not be called"))
+
+        anistore.seed_if_missing(self._path, factory)
+
+        factory.assert_not_called()
+
+    def test_skips_the_lock_entirely_when_file_already_exists(self):
+        # load_ani() calls this on every GET; once the file exists (the
+        # overwhelming common case) it must not pay for the cross-container
+        # flock at all -- only the "still missing" path needs it.
+        anistore.save(self._path, {"settings": {}, "anime": []})
+
+        with mock.patch.object(anistore, "locked", side_effect=AssertionError("must not lock")):
+            created = anistore.seed_if_missing(self._path, lambda: {"settings": {}, "anime": []})
+
+        self.assertFalse(created)
+
+    def test_still_locks_and_creates_when_file_is_missing(self):
+        created = anistore.seed_if_missing(self._path, lambda: {"settings": {"x": 1}, "anime": []})
+        self.assertTrue(created)
+        self.assertEqual(anistore.load(self._path), {"settings": {"x": 1}, "anime": []})
+
+
 class MergeEntryTest(unittest.TestCase):
     """Pure tests for anistore.merge_entry — the field-level merge that
     replaces a whole-document save (see bot/anibot.py's save_ani() and

@@ -57,6 +57,7 @@ except ImportError:
 from tvdb import TVDBClient
 
 import anistore
+import config_defaults
 
 import notify
 
@@ -667,6 +668,11 @@ def load_ani_cycle_start(path):
 def loadconfig():
     try:
         os.makedirs(os.path.dirname(botfolder), exist_ok=True)
+        # Seed a fresh, fully-defaulted ani.json the first time anyone (bot or
+        # dashboard) looks for it — never overwrites a real, existing file
+        # (see anistore.seed_if_missing). Without this, a missing file used to
+        # mean "no/bad config" forever until someone hand-wrote one.
+        anistore.seed_if_missing(botfile, config_defaults.default_ani_data)
         infile = open(botfile, "r", encoding="utf-8")
         data = json.load(infile)
         infile.close()
@@ -682,25 +688,50 @@ def loadconfig():
     al_user = al_pass = False
     for key in data:
         if(key == "settings"):
-            try:
-                value = data[key]
-                jdhost = value['jdhost']
-                hoster = value['hoster']
-                browser = value['browserengine']
-                browserlocation = value['browserlocation']
-                pushkey = value['pushbullet_apikey']
-                timedelay = value['timedelay']
-                myjd_user = value['myjd_user']
-                myjd_pass = value['myjd_pw']
-                myjd_device = value['myjd_device']
-                jd_deprecated = value['jd_deprecated']
-                jd_deprecatedport = value['jd_deprecatedport']
-            except Exception as e:
-                printException(e)
-                print("Fehlerhafte ani.json Konfiguration")
-                # 13-tuple to match the caller's unpack — a short tuple here would
-                # raise ValueError at the call site and crash the process.
+            value = data[key]
+            if not isinstance(value, dict):
+                _log.error("ani.json 'settings' ist kein Objekt / is not an object")
                 return False, False, False, False, False, False, False, False, False, False, False, False, False
+
+            # Missing OPTIONAL keys (anything a hand-edited or partially
+            # upgraded ani.json can simply omit) fall back to
+            # config_defaults.DEFAULT_SETTINGS instead of the old
+            # "Fehlerhafte ani.json Konfiguration" hard failure — only a
+            # missing download backend (below) is actually fatal.
+            filled, missing = config_defaults.fill_settings_defaults(value)
+            if missing:
+                _log.info(
+                    "ani.json settings: fehlende optionale Schluessel, nutze Standardwerte / "
+                    "missing optional key(s), using defaults: %s",
+                    ", ".join(sorted(missing)),
+                )
+
+            jdhost = filled['jdhost']
+            hoster = filled['hoster']
+            browser = filled['browserengine']
+            browserlocation = filled['browserlocation']
+            pushkey = filled['pushbullet_apikey']
+            timedelay = filled['timedelay']
+            myjd_user = filled['myjd_user']
+            myjd_pass = filled['myjd_pw']
+            myjd_device = filled['myjd_device']
+            jd_deprecated = filled['jd_deprecated']
+            jd_deprecatedport = filled['jd_deprecatedport']
+
+            # The one thing loadconfig() truly cannot default: a download
+            # backend. Either a local JDownloader host, or a MyJDownloader
+            # user (its password can still be entered interactively at
+            # startup, see startbot()'s own jdhost=="" and myjd_pass==""
+            # handling) must be configured.
+            if not jdhost and not myjd_user:
+                _log.error(
+                    "ani.json settings: kein Download-Ziel konfiguriert, setze 'jdhost' "
+                    "(lokaler JDownloader) oder 'myjd_user' fuer MyJDownloader / "
+                    "no download backend configured, set 'jdhost' (local JDownloader) "
+                    "or 'myjd_user' (MyJDownloader)"
+                )
+                return False, False, False, False, False, False, False, False, False, False, False, False, False
+
             # anime-loads.org login: prefer the environment (AL_USER/AL_PASS from
             # .env), fall back to ani.json settings for backward compatibility.
             al_user = os.environ.get('AL_USER') or value.get('al_user')

@@ -2360,17 +2360,47 @@ function expandEps(btn) {
     try {
       JSON.parse(btn.dataset.missing || '[]').forEach(function(e) { miss[e] = 1; });
     } catch (e) {}
-    var rows = '';
+    // Built as real DOM nodes, not an HTML string — key is the attribute-
+    // decoded watchlist URL, and concatenating it into markup would let a
+    // URL containing HTML metacharacters inject content into the page.
+    var frag = document.createDocumentFragment();
     for (var n = 1; n <= eps; n++) {
       if (miss[n]) continue;
-      rows += '<div class="ep-row"><span class="ep-num">Ep ' + n + '</span> '
-            + '<span class="badge badge-ok">OK</span> '
-            + '<form method="POST" action="/ep-add" style="margin:0;">'
-            + '<input type="hidden" name="key" value="' + key + '">'
-            + '<input type="hidden" name="ep" value="' + n + '">'
-            + '<button type="submit" class="btn btn-ghost btn-sm">Retry</button></form></div>';
+      var row = document.createElement('div');
+      row.className = 'ep-row';
+      var numSpan = document.createElement('span');
+      numSpan.className = 'ep-num';
+      numSpan.textContent = 'Ep ' + n;
+      row.appendChild(numSpan);
+      row.appendChild(document.createTextNode(' '));
+      var okBadge = document.createElement('span');
+      okBadge.className = 'badge badge-ok';
+      okBadge.textContent = 'OK';
+      row.appendChild(okBadge);
+      row.appendChild(document.createTextNode(' '));
+      var form = document.createElement('form');
+      form.setAttribute('method', 'POST');
+      form.setAttribute('action', '/ep-add');
+      form.style.margin = '0';
+      var keyInput = document.createElement('input');
+      keyInput.type = 'hidden';
+      keyInput.name = 'key';
+      keyInput.value = key;
+      form.appendChild(keyInput);
+      var epInput = document.createElement('input');
+      epInput.type = 'hidden';
+      epInput.name = 'ep';
+      epInput.value = n;
+      form.appendChild(epInput);
+      var submitBtn = document.createElement('button');
+      submitBtn.type = 'submit';
+      submitBtn.className = 'btn btn-ghost btn-sm';
+      submitBtn.textContent = 'Retry';
+      form.appendChild(submitBtn);
+      row.appendChild(form);
+      frag.appendChild(row);
     }
-    group.innerHTML = rows;
+    group.appendChild(frag);
     btn.dataset.built = '1';
   }
   var open = group.classList.toggle('ep-ok-open');
@@ -3027,7 +3057,7 @@ def render_watchlist(anime_list, pending_list=None):
             else:
                 tvdb_badges += ' <span class="badge badge-neutral">TVDB</span>'
             if a.get("episode_offset", 0) != 0:
-                tvdb_badges += ' <span class="badge badge-neutral">Offset +{}</span>'.format(
+                tvdb_badges += ' <span class="badge badge-neutral">Offset {:+d}</span>'.format(
                     a["episode_offset"])
             tvdb_badges += (' <form method="POST" action="/tvdb-unlink" style="margin:0;display:inline;">'
                             '<input type="hidden" name="key" value="{}">'
@@ -3494,11 +3524,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Location", url)
         self.end_headers()
 
-    def _redirect_msg(self, msg):
+    def _redirect_msg(self, msg, level=None):
         """Redirect home with a status banner message, URL-encoded so a name
         containing ``& = # %`` survives intact — parse_qs decodes it on the GET
-        side. A raw ``/?msg=...`` truncated everything after the first ``&``."""
-        self._redirect("/?" + urlencode({"msg": msg}))
+        side. A raw ``/?msg=...`` truncated everything after the first ``&``.
+
+        ``level`` ("ok"/"err") lets a caller state the banner tone explicitly
+        instead of the GET side guessing it from a leading "Error" — a
+        failure message that doesn't start with that word (e.g. "Could not
+        fetch releases: ...") otherwise renders as a green success. Omitted,
+        do_GET falls back to the old prefix sniff, so an un-migrated caller
+        keeps its previous behavior."""
+        params = {"msg": msg}
+        if level is not None:
+            params["level"] = level
+        self._redirect("/?" + urlencode(params))
 
     def _read_post(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -3545,7 +3585,10 @@ class Handler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
         if "msg" in qs:
             msg = qs["msg"][0]
-            cls = "status-ok" if not msg.startswith("Error") else "status-err"
+            level = qs.get("level", [None])[0]
+            if level not in ("ok", "err"):
+                level = "ok" if not msg.startswith("Error") else "err"
+            cls = "status-ok" if level == "ok" else "status-err"
             status = '<div class="status-msg {}" id="status-msg">{}</div>'.format(cls, escape(msg))
 
         try:
@@ -3568,7 +3611,8 @@ class Handler(BaseHTTPRequestHandler):
             # mutate/save anything, so nothing was written.
             _log.error("[watchlist] ani.json is corrupt, refused POST %s: %s", parsed.path, e)
             self._redirect_msg(
-                "Error: ani.json is corrupt — refused to save. Fix or restore the file, then reload.")
+                "Error: ani.json is corrupt — refused to save. Fix or restore the file, then reload.",
+                level="err")
 
     def _dispatch_post(self, parsed, params):
         if parsed.path == "/run-now":
@@ -3578,7 +3622,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect_msg(msg)
             else:
                 _log.warning("[bot] Run now request rejected: %s", msg)
-                self._redirect_msg("Error: {}".format(msg))
+                self._redirect_msg("Error: {}".format(msg), level="err")
 
         elif parsed.path == "/check-now":
             entry_url = params.get("key", "")
@@ -3588,7 +3632,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect_msg(msg)
             else:
                 _log.warning("[bot] Check now request rejected: %s", msg)
-                self._redirect_msg("Error: {}".format(msg))
+                self._redirect_msg("Error: {}".format(msg), level="err")
 
         elif parsed.path == "/move-now":
             _log.info("[mover] Move Now triggered via dashboard")
@@ -3602,15 +3646,15 @@ class Handler(BaseHTTPRequestHandler):
                 _log.info("[mover] Ignoring stuck item: %s", msg)
                 self._redirect_msg("Ignoring: {}".format(msg))
             else:
-                self._redirect_msg("Error: stuck item not found")
+                self._redirect_msg("Error: stuck item not found", level="err")
 
         elif parsed.path == "/move-stuck-delete":
             key = params.get("key", "")
             result = stuck_delete_download(key)
             if result is None:
-                self._redirect_msg("Error: stuck item not found")
+                self._redirect_msg("Error: stuck item not found", level="err")
             elif result.startswith("error:"):
-                self._redirect_msg("Error: {}".format(result[len("error:"):]))
+                self._redirect_msg("Error: {}".format(result[len("error:"):]), level="err")
             else:
                 _log.info("[mover] Deleted downloaded copy: %s", result)
                 self._redirect_msg("Deleted download copy: {}".format(result))
@@ -3622,13 +3666,19 @@ class Handler(BaseHTTPRequestHandler):
                 _log.info("[mover] Will move anyway on next cycle: %s", msg)
                 self._redirect_msg("Will move on next cycle: {}".format(msg))
             else:
-                self._redirect_msg("Error: stuck item not found")
+                self._redirect_msg("Error: stuck item not found", level="err")
 
         elif parsed.path == "/save-prefs":
+            try:
+                min_resolution = int(params.get("min_resolution", "1080"))
+            except ValueError:
+                self._redirect_msg(
+                    "Error: minimum resolution must be a number", level="err")
+                return
             prefs = {
                 "audio_language": params.get("audio_language", "german"),
                 "sub_language": params.get("sub_language", "any"),
-                "min_resolution": int(params.get("min_resolution", "1080")),
+                "min_resolution": min_resolution,
                 "auto_select": "auto_select" in params,
             }
             save_prefs(prefs)
@@ -3873,7 +3923,7 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/search":
             query = params.get("q", "").strip()
             if not query:
-                self._redirect_msg("Error: Empty search")
+                self._redirect_msg("Error: Empty search", level="err")
                 return
 
             results, err = search_anime(query)
@@ -3905,7 +3955,7 @@ class Handler(BaseHTTPRequestHandler):
                 _log.info("[watchlist] Removed pending: %s", removed.get("name") or removed.get("url", "?"))
                 self._redirect_msg("Removed: {}".format(removed.get("name", "?")))
             else:
-                self._redirect_msg("Error: entry not found")
+                self._redirect_msg("Error: entry not found", level="err")
 
         elif parsed.path == "/remove":
             entry_url = params.get("key", "")
@@ -3924,17 +3974,40 @@ class Handler(BaseHTTPRequestHandler):
                 _log.info("[watchlist] Removed anime: %s", removed.get("name", "?"))
                 self._redirect_msg("Removed: {}".format(removed.get("name", "?")))
             else:
-                self._redirect_msg("Error: entry not found")
+                self._redirect_msg("Error: entry not found", level="err")
 
         elif parsed.path == "/ep-add":
             entry_url = params.get("key", "")
-            ep = int(params.get("ep", -1))
+            try:
+                ep = int(params.get("ep", -1))
+            except ValueError:
+                self._redirect_msg(
+                    "Error: episode number must be numeric", level="err")
+                return
             outcome = {}
 
             def _ep_add(data):
                 anime_list = data.get("anime", [])
                 _, entry = find_entry_by_url(anime_list, entry_url)
-                if entry is None or ep <= 0:
+                if entry is None:
+                    outcome["result"] = "invalid"
+                    return
+                # Bound to the site's known ANNOUNCED total (al_max_episodes)
+                # — NOT entry["episodes"] (highest already downloaded) and
+                # NOT al_available_max (the currently-published cap): adding
+                # the next, not-yet-published episode number is the
+                # documented manual override for one that went up early —
+                # by definition beyond al_available_max — so bounding on
+                # either of those would block exactly that. animeloads.py
+                # uses 999999 as its "unknown announced total" sentinel, so
+                # that value means unknown here too, falling through to a
+                # generous sanity cap.
+                al_max_episodes = entry.get("al_max_episodes")
+                if isinstance(al_max_episodes, (int, float)) and 0 < al_max_episodes < 999999:
+                    ep_max = al_max_episodes
+                else:
+                    ep_max = 5000
+                if ep <= 0 or ep > ep_max:
                     outcome["result"] = "invalid"
                     return
                 outcome["name"] = entry.get("name", "?")
@@ -3953,11 +4026,16 @@ class Handler(BaseHTTPRequestHandler):
             elif outcome["result"] == "already":
                 self._redirect_msg("Episode {} already in retry queue".format(ep))
             else:
-                self._redirect_msg("Error: entry not found or invalid episode")
+                self._redirect_msg("Error: entry not found or invalid episode", level="err")
 
         elif parsed.path == "/ep-remove":
             entry_url = params.get("key", "")
-            ep = int(params.get("ep", -1))
+            try:
+                ep = int(params.get("ep", -1))
+            except ValueError:
+                self._redirect_msg(
+                    "Error: episode number must be numeric", level="err")
+                return
             outcome = {}
 
             def _ep_remove(data):
@@ -3981,7 +4059,7 @@ class Handler(BaseHTTPRequestHandler):
             elif outcome["result"] == "not_queued":
                 self._redirect_msg("Episode {} not in retry queue".format(ep))
             else:
-                self._redirect_msg("Error: entry not found or invalid episode")
+                self._redirect_msg("Error: entry not found or invalid episode", level="err")
 
         elif parsed.path == "/tvdb-link":
             entry_url = params.get("key", "")
@@ -4000,7 +4078,7 @@ class Handler(BaseHTTPRequestHandler):
                     media_type=media_type)
                 self._respond(200, render_page(search_html=search_html))
             else:
-                self._redirect_msg("Error: entry not found or TVDB unavailable")
+                self._redirect_msg("Error: entry not found or TVDB unavailable", level="err")
 
         elif parsed.path == "/tvdb-save":
             entry_url = params.get("key", "")
@@ -4056,7 +4134,7 @@ class Handler(BaseHTTPRequestHandler):
             if outcome.get("result") == "saved":
                 self._redirect_msg("TVDB linked: {}{}".format(outcome["name"], outcome["season_str"]))
             else:
-                self._redirect_msg("Error: entry not found")
+                self._redirect_msg("Error: entry not found", level="err")
 
         elif parsed.path == "/tvdb-unlink":
             entry_url = params.get("key", "")
@@ -4077,7 +4155,7 @@ class Handler(BaseHTTPRequestHandler):
             if outcome.get("result") == "unlinked":
                 self._redirect_msg("TVDB unlinked: {}".format(outcome["name"]))
             else:
-                self._redirect_msg("Error: entry not found")
+                self._redirect_msg("Error: entry not found", level="err")
 
         elif parsed.path == "/update-folder":
             entry_url = params.get("key", "")
@@ -4100,7 +4178,7 @@ class Handler(BaseHTTPRequestHandler):
                 shown = folder if folder == folder_raw else "{} (saved as '{}')".format(folder_raw, folder)
                 self._redirect_msg("Folder updated: {} -> {}".format(outcome["name"], shown))
             else:
-                self._redirect_msg("Error: entry not found or empty folder")
+                self._redirect_msg("Error: entry not found or empty folder", level="err")
 
         elif parsed.path == "/mark-incomplete":
             entry_url = params.get("key", "")
@@ -4121,7 +4199,7 @@ class Handler(BaseHTTPRequestHandler):
             if outcome.get("result") == "marked":
                 self._redirect_msg("Marked incomplete: {}".format(outcome["name"]))
             else:
-                self._redirect_msg("Error: entry not found")
+                self._redirect_msg("Error: entry not found", level="err")
 
         else:
             self._redirect("/")

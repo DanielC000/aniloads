@@ -583,6 +583,50 @@ class RenderWatchlistEpisodeCollapseTest(unittest.TestCase):
         self.assertNotIn("badge-retry", out)
 
 
+class RenderWatchlistOffsetBadgeTest(unittest.TestCase):
+    """The TVDB episode-offset badge must show a signed number — a negative
+    offset used to render as e.g. 'Offset +-2' (the template hard-coded a '+'
+    in front of a value that could itself already be negative)."""
+
+    def test_positive_offset_shows_plus(self):
+        out = app.render_watchlist([{
+            "name": "A", "url": "http://x/a", "tvdb_id": 1, "episode_offset": 12}])
+        self.assertIn("Offset +12", out)
+
+    def test_negative_offset_shows_single_minus(self):
+        out = app.render_watchlist([{
+            "name": "A", "url": "http://x/a", "tvdb_id": 1, "episode_offset": -2}])
+        self.assertIn("Offset -2", out)
+        self.assertNotIn("+-2", out)
+
+    def test_zero_offset_has_no_badge(self):
+        out = app.render_watchlist([{
+            "name": "A", "url": "http://x/a", "tvdb_id": 1, "episode_offset": 0}])
+        self.assertNotIn("Offset", out)
+
+
+class ExpandEpsDomSafetyTest(unittest.TestCase):
+    """expandEps() used to build the OK-episode rows by string-concatenating
+    the attribute-decoded data-key straight into innerHTML — a watchlist URL
+    containing HTML metacharacters could inject markup into the page. It must
+    build DOM nodes (createElement/textContent/setAttribute) instead."""
+
+    def _expand_eps_source(self):
+        start = app.HTML_TEMPLATE.index("function expandEps")
+        end = app.HTML_TEMPLATE.index("function setRunDetail", start)
+        return app.HTML_TEMPLATE[start:end]
+
+    def test_does_not_assign_key_into_innerhtml(self):
+        src = self._expand_eps_source()
+        self.assertNotIn("innerHTML", src)
+
+    def test_builds_rows_via_dom_apis(self):
+        src = self._expand_eps_source()
+        self.assertIn("createElement", src)
+        self.assertIn("textContent", src)
+        self.assertIn("group.appendChild", src)
+
+
 def _iso(dt):
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -1523,6 +1567,24 @@ class RedirectMsgEncodingTest(unittest.TestCase):
         qs = parse_qs(urlparse(self._captured_url("Error: Invalid index")).query)
         self.assertTrue(qs["msg"][0].startswith("Error"))
 
+    def test_no_level_arg_omits_level_from_redirect(self):
+        # A caller that hasn't been migrated to the explicit level keeps the
+        # old redirect shape, so do_GET's prefix-sniff fallback still applies.
+        handler = app.Handler.__new__(app.Handler)
+        captured = {}
+        handler._redirect = lambda url: captured.__setitem__("url", url)
+        handler._redirect_msg("Removed: X")
+        qs = parse_qs(urlparse(captured["url"]).query)
+        self.assertNotIn("level", qs)
+
+    def test_explicit_level_is_encoded_in_redirect(self):
+        handler = app.Handler.__new__(app.Handler)
+        captured = {}
+        handler._redirect = lambda url: captured.__setitem__("url", url)
+        handler._redirect_msg("Could not fetch releases: timeout", level="err")
+        qs = parse_qs(urlparse(captured["url"]).query)
+        self.assertEqual(qs["level"][0], "err")
+
 
 class ParseBotLogsStandaloneTest(unittest.TestCase):
     """Standalone [SKIP]/[THROTTLE]/[COMPLETE] lines arriving with no active run
@@ -1586,7 +1648,7 @@ class WatchlistMutationKeyByUrlTest(unittest.TestCase):
         handler = app.Handler.__new__(app.Handler)
         handler.path = path
         handler._read_post = lambda: params
-        handler._redirect_msg = lambda msg: captured.__setitem__("msg", msg)
+        handler._redirect_msg = lambda msg, level=None: captured.update(msg=msg, level=level)
         handler._redirect = lambda url: captured.__setitem__("url", url)
         handler._respond = lambda code, html: captured.__setitem__("html", html)
         handler.do_POST()
@@ -1624,6 +1686,98 @@ class WatchlistMutationKeyByUrlTest(unittest.TestCase):
         by_name = {e["name"]: e for e in app.load_ani()["anime"]}
         self.assertEqual(by_name["B"]["missing"], [5])
         self.assertEqual(by_name["A"]["missing"], [])  # A untouched
+
+    def test_ep_add_non_numeric_ep_shows_error_no_crash(self):
+        # BUG: int(params["ep"]) used to raise ValueError straight out of the
+        # handler — a non-numeric episode dropped the connection.
+        a = {"name": "A", "url": "http://x/a", "episodes": 12, "missing": []}
+        app.save_ani({"anime": [a]})
+        result = self._post("/ep-add", {"key": "http://x/a", "ep": "abc"})
+        self.assertTrue(result["msg"].startswith("Error"))
+        self.assertEqual(result.get("level"), "err")
+        self.assertEqual(app.load_ani()["anime"][0]["missing"], [])
+
+    def test_ep_remove_non_numeric_ep_shows_error_no_crash(self):
+        a = {"name": "A", "url": "http://x/a", "episodes": 12, "missing": [3]}
+        app.save_ani({"anime": [a]})
+        result = self._post("/ep-remove", {"key": "http://x/a", "ep": "abc"})
+        self.assertTrue(result["msg"].startswith("Error"))
+        self.assertEqual(result.get("level"), "err")
+        self.assertEqual(app.load_ani()["anime"][0]["missing"], [3])  # untouched
+
+    def test_ep_add_beyond_downloaded_count_but_within_site_max_is_allowed(self):
+        # "Add to retry" with the NEXT, not-yet-downloaded episode (episodes+1)
+        # is the documented manual override for an episode published ahead of
+        # its TVDB airdate — entry["episodes"] (highest already downloaded)
+        # must NOT be the bound, only the site's known max.
+        a = {"name": "A", "url": "http://x/a", "episodes": 6,
+             "al_max_episodes": 12, "missing": []}
+        app.save_ani({"anime": [a]})
+        self._post("/ep-add", {"key": "http://x/a", "ep": "7"})
+        self.assertEqual(app.load_ani()["anime"][0]["missing"], [7])
+        self._post("/ep-add", {"key": "http://x/a", "ep": "12"})
+        self.assertEqual(app.load_ani()["anime"][0]["missing"], [7, 12])
+
+    def test_ep_add_rejects_episode_beyond_al_max_episodes(self):
+        a = {"name": "A", "url": "http://x/a", "episodes": 6,
+             "al_max_episodes": 12, "missing": []}
+        app.save_ani({"anime": [a]})
+        result = self._post("/ep-add", {"key": "http://x/a", "ep": "13"})
+        self.assertTrue(result["msg"].startswith("Error"))
+        self.assertEqual(app.load_ani()["anime"][0]["missing"], [])
+
+    def test_ep_add_ignores_al_available_max(self):
+        # al_available_max is the CURRENTLY-PUBLISHED cap (the phantom-episode
+        # guard) — the early-release override is by definition adding an
+        # episode beyond it, so it must never bound /ep-add. Only
+        # al_max_episodes (the site's announced total) does.
+        a = {"name": "A", "url": "http://x/a", "episodes": 6,
+             "al_available_max": 6, "al_max_episodes": 12, "missing": []}
+        app.save_ani({"anime": [a]})
+        self._post("/ep-add", {"key": "http://x/a", "ep": "7"})
+        self.assertEqual(app.load_ani()["anime"][0]["missing"], [7])
+        self._post("/ep-add", {"key": "http://x/a", "ep": "12"})
+        self.assertEqual(app.load_ani()["anime"][0]["missing"], [7, 12])
+        result = self._post("/ep-add", {"key": "http://x/a", "ep": "13"})
+        self.assertTrue(result["msg"].startswith("Error"))
+        self.assertEqual(app.load_ani()["anime"][0]["missing"], [7, 12])
+
+    def test_ep_add_al_available_max_alone_does_not_bound(self):
+        a = {"name": "A", "url": "http://x/a", "episodes": 6,
+             "al_available_max": 6, "missing": []}
+        app.save_ani({"anime": [a]})
+        self._post("/ep-add", {"key": "http://x/a", "ep": "7"})
+        self.assertEqual(app.load_ani()["anime"][0]["missing"], [7])
+
+    def test_ep_add_rejects_zero_and_negative(self):
+        a = {"name": "A", "url": "http://x/a", "episodes": 12, "missing": []}
+        app.save_ani({"anime": [a]})
+        self._post("/ep-add", {"key": "http://x/a", "ep": "0"})
+        self._post("/ep-add", {"key": "http://x/a", "ep": "-3"})
+        self.assertEqual(app.load_ani()["anime"][0]["missing"], [])
+
+    def test_ep_add_sanity_cap_when_max_unknown(self):
+        # No known site max (e.g. a dashboard-added entry) still gets a
+        # generous sanity cap rather than accepting any number.
+        a = {"name": "A", "url": "http://x/a", "episodes": 6, "missing": []}
+        app.save_ani({"anime": [a]})
+        self._post("/ep-add", {"key": "http://x/a", "ep": "7"})
+        self.assertEqual(app.load_ani()["anime"][0]["missing"], [7])
+        result = self._post("/ep-add", {"key": "http://x/a", "ep": "99999"})
+        self.assertTrue(result["msg"].startswith("Error"))
+        self.assertEqual(app.load_ani()["anime"][0]["missing"], [7])
+
+    def test_ep_add_al_max_episodes_999999_treated_as_unknown(self):
+        # animeloads.py uses 999999 as its "unknown max" sentinel (e.g. for
+        # movies, or a series not yet scraped for its total) — it must fall
+        # through to the sanity cap, not be treated as a real bound.
+        a = {"name": "A", "url": "http://x/a", "episodes": 6,
+             "al_max_episodes": 999999, "missing": []}
+        app.save_ani({"anime": [a]})
+        self._post("/ep-add", {"key": "http://x/a", "ep": "100"})
+        self.assertEqual(app.load_ani()["anime"][0]["missing"], [100])
+        result = self._post("/ep-add", {"key": "http://x/a", "ep": "99999"})
+        self.assertTrue(result["msg"].startswith("Error"))
 
     def test_unknown_url_reports_not_found(self):
         app.save_ani({"anime": [{"name": "A", "url": "http://x/a"}]})
@@ -1827,7 +1981,7 @@ class AniJsonCorruptTest(unittest.TestCase):
         h = app.Handler.__new__(app.Handler)
         h.path = path
         h._read_post = lambda: params
-        h._redirect_msg = lambda msg: captured.__setitem__("msg", msg)
+        h._redirect_msg = lambda msg, level=None: captured.update(msg=msg, level=level)
         h._redirect = lambda url: captured.__setitem__("url", url)
         h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
         h.do_POST()
@@ -2789,7 +2943,7 @@ class HandlerPostRoutingTest(unittest.TestCase):
         h = app.Handler.__new__(app.Handler)
         h.path = path
         h._read_post = lambda: params
-        h._redirect_msg = lambda msg: captured.__setitem__("msg", msg)
+        h._redirect_msg = lambda msg, level=None: captured.update(msg=msg, level=level)
         h._redirect = lambda url: captured.__setitem__("url", url)
         h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
         h.do_POST()
@@ -2809,6 +2963,15 @@ class HandlerPostRoutingTest(unittest.TestCase):
         self._post("/save-prefs", {"min_resolution": "1080"})
         self.assertFalse(app.load_prefs()["auto_select"])
 
+    def test_save_prefs_non_numeric_resolution_shows_error_no_write(self):
+        # BUG: int(params["min_resolution"]) used to raise ValueError straight
+        # out of the handler, dropping the connection instead of banner-erroring.
+        before = app.load_prefs()
+        result = self._post("/save-prefs", {"min_resolution": "not-a-number"})
+        self.assertTrue(result["msg"].startswith("Error"))
+        self.assertEqual(result.get("level"), "err")
+        self.assertEqual(app.load_prefs(), before)  # nothing was saved
+
     def test_move_now_sets_trigger(self):
         app._move_trigger.clear()
         result = self._post("/move-now", {})
@@ -2822,6 +2985,7 @@ class HandlerPostRoutingTest(unittest.TestCase):
     def test_search_empty_query_errors(self):
         result = self._post("/search", {"q": "  "})
         self.assertTrue(result["msg"].startswith("Error: Empty search"))
+        self.assertEqual(result.get("level"), "err")
 
     def test_move_stuck_ignore_marks_item_and_redirects(self):
         app._stuck_items["k1"] = {
@@ -2835,6 +2999,7 @@ class HandlerPostRoutingTest(unittest.TestCase):
     def test_move_stuck_ignore_missing_key_errors(self):
         result = self._post("/move-stuck-ignore", {"key": "nope"})
         self.assertEqual(result["msg"], "Error: stuck item not found")
+        self.assertEqual(result.get("level"), "err")
 
     def test_move_stuck_delete_removes_download_copy(self):
         dl_dir = os.path.join(self._tmp, "downloads", "d")
@@ -2878,8 +3043,10 @@ class HandlerPostRoutingTest(unittest.TestCase):
 
 
 class HandlerGetMsgBannerTest(unittest.TestCase):
-    """do_GET's status-banner branch keys the banner CSS class off whether the
-    msg starts with 'Error'. render_page is stubbed so no full page is built."""
+    """do_GET's status-banner branch keys the banner CSS class off an explicit
+    ``level`` query param when present, falling back to sniffing a leading
+    'Error' only for a redirect that didn't set one (back-compat). render_page
+    is stubbed so no full page is built."""
 
     def _get(self, path):
         captured = {}
@@ -2903,6 +3070,19 @@ class HandlerGetMsgBannerTest(unittest.TestCase):
     def test_error_msg_uses_err_class(self):
         _code, html_out = self._get("/?msg=" + quote("Error: nope"))
         self.assertIn("status-err", html_out)
+
+    def test_explicit_err_level_wins_without_error_prefix(self):
+        # BUG: a failure message that doesn't start with "Error" (e.g. from
+        # a fetch failure) used to render green via the old prefix sniff.
+        url = "/?msg={}&level=err".format(quote("Could not fetch releases: timeout"))
+        _code, html_out = self._get(url)
+        self.assertIn("status-err", html_out)
+        self.assertNotIn("status-ok", html_out)
+
+    def test_explicit_ok_level_overrides_error_looking_text(self):
+        url = "/?msg={}&level=ok".format(quote("Error-prone but actually fine"))
+        _code, html_out = self._get(url)
+        self.assertIn("status-ok", html_out)
 
 
 class ApplyResolvedPendingTest(unittest.TestCase):
@@ -3474,7 +3654,7 @@ class RunNowCheckNowPostTest(unittest.TestCase):
         h = app.Handler.__new__(app.Handler)
         h.path = path
         h._read_post = lambda: params
-        h._redirect_msg = lambda msg: captured.__setitem__("msg", msg)
+        h._redirect_msg = lambda msg, level=None: captured.update(msg=msg, level=level)
         h._redirect = lambda url: captured.__setitem__("url", url)
         h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
         h.do_POST()
@@ -3489,6 +3669,7 @@ class RunNowCheckNowPostTest(unittest.TestCase):
         self._post("/run-now", {})
         result = self._post("/run-now", {})
         self.assertTrue(result["msg"].startswith("Error:"))
+        self.assertEqual(result.get("level"), "err")
 
     def test_check_now_sets_force_check_and_queues(self):
         app.save_ani({"anime": [{"name": "A", "url": "http://x/a"}]})
@@ -3499,6 +3680,7 @@ class RunNowCheckNowPostTest(unittest.TestCase):
     def test_check_now_missing_key_errors(self):
         result = self._post("/check-now", {"key": "http://x/missing"})
         self.assertTrue(result["msg"].startswith("Error:"))
+        self.assertEqual(result.get("level"), "err")
 
 
 class AddUrlClobberTest(unittest.TestCase):

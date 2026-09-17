@@ -3,9 +3,12 @@
 import builtins
 import json
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 
 import support
@@ -2000,3 +2003,115 @@ class WaitingForConfigStateTest(unittest.TestCase):
         anibot.botfile = os.path.join(blocker, "ani.json")
         anibot.write_waiting_for_config("no download backend configured")  # must not raise
         anibot.clear_waiting_for_config()  # must not raise
+
+
+class HealthcheckTest(unittest.TestCase):
+    """bot/healthcheck.py backs the anime-loads compose HEALTHCHECK. It is a
+    standalone module (no anibot import) so these tests load it directly."""
+
+    def setUp(self):
+        self.hc = support.load_healthcheck()
+        fd, self.path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self.now = datetime(2026, 9, 17, 12, 0, 0, tzinfo=timezone.utc)
+
+    def tearDown(self):
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
+    def _write(self, state):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+
+    def test_missing_file_is_healthy(self):
+        os.remove(self.path)
+        ok, reason = self.hc.check_health(run_state_path=self.path, now=self.now)
+        self.assertTrue(ok)
+        self.assertIn("missing", reason)
+
+    def test_corrupt_file_is_healthy(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        ok, reason = self.hc.check_health(run_state_path=self.path, now=self.now)
+        self.assertTrue(ok)
+
+    def test_no_last_run_yet_is_healthy(self):
+        self._write({"schema": 1})
+        ok, reason = self.hc.check_health(run_state_path=self.path, now=self.now)
+        self.assertTrue(ok)
+        self.assertIn("no completed cycle", reason)
+
+    def test_waiting_for_config_marker_is_healthy_even_if_stale(self):
+        # A stale (or entirely absent) last_run must not flap the container
+        # unhealthy while the bot is legitimately stuck waiting on Settings.
+        self._write({
+            "waiting_for_config": {"reason": "no download backend configured", "since": "2026-09-01T00:00:00Z"},
+            "last_run": {"finished_ts": "2026-09-01T00:00:00Z", "timedelay": 600},
+        })
+        ok, reason = self.hc.check_health(run_state_path=self.path, now=self.now)
+        self.assertTrue(ok)
+        self.assertIn("waiting for configuration", reason)
+
+    def test_recent_cycle_is_healthy(self):
+        self._write({"last_run": {"finished_ts": "2026-09-17T11:55:00Z", "timedelay": 600}})
+        ok, reason = self.hc.check_health(run_state_path=self.path, now=self.now)
+        self.assertTrue(ok)
+
+    def test_cycle_just_under_threshold_is_healthy(self):
+        # timedelay=600 -> threshold = max(1800, 1800) = 1800s.
+        self._write({"last_run": {"finished_ts": "2026-09-17T11:31:00Z", "timedelay": 600}})
+        ok, _ = self.hc.check_health(run_state_path=self.path, now=self.now)
+        self.assertTrue(ok)
+
+    def test_stale_cycle_is_unhealthy(self):
+        self._write({"last_run": {"finished_ts": "2026-09-17T11:00:00Z", "timedelay": 600}})
+        ok, reason = self.hc.check_health(run_state_path=self.path, now=self.now)
+        self.assertFalse(ok)
+        self.assertIn("exceeds", reason)
+
+    def test_large_timedelay_widens_threshold_past_30_min_floor(self):
+        # timedelay=3600 -> threshold = max(10800, 1800) = 10800s (3h).
+        self._write({"last_run": {"finished_ts": "2026-09-17T10:00:00Z", "timedelay": 3600}})
+        ok, _ = self.hc.check_health(run_state_path=self.path, now=self.now)
+        self.assertTrue(ok)
+
+    def test_missing_or_zero_timedelay_falls_back_to_30_min_floor(self):
+        self._write({"last_run": {"finished_ts": "2026-09-17T11:00:00Z", "timedelay": 0}})
+        ok, _ = self.hc.check_health(run_state_path=self.path, now=self.now)
+        self.assertFalse(ok)
+
+    def test_unparsable_finished_ts_is_healthy(self):
+        self._write({"last_run": {"finished_ts": "not-a-timestamp", "timedelay": 600}})
+        ok, reason = self.hc.check_health(run_state_path=self.path, now=self.now)
+        self.assertTrue(ok)
+        self.assertIn("unparsable", reason)
+
+
+class HealthcheckMainTest(unittest.TestCase):
+    """Exercises the actual `python healthcheck.py` process (what the
+    compose HEALTHCHECK runs), not just the importable check_health()."""
+
+    def setUp(self):
+        self.config_dir = tempfile.mkdtemp(prefix="aniloads-hc-")
+
+    def tearDown(self):
+        shutil.rmtree(self.config_dir, ignore_errors=True)
+
+    def _run(self):
+        script = os.path.join(support._BOT_DIR, "healthcheck.py")
+        env = dict(os.environ, CONFIG_DIR=self.config_dir)
+        return subprocess.run(
+            [sys.executable, script], env=env, capture_output=True, text=True, timeout=10)
+
+    def test_exits_zero_with_no_run_state(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0)
+
+    def test_exits_one_when_stale(self):
+        finished = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(os.path.join(self.config_dir, "run_state.json"), "w", encoding="utf-8") as f:
+            json.dump({"last_run": {"finished_ts": finished, "timedelay": 600}}, f)
+        result = self._run()
+        self.assertEqual(result.returncode, 1)

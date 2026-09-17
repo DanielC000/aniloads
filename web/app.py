@@ -5805,14 +5805,22 @@ class Handler(BaseHTTPRequestHandler):
         BaseHTTPRequestHandler.handle_one_request), so a handler added later
         can't accidentally bypass auth/CSRF by skipping a call other routes
         remember to make. Auth covers every method; CSRF only applies to
-        state-changing POSTs."""
+        state-changing POSTs. /healthz is the one deliberate exemption — a
+        container healthcheck has no credentials, so it must reach 200
+        without either gate; do_GET keeps its own response minimal (no
+        data, no Docker/disk calls) so the exemption reveals nothing."""
         if not BaseHTTPRequestHandler.parse_request(self):
             return False
+        if self._is_healthz():
+            return True
         if not self._authorize():
             return False
         if self.command == "POST" and not self._check_csrf():
             return False
         return True
+
+    def _is_healthz(self):
+        return self.command == "GET" and urlparse(self.path).path == "/healthz"
 
     def _authorize(self):
         """HTTP Basic auth, only enforced when both DASHBOARD_USER and
@@ -5973,6 +5981,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+
+        if parsed.path == "/healthz":
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
 
         qs = parse_qs(parsed.query)
         if parsed.path == "/api/status":

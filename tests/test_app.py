@@ -7300,6 +7300,72 @@ class AddUrlValidatorIntegrationTest(unittest.TestCase):
 
         result = self._post("/remove", {"key": odd_url})
         self.assertEqual(result.get("msg"), "Removed: Legacy")
+
+
+class HealthzEndpointTest(_DashboardServerTestBase):
+    """/healthz backs the anime-web compose HEALTHCHECK: it must reach 200
+    with no credentials even when Basic Auth is enabled, and must not leak
+    data or touch the Docker socket/disk beyond the static response."""
+
+    def setUp(self):
+        super().setUp()
+        app.DASHBOARD_USER = "tester"
+        app.DASHBOARD_PASS = "s3cret-pw"
+        app.AUTH_ENABLED = True
+
+    def test_200_with_no_credentials(self):
+        status, _, body = self._request("GET", "/healthz")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"ok")
+
+    def test_no_www_authenticate_challenge(self):
+        _, headers, _ = self._request("GET", "/healthz")
+        self.assertIsNone(headers.get("WWW-Authenticate"))
+
+    def test_body_reveals_no_status_data(self):
+        _, _, body = self._request("GET", "/healthz")
+        text = body.decode("utf-8")
+        for leaky in ("bot_status", "run_history", "health", "<html", "<!DOCTYPE"):
+            self.assertNotIn(leaky, text)
+
+    def test_post_not_exempt_still_requires_auth(self):
+        # The exemption is GET-only and path-scoped — a POST to /healthz
+        # must still hit the normal auth gate, not silently bypass it.
+        status, _, _ = self._request("POST", "/healthz")
+        self.assertEqual(status, 401)
+
+
+class HealthzGateCoverageTest(_DashboardServerTestBase):
+    """Proves the /healthz exemption is narrow: the auth gate still covers
+    every other route, both when auth is enabled and disabled."""
+
+    def test_root_still_requires_auth(self):
+        app.DASHBOARD_USER = "tester"
+        app.DASHBOARD_PASS = "s3cret-pw"
+        app.AUTH_ENABLED = True
+        status, _, _ = self._request("GET", "/")
+        self.assertEqual(status, 401)
+
+    def test_api_status_still_requires_auth(self):
+        app.DASHBOARD_USER = "tester"
+        app.DASHBOARD_PASS = "s3cret-pw"
+        app.AUTH_ENABLED = True
+        status, _, _ = self._request("GET", "/api/status")
+        self.assertEqual(status, 401)
+
+    def test_api_status_200_with_correct_creds(self):
+        app.DASHBOARD_USER = "tester"
+        app.DASHBOARD_PASS = "s3cret-pw"
+        app.AUTH_ENABLED = True
+        token = base64.b64encode(b"tester:s3cret-pw").decode("ascii")
+        status, _, _ = self._request(
+            "GET", "/api/status", headers={"Authorization": "Basic " + token})
+        self.assertEqual(status, 200)
+
+    def test_healthz_200_regardless_of_auth_state(self):
+        app.AUTH_ENABLED = False
+        status, _, _ = self._request("GET", "/healthz")
+        self.assertEqual(status, 200)
         self.assertEqual(app.load_ani()["anime"], [])
 
 

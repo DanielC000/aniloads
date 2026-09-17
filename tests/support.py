@@ -31,6 +31,7 @@ _animeloads_cache = None
 _anistore_cache = None
 _notify_cache = None
 _config_defaults_cache = None
+_healthcheck_cache = None
 
 
 def _load_from_path(name, path):
@@ -79,6 +80,17 @@ def load_config_defaults():
         _config_defaults_cache = _load_from_path(
             "aniloads_config_defaults", os.path.join(_BOT_DIR, "config_defaults.py"))
     return _config_defaults_cache
+
+
+def load_healthcheck():
+    """Import bot/healthcheck.py once. Stdlib only — no stubs needed."""
+    global _healthcheck_cache
+    if _healthcheck_cache is None:
+        if _BOT_DIR not in sys.path:
+            sys.path.insert(0, _BOT_DIR)
+        _healthcheck_cache = _load_from_path(
+            "aniloads_healthcheck", os.path.join(_BOT_DIR, "healthcheck.py"))
+    return _healthcheck_cache
 
 
 def _install_anibot_stubs():

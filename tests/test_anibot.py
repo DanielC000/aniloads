@@ -199,6 +199,92 @@ class WriteRunStateTest(unittest.TestCase):
                          {"kind", "anime", "episodes"})
 
 
+class WriteLoginStateTest(unittest.TestCase):
+    """The bot records the anime-loads.org login outcome as an additive
+    top-level `login` key in run_state.json, independent of per-cycle
+    last_run/runs records — login happens once at startup, not per cycle."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-loginstate-")
+        self._orig_botfile = anibot.botfile
+        anibot.botfile = os.path.join(self.tmp, "ani.json")
+        self.path = os.path.join(self.tmp, "run_state.json")
+
+    def tearDown(self):
+        anibot.botfile = self._orig_botfile
+
+    def _read(self):
+        with open(self.path, "r") as f:
+            return json.load(f)
+
+    def test_successful_login_recorded(self):
+        anibot.write_login_state(True, True, vip=True)
+        login = self._read()["login"]
+        self.assertEqual(login["user_configured"], True)
+        self.assertEqual(login["ok"], True)
+        self.assertEqual(login["vip"], True)
+        self.assertIn("checked_ts", login)
+        self.assertNotIn("error", login)
+
+    def test_failed_login_records_error_no_credentials(self):
+        anibot.write_login_state(True, False, error="Login data is invalid")
+        login = self._read()["login"]
+        self.assertEqual(login["user_configured"], True)
+        self.assertEqual(login["ok"], False)
+        self.assertEqual(login["error"], "Login data is invalid")
+        # Never a username/password field, only the generic error string.
+        self.assertNotIn("user", login)
+        self.assertNotIn("password", login)
+
+    def test_anonymous_run_recorded_as_not_configured(self):
+        anibot.write_login_state(False, False)
+        login = self._read()["login"]
+        self.assertEqual(login["user_configured"], False)
+        self.assertEqual(login["ok"], False)
+
+    def test_additive_alongside_existing_run_history(self):
+        anibot.write_run_state("2026-06-13T19:00:00Z", "2026-06-13T19:01:00Z", 600, {"checked": 1})
+        anibot.write_login_state(True, True)
+        state = self._read()
+        self.assertIn("last_run", state)
+        self.assertIn("login", state)
+        self.assertEqual(state["last_run"]["counts"]["checked"], 1)
+
+    def test_login_state_preserved_across_later_run_state_writes(self):
+        anibot.write_login_state(True, True)
+        anibot.write_run_state("2026-06-13T19:00:00Z", "2026-06-13T19:01:00Z", 600, {"checked": 1})
+        state = self._read()
+        self.assertEqual(state["login"]["ok"], True)
+
+    def test_later_login_attempt_overwrites_earlier_one(self):
+        anibot.write_login_state(True, False, error="Login data is invalid")
+        anibot.write_login_state(True, True)
+        login = self._read()["login"]
+        self.assertEqual(login["ok"], True)
+        self.assertNotIn("error", login)
+
+    def test_error_message_truncated_at_200_chars(self):
+        anibot.write_login_state(True, False, error="x" * 500)
+        self.assertEqual(len(self._read()["login"]["error"]), 200)
+
+    def test_corrupt_existing_file_is_replaced_not_fatal(self):
+        with open(self.path, "w") as f:
+            f.write("{not valid json")
+        anibot.write_login_state(True, True)
+        self.assertEqual(self._read()["login"]["ok"], True)
+
+    def test_never_raises_on_unwritable_path(self):
+        anibot.botfile = os.path.join(self.tmp, "nonexistent", "deeply", "ani.json")
+        # os.makedirs on a nested missing dir succeeds, so force a genuine
+        # write failure instead: point at a directory that already exists as
+        # a file, which os.replace/open cannot write through.
+        blocker = os.path.join(self.tmp, "blocked")
+        with open(blocker, "w") as f:
+            f.write("x")
+        anibot.botfile = os.path.join(blocker, "ani.json")
+        anibot.write_login_state(True, True)  # must not raise
+
+
 class FakePushbullet:
     """Stands in for pushbullet.Pushbullet: the real constructor validates
     the key over the network, which is exactly the failure mode under test."""

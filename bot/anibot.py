@@ -369,6 +369,8 @@ def write_run_state(started_ts, finished_ts, timedelay, counts, events=None):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 prev = json.load(f)
+            if not isinstance(prev, dict):
+                prev = {}
             runs = prev.get("runs")
             if not isinstance(runs, list):
                 runs = []
@@ -378,11 +380,61 @@ def write_run_state(started_ts, finished_ts, timedelay, counts, events=None):
         # whole write, without swallowing an unrelated bug as if it were a
         # corrupt file.
         except (FileNotFoundError, OSError, ValueError):
+            prev = {}
             runs = []
         runs.append(record)
         if len(runs) > RUN_STATE_HISTORY_MAX:
             runs = runs[-RUN_STATE_HISTORY_MAX:]
         state = {"schema": 1, "last_run": record, "runs": runs}
+        # `login` is an independent top-level key (write_login_state) written
+        # once per bot startup rather than once per cycle — preserve it across
+        # every per-cycle rewrite instead of silently dropping it.
+        if "login" in prev:
+            state["login"] = prev["login"]
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        # Run-state bookkeeping is never allowed to take down the bot loop.
+        pass
+
+def write_login_state(user_configured, ok, error=None, vip=None):
+    """Persist the anime-loads.org login outcome as a top-level `login` key in
+    run_state.json, alongside (not inside) the per-cycle `last_run`/`runs`
+    records write_run_state maintains — login happens once at bot startup, not
+    once per cycle, so it survives until the next login attempt overwrites it.
+
+    Additive: existing readers that only look at `last_run`/`runs` are
+    unaffected, and a reader must tolerate this key's absence (e.g. an older
+    run_state.json, or one written before the first login attempt completes).
+
+    Best-effort like write_run_state: a write failure must never break the bot
+    loop. Never pass a credential or username — `user_configured` is a plain
+    bool and `error` must stay a generic, non-identifying message."""
+    try:
+        record = {
+            "user_configured": bool(user_configured),
+            "ok": bool(ok),
+            "checked_ts": _utcnow_iso(),
+        }
+        if vip is not None:
+            record["vip"] = bool(vip)
+        if error:
+            record["error"] = str(error)[:200]
+        path = _run_state_path()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            if not isinstance(state, dict):
+                state = {}
+        except (FileNotFoundError, OSError, ValueError):
+            state = {}
+        state.setdefault("schema", 1)
+        state["login"] = record
         d = os.path.dirname(path)
         if d:
             os.makedirs(d, exist_ok=True)
@@ -1101,19 +1153,25 @@ def startbot():
             password = getpass("Passwort: ")
             try:
                 al.login(user, password)
-            except:
+                write_login_state(True, True, vip=al.isVIP)
+            except Exception as e:
                 print("Fehlerhafte Anmeldedaten, fahre mit anonymen Account fort")
+                write_login_state(True, False, error=str(e))
         else:
             print("Überspringe Anmeldung")
+            write_login_state(False, False)
     else:
         if(al_user is not None and al_pass is not None):
             try:
                 al.login(al_user, al_pass)
                 _log.info("Erfolgreich bei Anime-Loads angemeldet")
-            except:
+                write_login_state(True, True, vip=al.isVIP)
+            except Exception as e:
                 _log.warning("Fehlerhafte Anmeldedaten, fahre mit anonymen Account fort")
+                write_login_state(True, False, error=str(e))
         else:
             _log.info("Keine Anmeldedaten für Anime-Loads hinterlegt, fahre mit anonymen Account fort")
+            write_login_state(False, False)
 
     if(jdhost == "" and myjd_pass == ""):
         if(interactive == False):

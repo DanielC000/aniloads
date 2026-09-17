@@ -63,6 +63,18 @@ class TVDBClient:
             return True
         return self._login()
 
+    def check_health(self):
+        """Verify the configured API key actually authenticates, not just that
+        it is non-empty (that's what `available` means). Reuses the 29-day
+        token cache — only hits the network when no valid token is cached.
+        Returns (ok, detail); callers that poll this on a schedule should add
+        their own TTL, since this method has none of its own."""
+        if not self.api_key:
+            return False, "No TVDB_API_KEY configured"
+        if self._ensure_token():
+            return True, "Token valid"
+        return False, "TVDB login failed — check TVDB_API_KEY"
+
     def _get(self, path):
         if not self._ensure_token():
             return None

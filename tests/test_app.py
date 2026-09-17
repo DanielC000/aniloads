@@ -1,5 +1,6 @@
 """Tests for the pure-logic functions in web/app.py."""
 
+import collections
 import contextlib
 import html
 import json
@@ -8,6 +9,7 @@ import shutil
 import tempfile
 import threading
 import time
+import types
 import unittest
 import zoneinfo
 from datetime import date, datetime, timedelta, timezone
@@ -1641,6 +1643,23 @@ class AniJsonCorruptTest(unittest.TestCase):
         self.assertIn("status-err", html_out)
         self.assertIn("corrupt", html_out.lower())
 
+    def test_api_status_degrades_jdownloader_row_instead_of_500(self):
+        # /api/status's JDownloader check reads ani.json for the configured
+        # jdhost — a corrupt file must degrade that one row to "unknown"
+        # rather than raising CorruptStoreError out of the whole endpoint.
+        h = app.Handler.__new__(app.Handler)
+        h.path = "/api/status"
+        captured = {}
+        h.send_response = lambda code: captured.__setitem__("code", code)
+        h.send_header = lambda *a: None
+        h.end_headers = lambda: None
+        h.wfile = types.SimpleNamespace(write=lambda b: captured.__setitem__("body", b))
+        h.do_GET()
+        self.assertEqual(captured["code"], 200)
+        payload = json.loads(captured["body"].decode("utf-8"))
+        self.assertIn("ani.json unreadable", payload["health"])
+        self.assertIn("Unknown", payload["health"])
+
 
 class ParseBotLogsBranchesTest(unittest.TestCase):
     """Coverage for parse_bot_logs branches beyond the BUG-3 standalone cases:
@@ -2612,6 +2631,397 @@ class ApplyResolvedPendingTest(unittest.TestCase):
         app.apply_resolved_pending(data, resolved)
         self.assertEqual([e["url"] for e in data["pending"]], ["https://x/b"])
         self.assertTrue(data["pending"][0]["no_match"])
+
+
+class CachedHealthTest(unittest.TestCase):
+    """_cached_health must not re-run `compute` (a network probe) inside the
+    TTL window, and must recompute once it expires."""
+
+    def setUp(self):
+        self._orig_cache = dict(app._HEALTH_CACHE)
+        app._HEALTH_CACHE.clear()
+
+    def tearDown(self):
+        app._HEALTH_CACHE.clear()
+        app._HEALTH_CACHE.update(self._orig_cache)
+
+    def test_result_reused_within_ttl(self):
+        calls = []
+
+        def compute():
+            calls.append(1)
+            return {"state": "ok"}
+
+        first = app._cached_health("k1", 1000, compute)
+        second = app._cached_health("k1", 1000, compute)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(first, second)
+
+    def test_recomputed_once_ttl_elapsed(self):
+        calls = []
+
+        def compute():
+            calls.append(1)
+            return {"state": "ok"}
+
+        # ttl=0: "elapsed < ttl" is never true, so every call recomputes —
+        # exercises expiry without a real sleep.
+        app._cached_health("k2", 0, compute)
+        app._cached_health("k2", 0, compute)
+        self.assertEqual(len(calls), 2)
+
+    def test_distinct_keys_cached_independently(self):
+        calls = {"a": 0, "b": 0}
+        app._cached_health("a", 1000, lambda: calls.__setitem__("a", calls["a"] + 1) or {"state": "ok"})
+        app._cached_health("b", 1000, lambda: calls.__setitem__("b", calls["b"] + 1) or {"state": "ok"})
+        app._cached_health("a", 1000, lambda: calls.__setitem__("a", calls["a"] + 1) or {"state": "ok"})
+        self.assertEqual(calls["a"], 1)
+        self.assertEqual(calls["b"], 1)
+
+
+class CheckJdownloaderHealthTest(unittest.TestCase):
+    """JDownloader reachability: a plain TCP probe of the configured local
+    jdhost's CNL port, stubbed here so no real network call is ever made."""
+
+    def setUp(self):
+        app._HEALTH_CACHE.clear()
+        fd, self._path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self._orig_ani = app.ANI_JSON
+        app.ANI_JSON = self._path
+        self._orig_connect = app.socket.create_connection
+
+    def tearDown(self):
+        app.ANI_JSON = self._orig_ani
+        app.socket.create_connection = self._orig_connect
+        app._HEALTH_CACHE.clear()
+        try:
+            os.remove(self._path)
+        except OSError:
+            pass
+
+    def _write_ani(self, settings):
+        with open(self._path, "w", encoding="utf-8") as f:
+            json.dump({"settings": settings, "anime": []}, f)
+
+    def test_no_jdhost_configured_is_unknown(self):
+        self._write_ani({})
+        result = app.check_jdownloader_health()
+        self.assertEqual(result["state"], "unknown")
+        self.assertIn("hint", result)
+
+    def test_reachable_host_is_ok(self):
+        self._write_ani({"jdhost": "127.0.0.1"})
+
+        class FakeSock:
+            def close(self):
+                pass
+
+        app.socket.create_connection = lambda addr, timeout=None: FakeSock()
+        result = app.check_jdownloader_health()
+        self.assertEqual(result["state"], "ok")
+        self.assertNotIn("hint", result)
+
+    def test_unreachable_host_is_fail_with_hint(self):
+        self._write_ani({"jdhost": "127.0.0.1"})
+
+        def raise_refused(addr, timeout=None):
+            raise OSError("Connection refused")
+
+        app.socket.create_connection = raise_refused
+        result = app.check_jdownloader_health()
+        self.assertEqual(result["state"], "fail")
+        self.assertIn("hint", result)
+        # The failure detail may echo the OSError text but never a credential.
+        self.assertNotIn("password", result["detail"].lower())
+
+    def test_result_cached_across_calls(self):
+        self._write_ani({"jdhost": "127.0.0.1"})
+        calls = []
+
+        def fake_connect(addr, timeout=None):
+            calls.append(addr)
+            raise OSError("refused")
+
+        app.socket.create_connection = fake_connect
+        app.check_jdownloader_health()
+        app.check_jdownloader_health()
+        self.assertEqual(len(calls), 1)
+
+
+class CheckTvdbHealthTest(unittest.TestCase):
+    """TVDB health must distinguish "no key" (unknown) from "key present but
+    invalid/unreachable" (fail) — `tvdb.available` alone only means non-empty."""
+
+    def setUp(self):
+        app._HEALTH_CACHE.clear()
+        self._orig_available = app.tvdb.available
+        self._orig_check = app.tvdb.check_health
+
+    def tearDown(self):
+        app.tvdb.available = self._orig_available
+        app.tvdb.check_health = self._orig_check
+        app._HEALTH_CACHE.clear()
+
+    def test_no_key_is_unknown(self):
+        app.tvdb.available = False
+        result = app.check_tvdb_health()
+        self.assertEqual(result["state"], "unknown")
+
+    def test_valid_key_is_ok(self):
+        app.tvdb.available = True
+        app.tvdb.check_health = lambda: (True, "Token valid")
+        result = app.check_tvdb_health()
+        self.assertEqual(result["state"], "ok")
+        self.assertNotIn("hint", result)
+
+    def test_invalid_key_is_fail_with_hint(self):
+        app.tvdb.available = True
+        app.tvdb.check_health = lambda: (False, "TVDB login failed — check TVDB_API_KEY")
+        result = app.check_tvdb_health()
+        self.assertEqual(result["state"], "fail")
+        self.assertIn("hint", result)
+
+    def test_result_cached_across_calls(self):
+        app.tvdb.available = True
+        calls = []
+        app.tvdb.check_health = lambda: (calls.append(1), (True, "Token valid"))[1]
+        app.check_tvdb_health()
+        app.check_tvdb_health()
+        self.assertEqual(len(calls), 1)
+
+
+class CheckDiskHealthTest(unittest.TestCase):
+    """Disk health thresholds off (free GB, free %), for both watched dirs."""
+
+    def setUp(self):
+        app._HEALTH_CACHE.clear()
+        self._orig_media = app.MEDIA_DIR
+        self._orig_dl = app.DOWNLOAD_DIR
+        self._orig_disk_usage = app.shutil.disk_usage
+
+    def tearDown(self):
+        app.MEDIA_DIR = self._orig_media
+        app.DOWNLOAD_DIR = self._orig_dl
+        app.shutil.disk_usage = self._orig_disk_usage
+        app._HEALTH_CACHE.clear()
+
+    def _fake_usage(self, total_gb, free_gb):
+        usage = collections.namedtuple("usage", "total used free")
+        total = int(total_gb * 1024 ** 3)
+        free = int(free_gb * 1024 ** 3)
+        return usage(total=total, used=total - free, free=free)
+
+    def test_plenty_of_space_is_ok(self):
+        app.shutil.disk_usage = lambda path: self._fake_usage(500, 400)
+        result = app.check_disk_health()
+        self.assertEqual(result["state"], "ok")
+        self.assertNotIn("hint", result)
+
+    def test_low_space_is_warn(self):
+        # 8 GB free of 200 GB (4%) trips the GB threshold but not the %
+        # threshold — must land on warn, not fail.
+        app.shutil.disk_usage = lambda path: self._fake_usage(200, 8)
+        result = app.check_disk_health()
+        self.assertEqual(result["state"], "warn")
+        self.assertIn("hint", result)
+
+    def test_critical_space_is_fail(self):
+        app.shutil.disk_usage = lambda path: self._fake_usage(500, 1)
+        result = app.check_disk_health()
+        self.assertEqual(result["state"], "fail")
+        self.assertIn("hint", result)
+
+    def test_worst_of_the_two_dirs_wins(self):
+        def fake_usage(path):
+            if path == app.MEDIA_DIR:
+                return self._fake_usage(500, 400)  # plenty
+            return self._fake_usage(500, 1)  # critical
+
+        app.shutil.disk_usage = fake_usage
+        result = app.check_disk_health()
+        self.assertEqual(result["state"], "fail")
+
+    def test_missing_mount_is_unknown(self):
+        def raise_missing(path):
+            raise OSError("No such file or directory")
+
+        app.shutil.disk_usage = raise_missing
+        result = app.check_disk_health()
+        self.assertEqual(result["state"], "unknown")
+
+    def test_result_cached_across_calls(self):
+        calls = []
+
+        def fake_usage(path):
+            calls.append(path)
+            return self._fake_usage(500, 400)
+
+        app.shutil.disk_usage = fake_usage
+        app.check_disk_health()
+        app.check_disk_health()
+        # Two dirs checked per probe, but the probe itself must run only once.
+        self.assertEqual(len(calls), 2)
+
+
+class CheckLoginHealthTest(unittest.TestCase):
+    """Site-login health reads the bot-written `login` run_state key —
+    absent, anonymous, ok, and failed."""
+
+    def test_absent_key_is_unknown(self):
+        result = app.check_login_health({})
+        self.assertEqual(result["state"], "unknown")
+
+    def test_not_configured_is_warn(self):
+        result = app.check_login_health({"login": {"user_configured": False, "ok": False}})
+        self.assertEqual(result["state"], "warn")
+        self.assertIn("hint", result)
+
+    def test_configured_and_ok_is_ok(self):
+        result = app.check_login_health({"login": {"user_configured": True, "ok": True}})
+        self.assertEqual(result["state"], "ok")
+        self.assertNotIn("hint", result)
+
+    def test_vip_shown_in_detail(self):
+        result = app.check_login_health(
+            {"login": {"user_configured": True, "ok": True, "vip": True}})
+        self.assertIn("VIP", result["detail"])
+
+    def test_configured_and_failed_is_fail(self):
+        result = app.check_login_health(
+            {"login": {"user_configured": True, "ok": False, "error": "Login data is invalid"}})
+        self.assertEqual(result["state"], "fail")
+        self.assertIn("Login data is invalid", result["detail"])
+        self.assertIn("hint", result)
+
+
+class CheckBotStalenessTest(unittest.TestCase):
+    """Bot-cycle staleness: warn once a cycle is well overdue relative to its
+    own configured interval."""
+
+    def setUp(self):
+        self._orig_now = app._utc_now
+
+    def tearDown(self):
+        app._utc_now = self._orig_now
+
+    def test_no_last_run_is_unknown(self):
+        result = app.check_bot_staleness({})
+        self.assertEqual(result["state"], "unknown")
+
+    def test_recent_cycle_is_ok(self):
+        app._utc_now = lambda: datetime(2026, 6, 13, 19, 25, 0)
+        result = app.check_bot_staleness({
+            "last_run": {"finished_ts": "2026-06-13T19:20:00Z", "timedelay": 600},
+        })
+        self.assertEqual(result["state"], "ok")
+
+    def test_overdue_cycle_is_warn(self):
+        # timedelay=600 (10 min) → threshold is 20 min; 45 min elapsed is stale.
+        app._utc_now = lambda: datetime(2026, 6, 13, 20, 5, 0)
+        result = app.check_bot_staleness({
+            "last_run": {"finished_ts": "2026-06-13T19:20:00Z", "timedelay": 600},
+        })
+        self.assertEqual(result["state"], "warn")
+        self.assertIn("hint", result)
+
+
+class RenderHealthCardTest(unittest.TestCase):
+    """render_health_card: badge per state, hint only on non-ok rows, and
+    output is HTML-escaped (never renders a credential either way)."""
+
+    def setUp(self):
+        self._orig_get_health = app.get_health
+
+    def tearDown(self):
+        app.get_health = self._orig_get_health
+
+    def test_ok_row_has_no_hint(self):
+        app.get_health = lambda: [("Site Login", {"state": "ok", "detail": "Logged in"})]
+        out = app.render_health_card()
+        self.assertIn("badge-ok", out)
+        self.assertIn("Logged in", out)
+        self.assertNotIn("hint", out)
+
+    def test_fail_row_renders_hint(self):
+        app.get_health = lambda: [
+            ("JDownloader", {"state": "fail", "detail": "Unreachable", "hint": "Check the host."})
+        ]
+        out = app.render_health_card()
+        self.assertIn("badge-danger", out)
+        self.assertIn("Check the host.", out)
+
+    def test_warn_and_unknown_badges(self):
+        app.get_health = lambda: [
+            ("Disk Space", {"state": "warn", "detail": "low"}),
+            ("TVDB", {"state": "unknown", "detail": "no key"}),
+        ]
+        out = app.render_health_card()
+        self.assertIn("badge-warn", out)
+        self.assertIn("badge-neutral", out)
+
+    def test_detail_and_hint_are_escaped(self):
+        app.get_health = lambda: [
+            ("X", {"state": "fail", "detail": "<script>bad</script>", "hint": "<b>hint</b>"}),
+        ]
+        out = app.render_health_card()
+        self.assertNotIn("<script>", out)
+        self.assertNotIn("<b>hint</b>", out)
+
+
+class GetHealthDefaultStateTest(unittest.TestCase):
+    """With no ani.json/run_state/TVDB key present, get_health must return one
+    row per check without touching the network (jdhost/TVDB key both absent
+    → unknown, no probe attempted)."""
+
+    def setUp(self):
+        fd, self._path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        os.remove(self._path)  # load_ani() must tolerate a missing file too
+        self._orig_ani = app.ANI_JSON
+        self._orig_rs = app.RUN_STATE_FILE
+        self._orig_tvdb_available = app.tvdb.available
+        app.ANI_JSON = self._path
+        app.RUN_STATE_FILE = os.path.join(tempfile.gettempdir(), "aniloads-no-health-run-state.json")
+        app.tvdb.available = False
+        app._HEALTH_CACHE.clear()
+
+    def tearDown(self):
+        app.ANI_JSON = self._orig_ani
+        app.RUN_STATE_FILE = self._orig_rs
+        app.tvdb.available = self._orig_tvdb_available
+        app._HEALTH_CACHE.clear()
+
+    def test_five_rows_returned(self):
+        rows = app.get_health()
+        labels = [label for label, _ in rows]
+        self.assertEqual(labels, ["Site Login", "JDownloader", "TVDB", "Disk Space", "Bot Cycles"])
+        for _label, result in rows:
+            self.assertIn(result["state"], {"ok", "warn", "fail", "unknown"})
+
+
+class GetHealthResilientToRaisingCheckTest(unittest.TestCase):
+    """A single check raising must degrade only that row to "unknown" — the
+    other rows still render instead of the whole card/poll breaking."""
+
+    def setUp(self):
+        self._orig_tvdb_check = app.check_tvdb_health
+
+    def tearDown(self):
+        app.check_tvdb_health = self._orig_tvdb_check
+
+    def test_other_rows_still_render_when_one_check_raises(self):
+        def boom():
+            raise RuntimeError("boom")
+        app.check_tvdb_health = boom
+        rows = app.get_health()
+        labels = [label for label, _ in rows]
+        self.assertEqual(labels, ["Site Login", "JDownloader", "TVDB", "Disk Space", "Bot Cycles"])
+        by_label = dict(rows)
+        self.assertEqual(by_label["TVDB"]["state"], "unknown")
+        self.assertIn("boom", by_label["TVDB"]["detail"])
+        # The rest are unaffected by TVDB's failure.
+        self.assertIn(by_label["Disk Space"]["state"], {"ok", "warn", "fail", "unknown"})
 
 
 if __name__ == "__main__":

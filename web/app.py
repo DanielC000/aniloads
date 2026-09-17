@@ -740,6 +740,239 @@ def save_prefs(prefs):
         json.dump(prefs, f, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# Health panel — JDownloader / TVDB / site login / disk / bot staleness.
+#
+# The dashboard polls /api/status every 10s (see the refresh() script below),
+# so a naive per-poll network probe would hammer JDownloader/TVDB constantly.
+# Each network-touching check is memoized in _HEALTH_CACHE for its own TTL;
+# the login/staleness checks are free (pure reads of already-loaded state) and
+# skip the cache entirely.
+# ---------------------------------------------------------------------------
+
+JD_HEALTH_PORT = 9666  # JDownloader's Flashgot/CNL interface (see bot/animeloads.py utils.addToJD)
+JD_HEALTH_TIMEOUT = float(os.environ.get("JD_HEALTH_TIMEOUT", "2"))
+JD_HEALTH_CACHE_SECONDS = int(os.environ.get("JD_HEALTH_CACHE_SECONDS", "60"))
+DISK_HEALTH_CACHE_SECONDS = int(os.environ.get("DISK_HEALTH_CACHE_SECONDS", "60"))
+TVDB_HEALTH_CACHE_SECONDS = int(os.environ.get("TVDB_HEALTH_CACHE_SECONDS", "600"))
+
+_health_cache_lock = threading.Lock()
+_HEALTH_CACHE = {}  # key -> (time.monotonic() at check, result dict)
+
+
+def _cached_health(key, ttl, compute):
+    """Memoize a health probe for ttl seconds so the 10s dashboard poll never
+    re-triggers a network call on every request. `compute` must be side-effect
+    free beyond its own probe and must not raise."""
+    now = time.monotonic()
+    with _health_cache_lock:
+        cached = _HEALTH_CACHE.get(key)
+        if cached and now - cached[0] < ttl:
+            return cached[1]
+    result = compute()
+    with _health_cache_lock:
+        _HEALTH_CACHE[key] = (now, result)
+    return result
+
+
+def check_jdownloader_health():
+    """Reachability probe for the configured local JDownloader host, against
+    its CNL/Flashgot port — a plain TCP connect, so it never triggers JD's own
+    add-link handling. A MyJDownloader-only setup (no local jdhost) has
+    nothing to probe here, so it reads as unknown rather than failed."""
+    def compute():
+        try:
+            jdhost = (load_ani().get("settings") or {}).get("jdhost")
+        except anistore.CorruptStoreError:
+            return {"state": "unknown", "detail": "ani.json unreadable"}
+        if not jdhost:
+            return {
+                "state": "unknown",
+                "detail": "No local JDownloader host configured",
+                "hint": "Using MyJDownloader? Verify its connection in the MyJDownloader web UI — "
+                        "this check only covers a local jdhost.",
+            }
+        try:
+            sock = socket.create_connection((jdhost, JD_HEALTH_PORT), timeout=JD_HEALTH_TIMEOUT)
+            sock.close()
+            return {"state": "ok", "detail": "JDownloader reachable"}
+        except OSError as e:
+            return {
+                "state": "fail",
+                "detail": "JDownloader unreachable: {}".format(e),
+                "hint": "Check JDownloader is running with its Click'n'Load interface enabled, "
+                        "then reload the dashboard.",
+            }
+    return _cached_health("jdownloader", JD_HEALTH_CACHE_SECONDS, compute)
+
+
+def check_tvdb_health():
+    """TVDB reachability: verifies the configured API key actually
+    authenticates (not just that it's non-empty, which is all `tvdb.available`
+    means)."""
+    def compute():
+        if not tvdb.available:
+            return {
+                "state": "unknown",
+                "detail": "No TVDB API key configured",
+                "hint": "Set TVDB_API_KEY in .env, then redeploy, for TVDB-assisted matching.",
+            }
+        ok, detail = tvdb.check_health()
+        if ok:
+            return {"state": "ok", "detail": detail}
+        return {
+            "state": "fail",
+            "detail": detail,
+            "hint": "Check TVDB_API_KEY is a valid TheTVDB v4 API key, then redeploy.",
+        }
+    return _cached_health("tvdb", TVDB_HEALTH_CACHE_SECONDS, compute)
+
+
+def _disk_row(label, path):
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        return {"label": label, "state": "unknown", "detail": "{}: not accessible".format(label)}
+    free_gb = usage.free / (1024 ** 3)
+    pct_free = (usage.free / usage.total * 100) if usage.total else 0
+    if free_gb < 2 or pct_free < 3:
+        state = "fail"
+    elif free_gb < 10 or pct_free < 8:
+        state = "warn"
+    else:
+        state = "ok"
+    return {
+        "label": label, "state": state,
+        "detail": "{}: {:.1f} GB free ({:.0f}%)".format(label, free_gb, pct_free),
+    }
+
+
+def check_disk_health():
+    """Free space on the media + download dirs. Warns well before "full" so
+    there's time to react — a JDownloader box that fills up silently stalls
+    every download with no per-episode error to explain why."""
+    def compute():
+        rows = [_disk_row("Media", MEDIA_DIR), _disk_row("Downloads", DOWNLOAD_DIR)]
+        order = {"fail": 3, "warn": 2, "unknown": 1, "ok": 0}
+        worst = max(rows, key=lambda r: order[r["state"]])
+        result = {"state": worst["state"], "detail": " · ".join(r["detail"] for r in rows)}
+        if worst["state"] == "fail":
+            result["hint"] = "Free up space on the affected volume — downloads will stall until then."
+        elif worst["state"] == "warn":
+            result["hint"] = "Disk space is getting low — plan to free up space soon."
+        return result
+    return _cached_health("disk", DISK_HEALTH_CACHE_SECONDS, compute)
+
+
+def check_login_health(run_state=None):
+    """Site login state, as last recorded by the bot at startup
+    (bot/anibot.py's write_login_state). Absent entirely on a run_state.json
+    that predates this feature, or before the bot's first login attempt."""
+    run_state = run_state if run_state is not None else load_run_state()
+    login = run_state.get("login") if isinstance(run_state, dict) else None
+    if not isinstance(login, dict):
+        return {"state": "unknown", "detail": "No login attempt recorded yet"}
+    if not login.get("user_configured"):
+        return {
+            "state": "warn",
+            "detail": "Running anonymously (no site credentials configured)",
+            "hint": "Set AL_USER and AL_PASS in .env, then redeploy, for full access to multi-episode releases.",
+        }
+    if login.get("ok"):
+        detail = "Logged in"
+        if login.get("vip"):
+            detail += " (VIP)"
+        return {"state": "ok", "detail": detail}
+    return {
+        "state": "fail",
+        "detail": "Login failed: {}".format(login.get("error") or "unknown error"),
+        "hint": "Check AL_USER/AL_PASS are correct, then redeploy. Until then the bot runs anonymously "
+                "and multi-episode fetches will keep erroring with \"Login required\".",
+    }
+
+
+def check_bot_staleness(run_state=None):
+    """Warn when no cycle has finished in well over its own interval — the
+    bot container may be hung, crashed, or stuck retrying something."""
+    run_state = run_state if run_state is not None else load_run_state()
+    last = run_state.get("last_run") if isinstance(run_state, dict) else None
+    if not isinstance(last, dict):
+        return {"state": "unknown", "detail": "No completed cycle recorded yet"}
+    finished = _parse_state_ts(last.get("finished_ts"))
+    if finished is None:
+        return {"state": "unknown", "detail": "No completed cycle recorded yet"}
+    try:
+        delay = int(last.get("timedelay") or 0)
+    except (TypeError, ValueError):
+        delay = 0
+    elapsed = (_utc_now() - finished).total_seconds()
+    mins = max(int(elapsed // 60), 0)
+    threshold = max(delay, 60) * 2
+    if delay and elapsed > threshold:
+        return {
+            "state": "warn",
+            "detail": "No cycle finished in {} min (expected every ~{} min)".format(mins, delay // 60),
+            "hint": "Check the bot container is running — it may be hung or crash-looping.",
+        }
+    return {"state": "ok", "detail": "Last cycle finished {} min ago".format(mins)}
+
+
+def get_health():
+    """Assemble every health row. Cheap to call on every /api/status poll —
+    each row is either free (login/staleness) or backed by its own cache.
+
+    A single check raising (e.g. an unexpected error reaching a probed
+    service) must never blank the whole card or break the 10s poll — it
+    degrades that one row to "unknown" and the rest still render."""
+    run_state = load_run_state()
+    checks = [
+        ("Site Login", lambda: check_login_health(run_state)),
+        ("JDownloader", check_jdownloader_health),
+        ("TVDB", check_tvdb_health),
+        ("Disk Space", check_disk_health),
+        ("Bot Cycles", lambda: check_bot_staleness(run_state)),
+    ]
+    rows = []
+    for label, check in checks:
+        try:
+            rows.append((label, check()))
+        except Exception as e:
+            rows.append((label, {"state": "unknown", "detail": "Check failed: {}".format(e)}))
+    return rows
+
+
+_HEALTH_BADGE = {"ok": "badge-ok", "warn": "badge-warn", "fail": "badge-danger", "unknown": "badge-neutral"}
+_HEALTH_LABEL = {"ok": "OK", "warn": "Warn", "fail": "Fail", "unknown": "Unknown"}
+
+
+def render_health_card():
+    """Render the Health panel: one row per check, a status badge, and (for
+    anything not ok) a one-line actionable hint. Never renders a credential,
+    username, or raw host/port — only booleans, counts, and generic detail
+    strings."""
+    rows = []
+    for label, result in get_health():
+        state = result.get("state", "unknown")
+        badge_cls = _HEALTH_BADGE.get(state, "badge-neutral")
+        badge_label = _HEALTH_LABEL.get(state, "Unknown")
+        hint_html = ""
+        if state != "ok" and result.get("hint"):
+            hint_html = '<div class="hint">{}</div>'.format(escape(result["hint"]))
+        rows.append(
+            '<div class="health-row">'
+            '<div class="health-row-main">'
+            '<span class="health-label">{label}</span> '
+            '<span class="badge {badge_cls}">{badge_label}</span>'
+            '<span class="health-detail">{detail}</span>'
+            '</div>{hint}'
+            '</div>'.format(
+                label=escape(label), badge_cls=badge_cls, badge_label=badge_label,
+                detail=escape(result.get("detail", "")), hint=hint_html,
+            )
+        )
+    return '<div class="health-grid">{}</div>'.format("".join(rows))
+
+
 # Alias-tolerant language matching. Site labels are German ("Deutsch",
 # "Japanisch", "Englisch"); each pref maps to a set of substrings to look for.
 LANG_ALIASES = {
@@ -1528,6 +1761,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .status-dot.stopped { background: #d9534f; }
   .status-dot.unknown { background: var(--text-faint); }
 
+  /* Health panel */
+  .health-grid { display: flex; flex-direction: column; gap: var(--s3); }
+  .health-row { padding: var(--s2) 0; border-bottom: 1px solid var(--border); }
+  .health-row:last-child { border-bottom: none; padding-bottom: 0; }
+  .health-row-main { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; }
+  .health-label { font-weight: 600; font-size: var(--fs-sm); min-width: 110px; }
+  .health-detail { color: var(--text-muted); font-size: var(--fs-sm); }
+
   /* Run / move history feed */
   .run-entry { padding: var(--s3) 0; border-bottom: 1px solid var(--border); }
   .run-entry:last-child { border-bottom: none; }
@@ -1623,6 +1864,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </form>
       </div>
     </div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Health</h2>
+  <div class="card" id="health">
+    %%HEALTH%%
   </div>
 </div>
 
@@ -1750,7 +1998,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 <script>
 (function() {
-  var ids = ['bot-status','last-run','next-run','run-history',
+  var ids = ['bot-status','last-run','next-run','run-history','health',
              'move-status','move-last-run','move-history','move-stuck'];
   function refresh() {
     fetch('/api/status')
@@ -2838,6 +3086,8 @@ def render_page(status="", search_html="", prefs_open=False, ani_data=None):
     move_history_html = render_move_history()
     move_stuck_html = render_move_stuck()
 
+    health_html = render_health_card()
+
     lang_names = {"german": "German", "japanese": "Japanese", "english": "English", "any": "Any"}
     audio_pref = prefs.get("audio_language", "german")
     sub_pref = prefs.get("sub_language", "any")
@@ -2850,6 +3100,7 @@ def render_page(status="", search_html="", prefs_open=False, ani_data=None):
     page = page.replace("%%LAST_RUN%%", last_run_html)
     page = page.replace("%%NEXT_RUN%%", next_run_html)
     page = page.replace("%%RUN_HISTORY%%", history_html)
+    page = page.replace("%%HEALTH%%", health_html)
     page = page.replace("%%MOVE_STATUS%%", move_status_html)
     page = page.replace("%%MOVE_LAST_RUN%%", move_last_html)
     page = page.replace("%%MOVE_HISTORY%%", move_history_html)
@@ -2925,11 +3176,13 @@ class Handler(BaseHTTPRequestHandler):
             move_status_html, move_last_html = render_move_status()
             move_history_html = render_move_history()
             move_stuck_html = render_move_stuck()
+            health_html = render_health_card()
             payload = json.dumps({
                 "bot_status": bot_status_html,
                 "last_run": last_run_html,
                 "next_run": next_run_html,
                 "run_history": history_html,
+                "health": health_html,
                 "move_status": move_status_html,
                 "move_last_run": move_last_html,
                 "move_history": move_history_html,

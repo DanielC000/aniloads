@@ -6244,6 +6244,20 @@ class WatchlistFilterTest(unittest.TestCase):
         self.assertNotIn('data-filter="pending"', solo)
         self.assertEqual(app.render_watchlist_controls([], []), "")
 
+    def test_movies_chip_counts_movie_cards_only(self):
+        movie_retry = {"name": "M2", "url": "https://x/m2", "media_type": "movie", "missing": [1]}
+        entries = self.ENTRIES + [movie_retry]
+        out = app.render_watchlist_controls(entries)
+        self.assertIn('data-filter="movie" aria-pressed="false">Movies<span class="wl-chip-n">1</span>', out)
+        # a retrying movie counts as Retrying, not Movies
+        self.assertIn('data-filter="retrying" aria-pressed="false">Retrying<span class="wl-chip-n">2</span>', out)
+        cards = app.render_watchlist(entries)
+        self.assertEqual(cards.count('data-state="movie"'), 1)
+        # after Complete, before Paused
+        self.assertLess(out.index('data-filter="complete"'), out.index('data-filter="movie"'))
+        self.assertLess(out.index('data-filter="movie"'), out.index('data-filter="paused"'))
+        self.assertNotIn('data-filter="movie"', app.render_watchlist_controls([self.ENTRIES[3]]))
+
     def test_failed_resolve_still_counts_as_pending(self):
         pending = [{"name": "Stuck", "url": "https://x/s",
                     "resolve_error": {"reason": "site timed out", "ts": 1789600000}}]

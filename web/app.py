@@ -3741,8 +3741,8 @@ def render_entry_check(outcome, now=None):
 # Watchlist filter chips: (state, label). "pending" and "no-tvdb" are not
 # card states; the client matches them on the card kind and data-tvdb.
 _WL_FILTERS = (("all", "All"), ("airing", "Airing"), ("retrying", "Retrying"),
-               ("complete", "Complete"), ("paused", "Paused"),
-               ("pending", "Pending"), ("no-tvdb", "No TVDB"))
+               ("complete", "Complete"), ("movie", "Movies"),
+               ("paused", "Paused"), ("pending", "Pending"), ("no-tvdb", "No TVDB"))
 
 
 def watchlist_filter_state(entry, today=None):

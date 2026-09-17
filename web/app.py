@@ -2482,6 +2482,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   input[type=number].wl-num { width: 96px; padding: 6px 8px; margin: 0; min-height: 32px; font-size: var(--fs-xs); }
   .wl-prefs { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--s2) var(--s3); margin-bottom: var(--s1); }
   .wl-field { display: flex; flex-direction: column; gap: 2px; flex: 0 1 140px; font-size: var(--fs-xs); color: var(--text-muted); }
+  .wl-field-num { flex: 0 0 auto; }
   select.wl-select { width: 100%; padding: 6px 28px 6px 10px; margin: 0; min-height: 32px; font-size: var(--fs-xs); background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239aa3b2' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; }
   .flow-have { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s3); }
   .card .flow-have:not(:only-child) { margin-top: var(--s3); }
@@ -3937,6 +3938,48 @@ def parse_have_episodes(raw, cap=_MAX_SANE_EPISODE_COUNT):
     return value if value <= cap else None
 
 
+# Bounds for the manual library-placement fields. A season is a folder number
+# (S00 specials up to a year-style season); the offset shifts release episode
+# numbers onto library ones (release + offset = library, the same rule the
+# mover and the bot's batch matcher apply), so it never needs to exceed a
+# long-runner's absolute episode count.
+_MAX_LIBRARY_SEASON = 9999
+_MAX_EPISODE_OFFSET = 9999
+
+
+def parse_library_placement(params):
+    """The Edit panel's library season + episode offset fields as
+    ({"tvdb_season": int or None, "episode_offset": int}, error). A blank
+    season clears it (the mover keeps the file's own season); a blank offset
+    means 0."""
+    season_raw = str(params.get("tvdb_season", "")).strip()
+    offset_raw = str(params.get("episode_offset", "")).strip().replace("−", "-")
+    season = None
+    if season_raw:
+        if not re.fullmatch(r"\d{1,4}", season_raw):
+            return None, "season must be a whole number from 0 to {}".format(_MAX_LIBRARY_SEASON)
+        season = int(season_raw)
+    offset = 0
+    if offset_raw:
+        if not re.fullmatch(r"[+-]?\d{1,4}", offset_raw):
+            return None, "episode offset must be a whole number from -{0} to {0}".format(
+                _MAX_EPISODE_OFFSET)
+        offset = int(offset_raw)
+    return {"tvdb_season": season, "episode_offset": offset}, None
+
+
+def library_placement_note(value):
+    """Where the mover files this entry's downloads, in words, for the save
+    message."""
+    season = value.get("tvdb_season")
+    offset = value.get("episode_offset") or 0
+    where = ("files downloads into season {}".format(season) if season is not None
+             else "keeps the season from each file name")
+    shift = ("adds {:+d} to release episode numbers".format(offset) if offset
+             else "no episode offset")
+    return "the mover {}, {}".format(where, shift)
+
+
 def parse_entry_prefs(params):
     """The per-entry prefs form as {field: value-or-None}; None removes the
     override. Returns (prefs, error)."""
@@ -3961,8 +4004,8 @@ def apply_entry_edit(entry, edit, value):
     """Apply one validated dashboard edit to a watchlist entry, in place.
 
     ``edit`` is "episodes" (int), "paused" (bool), "prefs" (dict from
-    parse_entry_prefs) or "release" (a release id already confirmed against
-    the site). Pure local mutation, so it can run inside update_ani's lock.
+    parse_entry_prefs), "release" (a release id already confirmed against
+    the site) or "library" (dict from parse_library_placement). Pure local mutation, so it can run inside update_ani's lock.
     Returns (result, detail): result is "saved", "unchanged" or "invalid"."""
     if edit == "episodes":
         if not isinstance(value, int) or value < 0 or value > ep_add_max(entry):
@@ -4004,6 +4047,32 @@ def apply_entry_edit(entry, edit, value):
         # The available-episodes cap was measured on the old release.
         entry.pop("al_available_max", None)
         entry.pop("al_available_max_set_at", None)
+        return "saved", ""
+    if edit == "library":
+        # Stored exactly as /tvdb-link stores them: tvdb_season an int (0 is
+        # specials), episode_offset only when non-zero. Neither needs a
+        # tvdb_id; the bot's TVDB checks key off tvdb_id alone.
+        season = value.get("tvdb_season") if isinstance(value, dict) else None
+        offset = value.get("episode_offset") if isinstance(value, dict) else None
+        if season is not None and (not isinstance(season, int) or isinstance(season, bool)
+                                   or not 0 <= season <= _MAX_LIBRARY_SEASON):
+            return "invalid", "season must be a whole number from 0 to {}".format(
+                _MAX_LIBRARY_SEASON)
+        if (not isinstance(offset, int) or isinstance(offset, bool)
+                or not -_MAX_EPISODE_OFFSET <= offset <= _MAX_EPISODE_OFFSET):
+            return "invalid", "episode offset must be a whole number from -{0} to {0}".format(
+                _MAX_EPISODE_OFFSET)
+        if entry.get("tvdb_season") == season and (entry.get("episode_offset") or 0) == offset \
+                and ("episode_offset" in entry) == (offset != 0):
+            return "unchanged", ""
+        if season is None:
+            entry.pop("tvdb_season", None)
+        else:
+            entry["tvdb_season"] = season
+        if offset:
+            entry["episode_offset"] = offset
+        else:
+            entry.pop("episode_offset", None)
         return "saved", ""
     return "invalid", "unknown edit"
 
@@ -4262,6 +4331,32 @@ def _render_edit_panel(i, entry, key, name, is_open=False):
         '</div></form>').format(key=_key_input(key), i=i, folder=escape(folder),
                                 sr=_sr(" for {}".format(name)))
 
+    # Movies are filed without a season folder, so placement is series-only.
+    if entry.get("media_type") != "movie":
+        season = entry.get("tvdb_season")
+        rows += (
+            '<form method="POST" action="/entry-edit" class="wl-edit-row">{key}'
+            '<input type="hidden" name="edit" value="library">'
+            '<span class="wl-edit-label" id="lib-label-{i}">Library placement</span>'
+            '<div class="wl-prefs" role="group" aria-labelledby="lib-label-{i}">'
+            '<div class="wl-field wl-field-num"><label for="lib-season-{i}">Season</label>'
+            '<input type="number" id="lib-season-{i}" name="tvdb_season" value="{season}" '
+            'min="0" max="{max_season}" step="1" inputmode="numeric" placeholder="From file" '
+            'class="wl-num" aria-describedby="lib-hint-{i}"></div>'
+            '<div class="wl-field wl-field-num"><label for="lib-offset-{i}">Episode offset</label>'
+            '<input type="number" id="lib-offset-{i}" name="episode_offset" value="{offset}" '
+            'min="-{max_offset}" max="{max_offset}" step="1" class="wl-num" '
+            'aria-describedby="lib-hint-{i}"></div>'
+            '<button type="submit" class="btn btn-ghost btn-sm">Save placement{sr}</button></div>'
+            '<p class="wl-edit-hint" id="lib-hint-{i}">Leave season blank to keep the one in each '
+            'file name. The offset is added to release episode numbers: '
+            '-12 files episode 13 as 1.</p>'
+            '</form>').format(
+                key=_key_input(key), i=i, sr=_sr(" for {}".format(name)),
+                season="" if season is None else escape(str(season)),
+                offset=escape(str(entry.get("episode_offset") or 0)),
+                max_season=_MAX_LIBRARY_SEASON, max_offset=_MAX_EPISODE_OFFSET)
+
     if entry.get("tvdb_id"):
         linked = []
         if entry.get("tvdb_season"):
@@ -4327,8 +4422,12 @@ def render_watchlist_card(i, a, outcome=None, open_panel=None, banner=""):
     if a.get("tvdb_id"):
         facts.append(("TVDB S{:02d}".format(a["tvdb_season"]) if a.get("tvdb_season") else "TVDB",
                       "Linked to TVDB"))
-        if a.get("episode_offset", 0) != 0:
-            facts.append(("Offset {:+d}".format(a["episode_offset"]), "TVDB episode offset"))
+    elif isinstance(a.get("tvdb_season"), int):
+        facts.append(("Season {}".format(a["tvdb_season"]),
+                      "The mover files downloads into this library season"))
+    if isinstance(a.get("episode_offset"), int) and a["episode_offset"] != 0:
+        facts.append(("Offset {:+d}".format(a["episode_offset"]),
+                      "Added to release episode numbers when filing downloads"))
     facts += _pref_facts(a)
     facts_html = _facts_html(facts)
 
@@ -5513,7 +5612,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _entry_edit(self, params):
         """/entry-edit: one per-entry setting from a watchlist card's Edit
-        panel (``edit`` = episodes / paused / prefs / release), keyed by URL.
+        panel (``edit`` = episodes / paused / prefs / release / library),
+        keyed by URL.
         Input is validated first; a release pick may need one scrape to be
         confirmed, which happens before the single update_ani lock hold."""
         entry_url = params.get("key", "")
@@ -5532,6 +5632,12 @@ class Handler(BaseHTTPRequestHandler):
             value = params.get("paused") == "1"
         elif edit == "prefs":
             value, err = parse_entry_prefs(params)
+            if err:
+                self._redirect_msg("Error: {}".format(err), level="err",
+                                   anchor=entry_anchor_id(entry_url), panel="edit")
+                return
+        elif edit == "library":
+            value, err = parse_library_placement(params)
             if err:
                 self._redirect_msg("Error: {}".format(err), level="err",
                                    anchor=entry_anchor_id(entry_url), panel="edit")
@@ -5593,6 +5699,10 @@ class Handler(BaseHTTPRequestHandler):
         elif edit == "prefs":
             msg = ("Saved release preferences for {}. They apply when you change release."
                    if changed else "Release preferences for {} unchanged.").format(name)
+        elif edit == "library":
+            msg = "{}: {}.".format(
+                name, library_placement_note(value) if changed
+                else "library season and episode offset unchanged")
         else:
             msg = "{} {} release #{}. {}".format(
                 name, "now uses" if changed else "already uses", outcome["release"], note)

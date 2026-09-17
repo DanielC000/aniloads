@@ -1722,3 +1722,24 @@ class UserEditedEntryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TvdbChecksApplyTest(unittest.TestCase):
+    """Step 4's TVDB lookups key off tvdb_id alone: a season/offset set by
+    hand in the dashboard, with no TVDB link, never triggers a lookup."""
+
+    def test_manual_season_without_tvdb_id_skips_lookups(self):
+        entry = {"name": "A", "tvdb_season": 2, "episode_offset": -12}
+        self.assertFalse(anibot.tvdb_checks_apply(entry, False, True))
+
+    def test_linked_entry_runs_lookups(self):
+        entry = {"name": "A", "tvdb_id": 5, "tvdb_season": 2}
+        self.assertTrue(anibot.tvdb_checks_apply(entry, False, True))
+        self.assertFalse(anibot.tvdb_checks_apply(entry, True, True))
+        self.assertFalse(anibot.tvdb_checks_apply(entry, False, False))
+        self.assertFalse(anibot.tvdb_checks_apply(dict(entry, media_type="movie"), False, True))
+
+    def test_manual_placement_is_not_bot_owned(self):
+        # The bot must never write these back over a dashboard edit.
+        for field in ("tvdb_season", "episode_offset", "tvdb_id"):
+            self.assertNotIn(field, anibot.BOT_OWNED_SCALAR_FIELDS)

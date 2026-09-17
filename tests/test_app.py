@@ -5402,8 +5402,9 @@ class RenderWatchlistCardTest(unittest.TestCase):
         c = _ControlCollector()
         c.feed(out)
         self.assertEqual(len(c.ids), len(set(c.ids)))
-        # per card: have-episodes, dub, sub, resolution, folder, retry number
-        self.assertEqual(len(c.controls), 12)
+        # per card: have-episodes, dub, sub, resolution, folder, library season,
+        # episode offset, retry number
+        self.assertEqual(len(c.controls), 16)
         for ctl in c.controls:
             self.assertTrue(ctl.get("id") in c.label_for or ctl.get("aria-label"), ctl)
 
@@ -6456,3 +6457,143 @@ class RenderPendingCardTest(unittest.TestCase):
         finally:
             app.ANI_JSON = orig
             os.remove(path)
+
+
+class LibraryPlacementEditTest(unittest.TestCase):
+    """Library season + episode offset edited from the card's Edit panel
+    through /entry-edit, with no TVDB link and TVDB unconfigured."""
+
+    URL = EntryEditHandlerTest.URL
+
+    setUp = AddAnimeFlowTest.setUp
+    tearDown = AddAnimeFlowTest.tearDown
+    set_prefs = AddAnimeFlowTest.set_prefs
+    _post = AddAnimeFlowTest._post
+    seed = EntryEditHandlerTest.seed
+    entry = EntryEditHandlerTest.entry
+    edit = EntryEditHandlerTest.edit
+
+    def test_parse_bounds(self):
+        parse = app.parse_library_placement
+        self.assertEqual(parse({"tvdb_season": "2", "episode_offset": "-12"}),
+                         ({"tvdb_season": 2, "episode_offset": -12}, None))
+        self.assertEqual(parse({"tvdb_season": " ", "episode_offset": ""}),
+                         ({"tvdb_season": None, "episode_offset": 0}, None))
+        self.assertEqual(parse({"tvdb_season": "0", "episode_offset": "+3"})[0],
+                         {"tvdb_season": 0, "episode_offset": 3})
+        self.assertEqual(parse({"episode_offset": "−12"})[0]["episode_offset"], -12)
+        for season in ("-1", "1.5", "x", "10000"):
+            self.assertIsNone(parse({"tvdb_season": season})[0], season)
+        for offset in ("10000", "-10000", "1e3", "--1", "abc"):
+            self.assertIsNone(parse({"episode_offset": offset})[0], offset)
+
+    def test_apply_persist_unchanged_clear_invalid(self):
+        entry = {"name": "A"}
+        apply = app.apply_entry_edit
+        self.assertEqual(apply(entry, "library", {"tvdb_season": 2, "episode_offset": -12}),
+                         ("saved", ""))
+        self.assertEqual((entry["tvdb_season"], entry["episode_offset"]), (2, -12))
+        self.assertNotIn("tvdb_id", entry)
+        self.assertEqual(apply(entry, "library", {"tvdb_season": 2, "episode_offset": -12})[0],
+                         "unchanged")
+        self.assertEqual(apply(entry, "library", {"tvdb_season": None, "episode_offset": 0})[0],
+                         "saved")
+        self.assertEqual(entry, {"name": "A"})
+        self.assertEqual(apply(entry, "library", {"tvdb_season": None, "episode_offset": 0})[0],
+                         "unchanged")
+        for bad in ({"tvdb_season": -1, "episode_offset": 0},
+                    {"tvdb_season": 1, "episode_offset": 10000},
+                    {"tvdb_season": True, "episode_offset": 0},
+                    {"tvdb_season": 1, "episode_offset": None}, None):
+            self.assertEqual(apply(entry, "library", bad)[0], "invalid", bad)
+        self.assertEqual(entry, {"name": "A"})
+
+    def test_offset_zero_removes_key_like_tvdb_link(self):
+        entry = {"name": "A", "tvdb_id": 5, "tvdb_season": 1, "episode_offset": 3}
+        self.assertEqual(app.apply_entry_edit(
+            entry, "library", {"tvdb_season": 0, "episode_offset": 0})[0], "saved")
+        self.assertEqual(entry, {"name": "A", "tvdb_id": 5, "tvdb_season": 0})
+
+    def test_handler_saves_clears_and_rejects(self):
+        self.seed()
+        self.assertFalse(app.tvdb.available)
+        r = self.edit(edit="library", tvdb_season="2", episode_offset="-12")
+        self.assertEqual(r["level"], "ok")
+        self.assertEqual(r["anchor"], app.entry_anchor_id(self.URL))
+        self.assertEqual(r["panel"], "edit")
+        self.assertIn("files downloads into season 2", r["msg"])
+        self.assertIn("-12", r["msg"])
+        e = self.entry()
+        self.assertEqual((e["tvdb_season"], e["episode_offset"]), (2, -12))
+        self.assertNotIn("tvdb_id", e)
+        r = self.edit(edit="library", tvdb_season="2", episode_offset="-12")
+        self.assertIn("unchanged", r["msg"])
+        for season, offset in (("abc", "0"), ("2", "99999"), ("-3", "")):
+            r = self.edit(edit="library", tvdb_season=season, episode_offset=offset)
+            self.assertEqual(r["level"], "err", (season, offset))
+            self.assertEqual(r["panel"], "edit")
+        e = self.entry()
+        self.assertEqual((e["tvdb_season"], e["episode_offset"]), (2, -12))
+        r = self.edit(edit="library", tvdb_season="", episode_offset="")
+        self.assertEqual(r["level"], "ok")
+        self.assertIn("keeps the season from each file name", r["msg"])
+        e = self.entry()
+        self.assertNotIn("tvdb_season", e)
+        self.assertNotIn("episode_offset", e)
+
+    def test_edit_panel_fields_render_without_tvdb(self):
+        self.assertFalse(app.tvdb.available)
+        entry = {"name": "A", "url": self.URL, "episodes": 3, "tvdb_season": 2,
+                 "episode_offset": -12}
+        out = app.render_watchlist([entry])
+        edit = out.split('<details class="wl-panel wl-edit">', 1)[1]
+        self.assertIn('<input type="hidden" name="edit" value="library">', edit)
+        self.assertIn('name="tvdb_season" value="2"', edit)
+        self.assertIn('name="episode_offset" value="-12"', edit)
+        self.assertNotIn('action="/tvdb-link"', out)
+        head = out.split('<details class="wl-panel', 1)[0]
+        self.assertIn(">Season 2</span>", head)
+        self.assertIn(">Offset -12</span>", head)
+        self.assertNotIn("TVDB", head)
+
+    def test_blank_placement_renders_empty_and_no_badges(self):
+        out = app.render_watchlist([{"name": "A", "url": self.URL, "episodes": 3}])
+        self.assertIn('name="tvdb_season" value="" ', out)
+        self.assertIn('name="episode_offset" value="0" ', out)
+        head = out.split('<details class="wl-panel', 1)[0]
+        self.assertNotIn("Season", head)
+        self.assertNotIn("Offset", head)
+
+    def test_season_zero_badge_and_tvdb_badge_unchanged(self):
+        head = app.render_watchlist([{"name": "A", "url": self.URL, "tvdb_season": 0}]) \
+            .split('<details class="wl-panel', 1)[0]
+        self.assertIn(">Season 0</span>", head)
+        head = app.render_watchlist([{"name": "A", "url": self.URL, "tvdb_id": 9,
+                                      "tvdb_season": 2}]).split('<details class="wl-panel', 1)[0]
+        self.assertIn(">TVDB S02</span>", head)
+        self.assertNotIn("Season 2", head)
+
+    def test_movie_has_no_placement_row(self):
+        out = app.render_watchlist([{"name": "M", "url": self.URL, "media_type": "movie"}])
+        self.assertNotIn('value="library"', out)
+
+
+class ManualPlacementMoverTest(unittest.TestCase):
+    """A dashboard-set season and offset with no tvdb_id steer the mover."""
+
+    setUp = RunMoveCycleTest.setUp
+    tearDown = RunMoveCycleTest.tearDown
+    _write_ani = RunMoveCycleTest._write_ani
+    _make_dl = RunMoveCycleTest._make_dl
+    _types = RunMoveCycleTest._types
+
+    def test_manual_season_and_negative_offset_without_tvdb_id(self):
+        entry = {"name": "Frieren", "media_type": "series"}
+        app.apply_entry_edit(entry, "library", {"tvdb_season": 2, "episode_offset": -12})
+        self.assertNotIn("tvdb_id", entry)
+        self._write_ani([entry])
+        self._make_dl("Frieren.S01", ["Frieren.S01E13.mkv"])
+        events = app.run_move_cycle()
+        self.assertIn("moved", self._types(events))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.media, "Frieren", "S02", "Frieren.S02E01.mkv")))

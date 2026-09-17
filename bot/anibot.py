@@ -339,6 +339,15 @@ def refresh_entry(path, animeentry):
     return True
 
 
+def tvdb_checks_apply(animeentry, force_check, tvdb_available):
+    """Whether Step 4's TVDB lookups run for this entry. Keyed off `tvdb_id`
+    alone: a `tvdb_season` / `episode_offset` set by hand in the dashboard,
+    with no TVDB link, only steers the mover and batch matching and never
+    triggers a lookup."""
+    return (not force_check and bool(animeentry.get('tvdb_id')) and tvdb_available
+            and animeentry.get('media_type') != 'movie')
+
+
 def paused_skip_reason(animeentry):
     """Why this entry is skipped before any other check, or None. Paused is
     set and cleared only in the dashboard; the bot never unpauses."""
@@ -1816,8 +1825,7 @@ def startbot():
                 # Movies are not series — skip TVDB series status logic.
                 tvdb_id = animeentry.get('tvdb_id')
                 tvdb_season = animeentry.get('tvdb_season')
-                is_movie_cached = animeentry.get('media_type') == 'movie'
-                if not force_check and tvdb_id and tvdb.available and not is_movie_cached:
+                if tvdb_checks_apply(animeentry, force_check, tvdb.available):
                     try:
                         series_status = tvdb.get_series_status(tvdb_id)
                         if series_status:

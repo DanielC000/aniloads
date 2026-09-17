@@ -1945,9 +1945,12 @@ def _stuck_key(rel_path, reason):
     return "{}::{}".format(rel_path, reason)
 
 
-def _stuck_touch(rel_path, reason, entry_name, msg):
+def _stuck_touch(rel_path, reason, entry_name, msg, entry_url="", episode=None):
     """Record (or refresh) a stuck item, keyed by its path under DOWNLOAD_DIR
-    and the reason it's stuck. Returns (is_new, ignored, move_anyway) —
+    and the reason it's stuck. ``entry_url`` / ``episode`` (the watchlist
+    entry and library episode, when the mover knows them) let a watchlist card
+    show this download's trail; older records lack both, see
+    entry_download_trails. Returns (is_new, ignored, move_anyway) —
     move_anyway is a one-shot flag consumed here, so clicking "Move anyway"
     only applies to the very next cycle."""
     key = _stuck_key(rel_path, reason)
@@ -1967,6 +1970,10 @@ def _stuck_touch(rel_path, reason, entry_name, msg):
             _stuck_items[key] = rec
         rec["msg"] = msg
         rec["last_seen"] = now_iso
+        if entry_url:
+            rec["entry_url"] = entry_url
+        if isinstance(episode, int):
+            rec["episode"] = episode
         move_anyway = rec.pop("move_anyway", False)
         ignored = rec.get("ignored", False)
     return is_new, ignored, move_anyway
@@ -2153,7 +2160,8 @@ def stuck_assign(key, entry_url, season_raw, episode_raw):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     with _move_lock:
         _stuck_items.pop(key, None)
-        _move_history.append({"type": "moved", "msg": msg, "time": ts})
+        _move_history.append({"type": "moved", "msg": msg, "time": ts,
+                              "entry_url": entry.get("url", ""), "episode": episode})
     save_move_state()
     return True, msg
 
@@ -2278,7 +2286,8 @@ def run_move_cycle():
                 rel_path = os.path.relpath(filepath, DOWNLOAD_DIR)
                 if os.path.exists(target_path):
                     msg = "{} \u2014 already exists".format(dest_name)
-                    is_new, ignored, _ = _stuck_touch(rel_path, "exists", entry_name, msg)
+                    is_new, ignored, _ = _stuck_touch(rel_path, "exists", entry_name, msg,
+                                                      entry_url=dir_match.get("url", ""))
                     if is_new and not ignored:
                         events.append({"type": "skip", "msg": msg})
                     continue
@@ -2288,7 +2297,8 @@ def run_move_cycle():
                     video_stem = os.path.splitext(src_name)[0]
                     new_stem = os.path.splitext(dest_name)[0]
                     _move_subtitles(dir_path, video_stem, target_dir, new_stem)
-                    events.append({"type": "moved", "msg": "{} \u2192 {}/{}".format(src_name, movie_folder, dest_name)})
+                    events.append({"type": "moved", "msg": "{} \u2192 {}/{}".format(src_name, movie_folder, dest_name),
+                                   "entry_url": dir_match.get("url", "")})
                     _stuck_resolve(rel_path, "exists")
                 except Exception as e:
                     events.append({"type": "error", "msg": "Failed to move {}: {}".format(src_name, e)})
@@ -2336,6 +2346,9 @@ def run_move_cycle():
                         continue
 
                 anime_name = existing or match["folder_name"]
+                # Watchlist identity for the card's download trail ("" for an
+                # unmatched download filed by name).
+                entry_url = match.get("url", "") if match.get("matched") else ""
 
                 orig_season, orig_episode = season, episode
 
@@ -2355,7 +2368,8 @@ def run_move_cycle():
                 if episode < 1:
                     msg = "{} — offset {:+d} gives episode {} (from parsed {})".format(
                         filename, ep_offset, episode, orig_episode)
-                    is_new, ignored, _ = _stuck_touch(rel_path, "bad_offset", entry_name, msg)
+                    is_new, ignored, _ = _stuck_touch(rel_path, "bad_offset", entry_name, msg,
+                                                      entry_url=entry_url)
                     if is_new and not ignored:
                         events.append({"type": "error", "msg": msg})
                     continue
@@ -2373,14 +2387,16 @@ def run_move_cycle():
 
                 if not _is_within_media_dir(target_dir, MEDIA_DIR):
                     msg = "{} — unsafe folder name, refusing to move outside the media library".format(filename)
-                    is_new, ignored, _ = _stuck_touch(rel_path, "unsafe_folder", entry_name, msg)
+                    is_new, ignored, _ = _stuck_touch(rel_path, "unsafe_folder", entry_name, msg,
+                                                      entry_url=entry_url, episode=episode)
                     if is_new and not ignored:
                         events.append({"type": "error", "msg": msg})
                     continue
 
                 if os.path.exists(target_path):
                     msg = "{} \u2014 already exists".format(filename)
-                    is_new, ignored, _ = _stuck_touch(rel_path, "exists", entry_name, msg)
+                    is_new, ignored, _ = _stuck_touch(rel_path, "exists", entry_name, msg,
+                                                      entry_url=entry_url, episode=episode)
                     if is_new and not ignored:
                         events.append({"type": "skip", "msg": msg})
                     continue
@@ -2392,7 +2408,8 @@ def run_move_cycle():
                     new_stem = os.path.splitext(filename)[0]
                     _move_subtitles(dir_path, video_stem, target_dir, new_stem)
                     dest_short = "{}/{}".format(anime_name, season_dir)
-                    events.append({"type": "moved", "msg": "{} \u2192 {}".format(filename, dest_short)})
+                    events.append({"type": "moved", "msg": "{} \u2192 {}".format(filename, dest_short),
+                                   "entry_url": entry_url, "episode": episode})
                     _stuck_resolve(rel_path, "exists")
                     _stuck_resolve(rel_path, "unmatched")
                 except Exception as e:
@@ -2649,6 +2666,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .wl-checked { margin-top: var(--s1); font-size: var(--fs-xs); color: var(--text-muted); overflow-wrap: anywhere; }
   .wl-status + .wl-checked { margin-top: var(--s2); }
   .wl-checked--danger { color: var(--danger-text); }
+  .wl-checked a { color: inherit; text-underline-offset: 2px; }
   .run-more { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s3); margin-top: var(--s4); padding-top: var(--s3); border-top: 1px solid var(--border); }
   .run-more .hint { margin-right: auto; }
   .wl-status--ok .wl-status-dot { background: var(--ok-text); }
@@ -3918,14 +3936,17 @@ def pending_resolve_error(entry, now=None):
         head, " ".join(str(err["reason"]).split()).rstrip("."))
 
 
-def render_watchlist(anime_list, pending_list=None, entry_outcomes=None, focus=None):
+def render_watchlist(anime_list, pending_list=None, entry_outcomes=None, focus=None,
+                     trails=None):
     """``entry_outcomes`` is run_state.json's per-entry map, keyed by URL;
     absent (an older bot) the cards simply carry no last-check line.
+    ``trails`` is entry_download_trails' map, also keyed by URL.
 
     ``focus`` (``{"anchor", "panel", "banner"}``, see render_page) marks the
     card a redirect landed on: it carries the banner and re-opens the panel."""
     if not isinstance(entry_outcomes, dict):
         entry_outcomes = {}
+    trails = trails if isinstance(trails, dict) else {}
     focus = focus or {}
     if not anime_list and not pending_list:
         return '<div class="empty">No anime in watchlist. Add some above!</div>'
@@ -3938,11 +3959,12 @@ def render_watchlist(anime_list, pending_list=None, entry_outcomes=None, focus=N
 
     for i, a in enumerate(anime_list):
         outcome = entry_outcomes.get(a.get("url"))
+        trail = trails.get(a.get("url"))
         if focus.get("anchor") == entry_anchor_id(a.get("url", "")):
             html += render_watchlist_card(i, a, outcome, open_panel=focus.get("panel"),
-                                          banner=focus.get("banner", ""))
+                                          banner=focus.get("banner", ""), trail=trail)
         else:
-            html += render_watchlist_card(i, a, outcome)
+            html += render_watchlist_card(i, a, outcome, trail=trail)
     return html
 
 
@@ -4039,7 +4061,14 @@ def watchlist_status(entry, today=None):
     if entry.get("skip_until"):
         day = _parse_airdate(entry["skip_until"])
         what = "next episode" if entry.get("skip_real_airdate") else "next check"
-        if day is None:
+        recheck = _parse_state_ts(entry.get("skip_recheck_at"))
+        if recheck is not None and (day is None or day < today):
+            # Past its airdate the bot throttles itself to skip_recheck_at (the
+            # bot's local wall time), so that is the real next check.
+            clock = recheck.strftime("%H:%M")
+            when = "rechecking at {}".format(clock if recheck.date() == today else "{} {}".format(
+                format_airdate(recheck.date(), today), clock))
+        elif day is None:
             when = "{} {}".format(what, entry["skip_until"])
         elif day < today:
             when = "{} was due {}".format(what, format_airdate(day, today))
@@ -4124,12 +4153,209 @@ def entry_check_lines(outcome, now=None):
     return check, error
 
 
-def render_entry_check(outcome, now=None):
+# A stuck reason as the tail of a card's trail line ("→ stuck: <label>").
+_TRAIL_STUCK_LABELS = {
+    "parse": "can't read season/episode",
+    "exists": "already in the library",
+    "unmatched": "no watchlist match",
+    "unsafe_folder": "unsafe folder name",
+    "loose": "not in a package folder",
+    "bad_offset": "offset gives episode 0 or less",
+}
+
+_MOVE_DEST_SEASON_RE = re.compile(r"^S(\d+)$")
+
+
+def _state_int(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _trail_move_target(ev, anime_list, folder_urls):
+    """``(url, episode)`` for one "moved" history event. New events carry
+    ``entry_url`` / ``episode``; an older one is matched by the library folder
+    in its message ("file → Folder/S01[/new file]"), tiebroken by the season
+    folder when several entries share it, and its episode is parsed from the
+    filed name. Unmatchable events give ``(None, None)``."""
+    src, sep, dest = str(ev.get("msg", "")).partition(" → ")
+    parts = [p.strip() for p in dest.split("/")] if sep else []
+    url = ev.get("entry_url") or None
+    if not url and parts:
+        urls = folder_urls.get(parts[0].casefold(), [])
+        m = _MOVE_DEST_SEASON_RE.match(parts[1]) if len(parts) > 1 else None
+        if len(urls) > 1 and m:
+            season = int(m.group(1))
+            urls = [a.get("url") for a in anime_list
+                    if a.get("url") in urls and a.get("tvdb_season") == season]
+        url = urls[0] if len(urls) == 1 else None
+    if "episode" in ev:
+        episode = _state_int(ev.get("episode"))
+    else:
+        parsed = parse_season_episode(parts[-1] if len(parts) > 2 else src.strip())
+        episode = parsed[2] if parsed else None
+    return url, episode
+
+
+def entry_download_trails(anime_list, entry_outcomes, history, stuck):
+    """Each watchlist entry's latest episode on its way from JDownloader to the
+    library, keyed by entry URL. The one join between run_state's per-entry
+    outcomes (see ENTRY_RESULTS in bot/anibot.py) and the mover's history and
+    stuck store; built once per page render.
+
+    A trail is ``{"state", "episode", "sent_ts", "at", "reason"}``:
+
+    - After a "downloaded" outcome (``sent_ts`` set): state "moved" when a move
+      of that episode is recorded since the send, else "stuck" when a stuck
+      download for the entry appeared since, else "waiting". When a full
+      history no longer reaches back to the send, there is no trail rather
+      than a false "waiting".
+    - Otherwise: an unresolved stuck download for the entry, else its latest
+      recorded move, else no trail.
+
+    ``at`` is the move time or the stuck record's first sighting; ``reason``
+    the stuck reason key. Records older than the ``entry_url`` / ``episode``
+    fields fall back to folder and filename matching (_trail_move_target), and
+    a stuck record by its package folder name (match_anime_entry)."""
+    anime_list = [a for a in (anime_list or []) if isinstance(a, dict) and a.get("url")]
+    entry_outcomes = entry_outcomes if isinstance(entry_outcomes, dict) else {}
+    known = {a["url"] for a in anime_list}
+
+    folder_urls = {}
+    for a in anime_list:
+        names = set()
+        for raw in (a.get("customPackage"), a.get("name")):
+            seg = _safe_folder_segment(raw or "")
+            if seg:
+                names.add(seg.casefold())
+                if a.get("media_type") == "movie":
+                    names.add(_movie_target_name(seg, a.get("year")).casefold())
+        for n in names:
+            folder_urls.setdefault(n, []).append(a["url"])
+
+    moves, stucks = {}, {}
+    history = list(history or [])
+    # A full history may have dropped events from before a send (see
+    # MOVE_HISTORY_MAX); only then does its oldest event bound what it knows.
+    oldest = None
+    for ev in history:
+        if not isinstance(ev, dict):
+            continue
+        at = _parse_state_ts(ev.get("time"))
+        if at is not None and (oldest is None or at < oldest):
+            oldest = at
+        if ev.get("type") != "moved" or at is None:
+            continue
+        url, episode = _trail_move_target(ev, anime_list, folder_urls)
+        if url in known:
+            moves.setdefault(url, []).append({"at": at, "episode": episode, "ts": ev.get("time")})
+
+    records = stuck.values() if isinstance(stuck, dict) else []
+    for rec in records:
+        if not isinstance(rec, dict) or rec.get("ignored"):
+            continue
+        at = _parse_state_ts(rec.get("first_seen"))
+        url = rec.get("entry_url")
+        if not url and rec.get("reason") not in ("loose", "unmatched") and rec.get("dir"):
+            match = match_anime_entry("", str(rec["dir"]), anime_list)
+            url = match.get("url") if match.get("matched") else None
+        if url in known and at is not None:
+            stucks.setdefault(url, []).append({
+                "at": at, "episode": _state_int(rec.get("episode")),
+                "ts": rec.get("first_seen"), "reason": rec.get("reason", "")})
+
+    def trail(state, rec, episode=None, sent_ts=None):
+        return {"state": state, "episode": episode if rec is None else (
+                    episode if episode is not None else rec["episode"]),
+                "sent_ts": sent_ts, "at": rec["ts"] if rec else None,
+                "reason": rec.get("reason", "") if rec and state == "stuck" else ""}
+
+    trails = {}
+    for a in anime_list:
+        url = a["url"]
+        outcome = entry_outcomes.get(url)
+        own_moves = sorted(moves.get(url, []), key=lambda r: r["at"])
+        own_stuck = sorted(stucks.get(url, []), key=lambda r: r["at"])
+        sent_at = None
+        if isinstance(outcome, dict) and outcome.get("result") == "downloaded":
+            sent_at = _parse_state_ts(outcome.get("checked_ts"))
+        if sent_at is not None:
+            episode = _state_int(outcome.get("episode"))
+
+            def same(rec):
+                return rec["at"] >= sent_at and (
+                    episode is None or rec["episode"] is None or rec["episode"] == episode)
+
+            moved = [r for r in own_moves if same(r)]
+            stuck_now = [r for r in own_stuck if same(r)]
+            if moved:
+                trails[url] = trail("moved", moved[-1], episode, outcome["checked_ts"])
+            elif stuck_now:
+                trails[url] = trail("stuck", stuck_now[-1], episode, outcome["checked_ts"])
+            elif len(history) < MOVE_HISTORY_MAX or oldest is None or oldest <= sent_at:
+                trails[url] = trail("waiting", None, episode, outcome["checked_ts"])
+        elif own_stuck:
+            trails[url] = trail("stuck", own_stuck[-1])
+        elif own_moves:
+            trails[url] = trail("moved", own_moves[-1])
+    return trails
+
+
+def entry_trail_line(trail, now=None):
+    """A trail (see entry_download_trails) as card copy. Returns ``(text,
+    stuck)``: after a send, "Checked 04:31 · episode 12 sent to JDownloader →
+    moved to library 04:40" (or "→ stuck: already in the library" / "→
+    waiting for download"), which replaces the card's check line; without
+    one, "Episode 12 moved to library Tue 15 Sep 04:40" or "Episode 13 stuck
+    in downloads: already in the library". "" for no trail."""
+    if not isinstance(trail, dict) or trail.get("state") not in ("moved", "stuck", "waiting"):
+        return "", False
+    now = now or _utc_now()
+    episode = trail.get("episode")
+    state = trail["state"]
+    at = _local_ts(trail.get("at"))
+    when = format_day_time(at, fmt="%H:%M", now=now) if at else ""
+    label = _TRAIL_STUCK_LABELS.get(trail.get("reason"), "needs a look")
+
+    if trail.get("sent_ts"):
+        sent = _local_ts(trail["sent_ts"])
+        head = "Checked {}".format(format_day_time(sent, fmt="%H:%M", now=now)) if sent else "Last check"
+        what = "episode {} sent to JDownloader".format(episode) if episode is not None \
+            else "sent to JDownloader"
+        if state == "moved":
+            hop = "moved to library {}".format(when).rstrip()
+        elif state == "stuck":
+            hop = "stuck: {}".format(label)
+        else:
+            hop = "waiting for download"
+        return "{} · {} → {}".format(head, what, hop), state == "stuck"
+
+    subject = "Episode {}".format(episode) if episode is not None else None
+    if state == "stuck":
+        return "{}: {}".format(
+            "{} stuck in downloads".format(subject) if subject else "A download is stuck",
+            label), True
+    if state == "moved":
+        return "{} to library {}".format(
+            "{} moved".format(subject) if subject else "Moved", when).rstrip(), False
+    return "", False
+
+
+def render_entry_check(outcome, now=None, trail=None):
     check, error = entry_check_lines(outcome, now)
+    trail_text, stuck = entry_trail_line(trail, now)
+    review = ' <a href="#move-stuck">Review</a>' if stuck else ""
     html = ""
-    if check:
+    if trail_text and trail.get("sent_ts"):
+        # The trail restates this check ("episode 12 sent to JDownloader")
+        # and carries it on, so it takes the check line's place.
+        tone = " wl-checked--danger" if stuck else ""
+        html += '<p class="wl-checked{}">{}{}</p>'.format(tone, escape(trail_text), review)
+        trail_text = ""
+    elif check:
         tone = " wl-checked--danger" if outcome.get("result") == "error" else ""
         html += '<p class="wl-checked{}">{}</p>'.format(tone, escape(check))
+    if trail_text:
+        tone = " wl-checked--danger" if stuck else ""
+        html += '<p class="wl-checked{}">{}{}</p>'.format(tone, escape(trail_text), review)
     if error:
         html += '<p class="wl-checked wl-checked--danger">{}</p>'.format(escape(error))
     return html
@@ -4767,7 +4993,7 @@ def _render_edit_panel(i, entry, key, name, is_open=False):
                 open=" open" if is_open else "", sr=_sr(" " + name), rows=rows)
 
 
-def render_watchlist_card(i, a, outcome=None, open_panel=None, banner=""):
+def render_watchlist_card(i, a, outcome=None, open_panel=None, banner="", trail=None):
     name = a.get("name", "Unknown")
     url = a.get("url", "")
     # Mutations target this entry by its unique URL (see find_entry_by_url),
@@ -4827,7 +5053,8 @@ def render_watchlist_card(i, a, outcome=None, open_panel=None, banner=""):
         name=escape(name), url_html=_watchlist_url_html(url),
         head_action=head_action, filter_attrs=watchlist_filter_attrs(i, a),
         status_html=status_html,
-        check_html="" if a.get("paused") else render_entry_check(outcome), facts_html=facts_html,
+        check_html="" if a.get("paused") else render_entry_check(outcome, trail=trail),
+        facts_html=facts_html,
         ep_panel=_render_episode_panel(i, a, key, name, is_open=open_panel == "episodes"),
         edit_panel=_render_edit_panel(i, a, key, name, is_open=open_panel == "edit"),
     )
@@ -5532,8 +5759,11 @@ def render_page(status="", search_html="", prefs_open=False, ani_data=None, sear
     focus = None
     if status_at in entry_anchors:
         focus = {"anchor": status_at, "panel": open_panel, "banner": status}
+    with _move_lock:
+        move_records = list(_move_history), dict(_stuck_items)
     page = page.replace("%%WATCHLIST%%", render_watchlist(
-        anime_list, pending_list, run_state.get("entries"), focus=focus))
+        anime_list, pending_list, run_state.get("entries"), focus=focus,
+        trails=entry_download_trails(anime_list, run_state.get("entries"), *move_records)))
     page = page.replace("%%SETTINGS_CARD%%", render_settings_card(data.get("settings"), AUTH_ENABLED))
     page = page.replace("%%WATCHLIST_CONTROLS%%", render_watchlist_controls(anime_list, pending_list))
     page = page.replace("%%COUNT%%", watchlist_heading_count(anime_list, pending_list))

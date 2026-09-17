@@ -7324,3 +7324,204 @@ class RenderActivityWaitingForConfigTest(unittest.TestCase):
         status_html, _last, _next = app.render_activity(act)
         self.assertIn("Running", status_html)
         self.assertNotIn("Waiting for configuration", status_html)
+
+
+class EntryDownloadTrailsTest(unittest.TestCase):
+    """entry_download_trails: the join between run_state's per-entry outcome
+    and the mover's history/stuck store behind each card's trail line."""
+
+    URL = "http://x/frieren"
+    ENTRY = {"name": "Frieren", "url": URL, "customPackage": "Frieren", "tvdb_season": 1}
+    SENT = {"checked_ts": "2026-09-17T04:31:00Z", "result": "downloaded",
+            "reason": "episode downloaded", "episode": 12}
+
+    def trails(self, history=(), stuck=None, outcome=SENT, anime=None):
+        return app.entry_download_trails(anime or [self.ENTRY], {self.URL: outcome},
+                                         list(history), stuck or {})
+
+    def test_moved_after_send(self):
+        history = [{"type": "moved", "msg": "Frieren - S01E12.mkv → Frieren/S01",
+                    "time": "2026-09-17T04:40:00", "entry_url": self.URL, "episode": 12}]
+        self.assertEqual(self.trails(history)[self.URL], {
+            "state": "moved", "episode": 12, "sent_ts": "2026-09-17T04:31:00Z",
+            "at": "2026-09-17T04:40:00", "reason": ""})
+
+    def test_move_of_another_episode_or_before_send_does_not_count(self):
+        history = [
+            {"type": "moved", "msg": "a", "time": "2026-09-17T04:00:00",
+             "entry_url": self.URL, "episode": 12},
+            {"type": "moved", "msg": "b", "time": "2026-09-17T04:40:00",
+             "entry_url": self.URL, "episode": 11},
+        ]
+        self.assertEqual(self.trails(history)[self.URL]["state"], "waiting")
+
+    def test_stuck_after_send(self):
+        stuck = {"k": {"key": "k", "reason": "exists", "dir": "Frieren", "path": "Frieren/x.mkv",
+                       "ignored": False, "first_seen": "2026-09-17T04:40:00",
+                       "entry_url": self.URL, "episode": 12}}
+        trail = self.trails(stuck=stuck)[self.URL]
+        self.assertEqual((trail["state"], trail["reason"], trail["at"]),
+                         ("stuck", "exists", "2026-09-17T04:40:00"))
+
+    def test_ignored_stuck_is_not_a_trail(self):
+        stuck = {"k": {"reason": "exists", "ignored": True, "first_seen": "2026-09-17T04:40:00",
+                       "entry_url": self.URL, "episode": 12}}
+        self.assertEqual(self.trails(stuck=stuck)[self.URL]["state"], "waiting")
+
+    def test_not_yet_moved_is_waiting(self):
+        history = [{"type": "wait", "msg": "Frieren — files still being modified",
+                    "time": "2026-09-17T04:35:00"}]
+        trail = self.trails(history)[self.URL]
+        self.assertEqual((trail["state"], trail["episode"], trail["at"]), ("waiting", 12, None))
+
+    def test_history_not_reaching_the_send_gives_no_trail(self):
+        # A full history that no longer covers the send could have dropped
+        # the move, so "waiting" could be false and the card says nothing.
+        history = [{"type": "wait", "msg": "x", "time": "2026-09-17T05:00:00"}] * app.MOVE_HISTORY_MAX
+        self.assertNotIn(self.URL, self.trails(history))
+
+    def test_old_move_record_matches_by_folder_and_filename(self):
+        history = [{"type": "moved", "msg": "Frieren - S01E12.mkv → frieren/S01",
+                    "time": "2026-09-17T04:40:00"}]
+        trail = self.trails(history)[self.URL]
+        self.assertEqual((trail["state"], trail["episode"]), ("moved", 12))
+
+    def test_old_assign_record_reads_the_renamed_file(self):
+        history = [{"type": "moved", "msg": "weird.mkv → Frieren/S01/weird - S01E12.mkv",
+                    "time": "2026-09-17T04:40:00"}]
+        self.assertEqual(self.trails(history)[self.URL]["state"], "moved")
+
+    def test_old_move_record_shared_folder_uses_season(self):
+        s2 = {"name": "Frieren 2", "url": "http://x/frieren2", "customPackage": "Frieren",
+              "tvdb_season": 2}
+        history = [{"type": "moved", "msg": "Frieren - S02E03.mkv → Frieren/S02",
+                    "time": "2026-09-17T04:40:00"}]
+        trails = app.entry_download_trails([self.ENTRY, s2], {}, history, {})
+        self.assertEqual(trails, {"http://x/frieren2": {
+            "state": "moved", "episode": 3, "sent_ts": None,
+            "at": "2026-09-17T04:40:00", "reason": ""}})
+
+    def test_old_stuck_record_matches_by_package_folder(self):
+        stuck = {"k": {"reason": "parse", "dir": "Frieren", "path": "Frieren/weird.mkv",
+                       "ignored": False, "first_seen": "2026-09-17T04:40:00"}}
+        trail = self.trails(stuck=stuck)[self.URL]
+        self.assertEqual((trail["state"], trail["reason"], trail["episode"]),
+                         ("stuck", "parse", 12))
+
+    def test_without_a_send_shows_stuck_before_latest_move(self):
+        outcome = {"checked_ts": "2026-09-17T06:00:00Z", "result": "skipped",
+                   "reason": "no new episode"}
+        history = [{"type": "moved", "msg": "m", "time": "2026-09-17T04:40:00",
+                    "entry_url": self.URL, "episode": 12}]
+        self.assertEqual(self.trails(history, outcome=outcome)[self.URL]["state"], "moved")
+        stuck = {"k": {"reason": "bad_offset", "ignored": False,
+                       "first_seen": "2026-09-16T01:00:00", "entry_url": self.URL}}
+        trail = self.trails(history, stuck, outcome=outcome)[self.URL]
+        self.assertEqual((trail["state"], trail["episode"], trail["sent_ts"]),
+                         ("stuck", None, None))
+
+    def test_nothing_known_and_junk_inputs(self):
+        self.assertEqual(app.entry_download_trails([self.ENTRY], None, None, None), {})
+        self.assertEqual(app.entry_download_trails(
+            [self.ENTRY, "junk"], {self.URL: "junk"}, ["junk", {"type": "moved"}],
+            {"k": "junk"}), {})
+
+
+class EntryTrailLineTest(unittest.TestCase):
+    """entry_trail_line / render_entry_check: the trail as one quiet card line."""
+
+    NOW = datetime(2026, 9, 17, 18, 50)
+
+    def line(self, **trail):
+        return app.entry_trail_line(trail, now=self.NOW)
+
+    def test_sent_variants(self):
+        sent = dict(sent_ts="2026-09-17T04:31:00Z", episode=12)
+        self.assertEqual(self.line(state="moved", at="2026-09-17T04:40:00", **sent), (
+            "Checked 04:31 · episode 12 sent to JDownloader → moved to library 04:40", False))
+        self.assertEqual(self.line(state="stuck", reason="exists", at="2026-09-17T04:40:00", **sent), (
+            "Checked 04:31 · episode 12 sent to JDownloader → stuck: already in the library", True))
+        self.assertEqual(self.line(state="waiting", **sent), (
+            "Checked 04:31 · episode 12 sent to JDownloader → waiting for download", False))
+        self.assertEqual(self.line(state="waiting", sent_ts="2026-09-17T04:31:00Z", episode=None)[0],
+                         "Checked 04:31 · sent to JDownloader → waiting for download")
+
+    def test_without_send(self):
+        self.assertEqual(self.line(state="moved", episode=12, at="2026-09-15T04:40:00")[0],
+                         "Episode 12 moved to library Tue 15 Sep 04:40")
+        self.assertEqual(self.line(state="stuck", episode=None, reason="parse")[0],
+                         "A download is stuck: can't read season/episode")
+        self.assertEqual(app.entry_trail_line(None), ("", False))
+
+    def test_sent_trail_replaces_the_check_line(self):
+        outcome = {"checked_ts": "2026-09-17T04:31:00Z", "result": "downloaded",
+                   "reason": "episode downloaded", "episode": 12}
+        trail = {"state": "stuck", "episode": 12, "sent_ts": "2026-09-17T04:31:00Z",
+                 "at": "2026-09-17T04:40:00", "reason": "loose"}
+        out = app.render_entry_check(outcome, now=self.NOW, trail=trail)
+        self.assertEqual(out.count("<p"), 1)
+        self.assertNotIn("downloaded episode 12", out)
+        self.assertIn("wl-checked--danger", out)
+        self.assertIn('<a href="#move-stuck">Review</a>', out)
+
+    def test_unsent_trail_is_one_extra_line_and_card_keeps_its_attrs(self):
+        outcome = {"checked_ts": "2026-09-17T06:00:00Z", "result": "skipped",
+                   "reason": "no new episode"}
+        trail = {"state": "moved", "episode": 12, "sent_ts": None,
+                 "at": "2026-09-17T04:40:00", "reason": ""}
+        entry = {"name": "Frieren", "url": "http://x/frieren", "episodes": 12}
+        card = app.render_watchlist_card(0, entry, outcome, trail=trail)
+        self.assertIn("Episode 12 moved to library", card)
+        self.assertIn('id="{}"'.format(app.entry_anchor_id(entry["url"])), card)
+        self.assertIn('data-state="airing"', card)
+        html_out = app.render_watchlist([entry], None, {entry["url"]: outcome},
+                                        trails={entry["url"]: trail})
+        self.assertIn("Episode 12 moved to library", html_out)
+
+
+class WatchlistStatusRecheckTest(unittest.TestCase):
+    """An overdue airdate reads the bot's real next check, skip_recheck_at."""
+
+    TODAY = date(2026, 9, 17)
+
+    def details(self, **extra):
+        entry = {"episodes": 11, "skip_until": "2026-09-15", "skip_real_airdate": True}
+        entry.update(extra)
+        return app.watchlist_status(entry, today=self.TODAY)[2]
+
+    def test_overdue_with_recheck_reads_the_recheck(self):
+        self.assertEqual(self.details(skip_recheck_at="2026-09-17T14:00:00.123456")[0],
+                         "rechecking at 14:00")
+        self.assertEqual(self.details(skip_recheck_at="2026-09-18T01:00:00")[0],
+                         "rechecking at Fri 18 Sep 01:00")
+
+    def test_without_recheck_or_future_airdate_keeps_the_date(self):
+        self.assertEqual(self.details()[0], "next episode was due Tue 15 Sep")
+        self.assertEqual(self.details(skip_until="2026-09-20",
+                                      skip_recheck_at="2026-09-17T14:00:00")[0],
+                         "next episode Sun 20 Sep")
+        self.assertEqual(self.details(skip_recheck_at="garbage")[0],
+                         "next episode was due Tue 15 Sep")
+
+
+class MoveRecordTrailFieldsTest(unittest.TestCase):
+    """New mover records carry the watchlist entry URL and library episode
+    the card's download trail joins on."""
+
+    setUp = RunMoveCycleTest.setUp
+    tearDown = RunMoveCycleTest.tearDown
+    _write_ani = RunMoveCycleTest._write_ani
+    _make_dl = RunMoveCycleTest._make_dl
+
+    def test_series_move_and_exists_stuck_carry_url_and_episode(self):
+        self._write_ani([{"name": "Frieren", "url": "http://x/f", "customPackage": "Frieren",
+                          "episode_offset": 2}])
+        self._make_dl("Frieren", ["Frieren.S01E10.mkv"])
+        events = app.run_move_cycle()
+        moved = [e for e in events if e["type"] == "moved"]
+        self.assertEqual((moved[0]["entry_url"], moved[0]["episode"]), ("http://x/f", 12))
+
+        self._make_dl("Frieren", ["Frieren.S01E10.mkv"])
+        app.run_move_cycle()
+        rec = next(r for r in app._stuck_items.values() if r["reason"] == "exists")
+        self.assertEqual((rec["entry_url"], rec["episode"]), ("http://x/f", 12))

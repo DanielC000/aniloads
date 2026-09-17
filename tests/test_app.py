@@ -6633,7 +6633,6 @@ class JumpBarAndCompactPanelsTest(unittest.TestCase):
     DATA = {"settings": {}, "anime": [
         {"name": "A", "url": "https://www.anime-loads.org/media/a", "episodes": 1}]}
     OK = ("Site Login", {"state": "ok", "detail": "Logged in"})
-
     def setUp(self):
         self._orig_get_health = app.get_health
 
@@ -6727,6 +6726,113 @@ class JumpBarAndCompactPanelsTest(unittest.TestCase):
         c.feed(self.page())
         self.assertEqual(len(c.ids), len(set(c.ids)))
         self.assertNotIn("%%", self.page())
+
+
+class CheckDownloadBackendHealthTest(unittest.TestCase):
+    """check_download_backend_health reads the bot-written
+    `waiting_for_config` run_state key (see bot/anibot.py's
+    write_waiting_for_config) — card 9cf82ae0."""
+
+    def test_absent_marker_returns_none(self):
+        self.assertIsNone(app.check_download_backend_health({}))
+        self.assertIsNone(app.check_download_backend_health({"last_run": {}}))
+
+    def test_marker_present_is_fail_with_reason_and_settings_link(self):
+        result = app.check_download_backend_health({
+            "waiting_for_config": {"reason": "no download backend configured", "since": "2026-09-17T00:00:00Z"},
+        })
+        self.assertEqual(result["state"], "fail")
+        self.assertEqual(result["detail"], "Download backend not configured")
+        self.assertIn("no download backend configured", result["hint"])
+        self.assertEqual(result["link_anchor"], app.ANCHOR_SETTINGS)
+
+    def test_malformed_marker_falls_back_to_generic_reason(self):
+        result = app.check_download_backend_health({"waiting_for_config": {}})
+        self.assertEqual(result["state"], "fail")
+        self.assertIn("hint", result)
+
+
+class GetHealthDownloadBackendRowTest(unittest.TestCase):
+    """get_health includes/omits the "Download Backend" row based solely on
+    whether run_state.json carries a `waiting_for_config` marker."""
+
+    def setUp(self):
+        fd, self._path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        os.remove(self._path)
+        self._orig_ani = app.ANI_JSON
+        self._orig_rs = app.RUN_STATE_FILE
+        self._orig_tvdb_available = app.tvdb.available
+        app.ANI_JSON = self._path
+        self._rs_path = os.path.join(tempfile.mkdtemp(prefix="aniloads-waiting-health-"), "run_state.json")
+        app.RUN_STATE_FILE = self._rs_path
+        app.tvdb.available = False
+        app._HEALTH_CACHE.clear()
+
+    def tearDown(self):
+        app.ANI_JSON = self._orig_ani
+        app.RUN_STATE_FILE = self._orig_rs
+        app.tvdb.available = self._orig_tvdb_available
+        app._HEALTH_CACHE.clear()
+        try:
+            os.remove(self._rs_path)
+        except OSError:
+            pass
+
+    def test_no_marker_no_row(self):
+        rows = app.get_health()
+        labels = [label for label, _ in rows]
+        self.assertNotIn("Download Backend", labels)
+
+    def test_marker_present_adds_fail_row(self):
+        with open(app.RUN_STATE_FILE, "w") as f:
+            json.dump({"schema": 1, "waiting_for_config": {
+                "reason": "no download backend configured", "since": "2026-09-17T00:00:00Z"}}, f)
+        rows = app.get_health()
+        by_label = dict(rows)
+        self.assertIn("Download Backend", by_label)
+        self.assertEqual(by_label["Download Backend"]["state"], "fail")
+
+
+class RenderHealthCardLinkTest(unittest.TestCase):
+    """A health row's optional link_anchor renders as an in-page anchor link
+    (never a raw/unescaped URL) — used by the Download Backend fail row to
+    jump to Settings."""
+
+    def setUp(self):
+        self._orig_get_health = app.get_health
+
+    def tearDown(self):
+        app.get_health = self._orig_get_health
+
+    def test_link_anchor_renders_settings_link(self):
+        app.get_health = lambda: [
+            ("Download Backend", {"state": "fail", "detail": "Download backend not configured",
+                                   "hint": "Set it.", "link_anchor": app.ANCHOR_SETTINGS,
+                                   "link_text": "Go to Settings"}),
+        ]
+        out = app.render_health_card()
+        self.assertIn("#settings", out)
+        self.assertIn("at=settings", out)
+        self.assertIn("Go to Settings", out)
+
+    def test_no_link_anchor_renders_no_link(self):
+        app.get_health = lambda: [
+            ("JDownloader", {"state": "fail", "detail": "Unreachable", "hint": "Check the host."}),
+        ]
+        out = app.render_health_card()
+        self.assertNotIn("<a href", out)
+
+    def test_download_backend_fail_row_forces_full_panel(self):
+        app.get_health = lambda: [
+            ("Site Login", {"state": "ok", "detail": "Logged in"}),
+            ("Download Backend", {"state": "fail", "detail": "Download backend not configured",
+                                   "hint": "Set it.", "link_anchor": app.ANCHOR_SETTINGS,
+                                   "link_text": "Go to Settings"}),
+        ]
+        out = app.render_health_card()
+        self.assertTrue(out.startswith('<div class="health-grid">'))
+        self.assertNotIn("health-compact", out)
 
 
 class StuckAssignTest(unittest.TestCase):
@@ -7195,3 +7301,26 @@ class AddUrlValidatorIntegrationTest(unittest.TestCase):
         result = self._post("/remove", {"key": odd_url})
         self.assertEqual(result.get("msg"), "Removed: Legacy")
         self.assertEqual(app.load_ani()["anime"], [])
+
+
+class RenderActivityWaitingForConfigTest(unittest.TestCase):
+    """The Bot Activity status line says "Waiting for configuration" while
+    the bot's boot loop is stuck without a usable download backend, instead
+    of a plain (misleadingly healthy-looking) "Running" — card 9cf82ae0."""
+
+    def test_waiting_marker_overrides_running_text(self):
+        act = {
+            "status": {"running": True},
+            "runs": [], "last_run": None,
+            "waiting_for_config": {"reason": "no download backend configured",
+                                    "since": "2026-09-17T00:00:00Z"},
+        }
+        status_html, _last, _next = app.render_activity(act)
+        self.assertIn("Waiting for configuration", status_html)
+        self.assertNotIn(">Running<", status_html)
+
+    def test_no_marker_shows_plain_running(self):
+        act = {"status": {"running": True}, "runs": [], "last_run": None}
+        status_html, _last, _next = app.render_activity(act)
+        self.assertIn("Running", status_html)
+        self.assertNotIn("Waiting for configuration", status_html)

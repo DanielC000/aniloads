@@ -884,6 +884,73 @@ def write_login_state(user_configured, ok, error=None, vip=None):
         # Run-state bookkeeping is never allowed to take down the bot loop.
         pass
 
+def write_waiting_for_config(reason):
+    """Persist a `waiting_for_config` marker as a top-level key in
+    run_state.json, alongside (not inside) `last_run`/`runs`/`login` --
+    written once when startbot()'s boot backoff loops (missing/corrupt
+    config, no download backend, no MyJDownloader password, no JD port)
+    start retrying, so the dashboard can flag the one thing blocking
+    everything instead of showing an ambiguous "no completed cycle" state.
+    Cleared by clear_waiting_for_config() once the boot loops finish and the
+    main cycle loop starts.
+
+    Additive: existing readers that only look at `last_run`/`runs`/`login`
+    are unaffected, and a reader must tolerate this key's absence. `reason`
+    is a short, non-identifying description of what's missing -- never pass
+    a credential or JD host/port (run_state.json is dashboard-visible).
+
+    Best-effort like write_login_state: a write failure must never break the
+    bot loop."""
+    try:
+        record = {"reason": str(reason)[:200], "since": _utcnow_iso()}
+        path = _run_state_path()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            if not isinstance(state, dict):
+                state = {}
+        except (FileNotFoundError, OSError, ValueError):
+            state = {}
+        state.setdefault("schema", 1)
+        state["waiting_for_config"] = record
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        # Run-state bookkeeping is never allowed to take down the bot loop.
+        pass
+
+def clear_waiting_for_config():
+    """Remove the `waiting_for_config` marker (see write_waiting_for_config)
+    once startbot() has a usable download backend/port and starts the main
+    cycle loop. A no-op when the marker isn't set (e.g. a fresh install that
+    was already fully configured). Best-effort, same as write_run_state."""
+    try:
+        path = _run_state_path()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            if not isinstance(state, dict):
+                return
+        except (FileNotFoundError, OSError, ValueError):
+            return
+        if "waiting_for_config" not in state:
+            return
+        del state["waiting_for_config"]
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
 def load_ani_cycle_start(path):
     """Load ani.json at the start of a bot cycle, under the lock shared with
     the dashboard. Returns (data, None) on success, or (None, error) if the
@@ -1680,6 +1747,8 @@ def startbot():
         interactive = True
 
     config_attempt = 0
+    if jdhost == False and not interactive:
+        write_waiting_for_config("no download backend configured (set jdhost or myjd_user)")
     while(jdhost == False):
         if(interactive):
             print("Noch keine oder Fehlerhafte konfiguration, leite weiter zu Einstellungen")
@@ -1761,6 +1830,7 @@ def startbot():
             # password. Don't sys.exit (crash-loops under unless-stopped); stay
             # alive and re-read the config with backoff so the owner can fix it
             # without manually restarting the container.
+            write_waiting_for_config("no MyJDownloader password and no JD host set")
             jdpw_attempt = 0
             while(jdhost == "" and myjd_pass == ""):
                 jdpw_attempt += 1
@@ -1784,6 +1854,8 @@ def startbot():
                     print("Fehlerhafte Logindaten")
     _log.info("Erfolgreich eingeloggt")
     port_attempt = 0
+    if jd_deprecated and jd_deprecatedport == "" and not interactive:
+        write_waiting_for_config("no JD port set")
     while (jd_deprecated and jd_deprecatedport == ""):
         if interactive:
             _log.error("Kein JD port gesetzt. beende...")
@@ -1795,6 +1867,8 @@ def startbot():
         _log.error("Kein JD port gesetzt — Container bleibt aktiv, erneute Pruefung in %ds", delay)
         time.sleep(delay)
         jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport, al_user, al_pass = loadconfig()
+
+    clear_waiting_for_config()
 
     while(True):
         # Per-cycle run-state bookkeeping (persisted for the dashboard's

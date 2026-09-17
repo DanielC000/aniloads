@@ -1927,3 +1927,76 @@ class TvdbChecksApplyTest(unittest.TestCase):
         # The bot must never write these back over a dashboard edit.
         for field in ("tvdb_season", "episode_offset", "tvdb_id"):
             self.assertNotIn(field, anibot.BOT_OWNED_SCALAR_FIELDS)
+
+
+class WaitingForConfigStateTest(unittest.TestCase):
+    """The bot records an additive top-level `waiting_for_config` marker in
+    run_state.json while startbot()'s boot backoff loops are stuck without a
+    usable download backend/port, and clears it once the main cycle loop
+    starts -- see card 9cf82ae0."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-waitingconfig-")
+        self._orig_botfile = anibot.botfile
+        anibot.botfile = os.path.join(self.tmp, "ani.json")
+        self.path = os.path.join(self.tmp, "run_state.json")
+
+    def tearDown(self):
+        anibot.botfile = self._orig_botfile
+
+    def _read(self):
+        with open(self.path, "r") as f:
+            return json.load(f)
+
+    def test_marker_written_with_reason_and_since(self):
+        anibot.write_waiting_for_config("no download backend configured")
+        marker = self._read()["waiting_for_config"]
+        self.assertEqual(marker["reason"], "no download backend configured")
+        self.assertIn("since", marker)
+
+    def test_reason_truncated_at_200_chars(self):
+        anibot.write_waiting_for_config("x" * 500)
+        self.assertEqual(len(self._read()["waiting_for_config"]["reason"]), 200)
+
+    def test_clear_removes_marker(self):
+        anibot.write_waiting_for_config("no download backend configured")
+        anibot.clear_waiting_for_config()
+        self.assertNotIn("waiting_for_config", self._read())
+
+    def test_clear_without_marker_is_a_noop(self):
+        anibot.write_run_state("2026-06-13T19:00:00Z", "2026-06-13T19:01:00Z", 600, {"checked": 1})
+        anibot.clear_waiting_for_config()
+        state = self._read()
+        self.assertNotIn("waiting_for_config", state)
+        self.assertIn("last_run", state)
+
+    def test_clear_when_never_written_creates_no_file(self):
+        anibot.clear_waiting_for_config()
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_marker_additive_alongside_existing_run_history(self):
+        anibot.write_run_state("2026-06-13T19:00:00Z", "2026-06-13T19:01:00Z", 600, {"checked": 1})
+        anibot.write_waiting_for_config("no download backend configured")
+        state = self._read()
+        self.assertIn("last_run", state)
+        self.assertIn("waiting_for_config", state)
+
+    def test_later_marker_overwrites_earlier_one(self):
+        anibot.write_waiting_for_config("no download backend configured")
+        anibot.write_waiting_for_config("no JD port set")
+        self.assertEqual(self._read()["waiting_for_config"]["reason"], "no JD port set")
+
+    def test_corrupt_existing_file_is_replaced_not_fatal(self):
+        with open(self.path, "w") as f:
+            f.write("{not valid json")
+        anibot.write_waiting_for_config("no download backend configured")
+        self.assertEqual(
+            self._read()["waiting_for_config"]["reason"], "no download backend configured")
+
+    def test_never_raises_on_unwritable_path(self):
+        blocker = os.path.join(self.tmp, "blocked")
+        with open(blocker, "w") as f:
+            f.write("x")
+        anibot.botfile = os.path.join(blocker, "ani.json")
+        anibot.write_waiting_for_config("no download backend configured")  # must not raise
+        anibot.clear_waiting_for_config()  # must not raise

@@ -726,6 +726,14 @@ def get_activity():
     # fine while Health already flagged a stale cycle.
     result["staleness"] = check_bot_staleness(run_state)
 
+    # Surfaced so render_activity can say "Waiting for configuration" instead
+    # of a plain "Running" dot while the bot is stuck in its boot backoff loop
+    # (see bot/anibot.py's write_waiting_for_config) -- the container/process
+    # is up, but no cycle can start without a download backend.
+    waiting = run_state.get("waiting_for_config") if isinstance(run_state, dict) else None
+    if isinstance(waiting, dict):
+        result["waiting_for_config"] = waiting
+
     return result
 
 
@@ -1145,13 +1153,35 @@ def check_bot_staleness(run_state=None):
     return {"state": "ok", "detail": "Last cycle finished {} min ago".format(mins)}
 
 
+def check_download_backend_health(run_state=None):
+    """Fail row while the bot's boot loop is stuck without a usable download
+    backend/port (see bot/anibot.py's write_waiting_for_config). Unlike the
+    other checks, an absent marker isn't itself noteworthy — it means the
+    bot was never stuck at boot, or already recovered — so this returns
+    None rather than "unknown", and get_health() omits the row entirely."""
+    run_state = run_state if run_state is not None else load_run_state()
+    marker = run_state.get("waiting_for_config") if isinstance(run_state, dict) else None
+    if not isinstance(marker, dict):
+        return None
+    reason = marker.get("reason") or "no download backend configured"
+    return {
+        "state": "fail",
+        "detail": "Download backend not configured",
+        "hint": "{} — set it in Settings.".format(reason),
+        "link_anchor": ANCHOR_SETTINGS,
+        "link_text": "Go to Settings",
+    }
+
+
 def get_health():
     """Assemble every health row. Cheap to call on every /api/status poll —
     each row is either free (login/staleness) or backed by its own cache.
 
     A single check raising (e.g. an unexpected error reaching a probed
     service) must never blank the whole card or break the 10s poll — it
-    degrades that one row to "unknown" and the rest still render."""
+    degrades that one row to "unknown" and the rest still render. A check
+    that returns None (see check_download_backend_health) contributes no
+    row at all."""
     run_state = load_run_state()
     checks = [
         ("Site Login", lambda: check_login_health(run_state)),
@@ -1159,13 +1189,16 @@ def get_health():
         ("TVDB", check_tvdb_health),
         ("Disk Space", check_disk_health),
         ("Bot Cycles", lambda: check_bot_staleness(run_state)),
+        ("Download Backend", lambda: check_download_backend_health(run_state)),
     ]
     rows = []
     for label, check in checks:
         try:
-            rows.append((label, check()))
+            result = check()
         except Exception as e:
-            rows.append((label, {"state": "unknown", "detail": "Check failed: {}".format(e)}))
+            result = {"state": "unknown", "detail": "Check failed: {}".format(e)}
+        if result is not None:
+            rows.append((label, result))
     return rows
 
 
@@ -1193,7 +1226,13 @@ def render_health_card():
         badge_label = _HEALTH_LABEL.get(state, "Unknown")
         hint_html = ""
         if state != "ok" and result.get("hint"):
-            hint_html = '<div class="hint">{}</div>'.format(escape(result["hint"]))
+            hint_text = escape(result["hint"])
+            link_anchor = result.get("link_anchor")
+            if link_anchor and _ANCHOR_RE.match(link_anchor):
+                href = "/?" + urlencode({"at": link_anchor}) + "#" + link_anchor
+                hint_text += ' <a href="{}">{}</a>'.format(
+                    escape(href), escape(result.get("link_text") or "Go there"))
+            hint_html = '<div class="hint">{}</div>'.format(hint_text)
         rows.append(
             '<div class="health-row">'
             '<div class="health-row-main">'
@@ -3195,15 +3234,24 @@ def render_activity(activity, now=None):
     else:
         bot_running = status.get("running", False)
         dot_class = "running" if bot_running else "stopped"
-        status_text = '<span class="status-dot {}"></span>{}'.format(
-            dot_class, "Running" if bot_running else "Stopped"
-        )
-        # Health's own "Bot Cycles" row is the authority on staleness; don't
-        # let a green "Running" dot silently contradict it.
-        staleness = activity.get("staleness")
-        if bot_running and isinstance(staleness, dict) and staleness.get("state") == "warn":
-            status_text += ' <span class="hint">&mdash; {}</span>'.format(
-                escape(staleness.get("detail", "")))
+        waiting = activity.get("waiting_for_config")
+        if isinstance(waiting, dict):
+            # The container/process is up but stuck in its boot backoff loop
+            # (see bot/anibot.py's write_waiting_for_config) -- a plain
+            # "Running" dot here would look identical to a healthy fresh
+            # start, which is exactly the gap card 9cf82ae0 closes.
+            status_text = '<span class="status-dot {}"></span>Waiting for configuration'.format(
+                dot_class)
+        else:
+            status_text = '<span class="status-dot {}"></span>{}'.format(
+                dot_class, "Running" if bot_running else "Stopped"
+            )
+            # Health's own "Bot Cycles" row is the authority on staleness; don't
+            # let a green "Running" dot silently contradict it.
+            staleness = activity.get("staleness")
+            if bot_running and isinstance(staleness, dict) and staleness.get("state") == "warn":
+                status_text += ' <span class="hint">&mdash; {}</span>'.format(
+                    escape(staleness.get("detail", "")))
 
     # Prefer the persisted run-state line (immune to log-tail rollover); fall
     # back to the log-parsed last run, then to the empty/unavailable states.

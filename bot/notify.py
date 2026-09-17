@@ -160,12 +160,21 @@ def _parse_gotify(parts, secure):
 
 def send_all(targets, title, message):
     """Send `message` (with `title`) to every target. Never raises — a
-    per-target failure is logged (redacted) and the rest are still tried."""
+    per-target failure is logged (redacted) and the rest are still tried.
+
+    Returns a list of {"kind", "ok", "error"?} dicts, one per target in
+    order, for a caller that wants a per-target result (e.g. the dashboard's
+    "Send test" button) — additive: existing callers that ignore the return
+    value are unaffected."""
+    results = []
     for target in targets:
         try:
             _send_one(target, title, message)
+            results.append({"kind": target.get("kind"), "ok": True})
         except Exception as e:
             _log.warning("notify: send failed for %s: %s", _redact(target.get("url", "")), e)
+            results.append({"kind": target.get("kind"), "ok": False, "error": str(e)})
+    return results
 
 
 def _send_one(target, title, message):

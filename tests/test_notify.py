@@ -256,5 +256,41 @@ class SendAllNeverRaisesTest(unittest.TestCase):
         notify.send_all([], "Aniloads", "hello")
 
 
+class SendAllReturnValueTest(unittest.TestCase):
+    """send_all returns a per-target {kind, ok, error?} result list, in
+    order — additive: existing callers (bot/anibot.py's _notify_cycle) that
+    ignore the return value are unaffected either way."""
+
+    def test_successful_send_reports_ok_true(self):
+        good = {"kind": "ntfy", "url": "https://ntfy.example.com/topic"}
+        with mock.patch("notify.urllib.request.urlopen"):
+            results = notify.send_all([good], "Aniloads", "hello")
+        self.assertEqual(results, [{"kind": "ntfy", "ok": True}])
+
+    def test_failed_send_reports_ok_false_with_error(self):
+        bad = {"kind": "discord", "url": "https://discord.com/api/webhooks/1/tok"}
+        with mock.patch("notify.urllib.request.urlopen", side_effect=OSError("timed out")):
+            results = notify.send_all([bad], "Aniloads", "hello")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["kind"], "discord")
+        self.assertFalse(results[0]["ok"])
+        self.assertIn("timed out", results[0]["error"])
+
+    def test_results_preserve_order_across_mixed_outcomes(self):
+        bad = {"kind": "ntfy", "url": "https://bad.example.com/topic"}
+        good = {"kind": "discord", "url": "https://discord.com/api/webhooks/1/tok"}
+
+        def fake_send_one(target, title, message):
+            if target is bad:
+                raise OSError("unreachable")
+
+        with mock.patch.object(notify, "_send_one", side_effect=fake_send_one):
+            results = notify.send_all([bad, good], "Aniloads", "hello")
+        self.assertEqual([r["ok"] for r in results], [False, True])
+
+    def test_empty_target_list_returns_empty_list(self):
+        self.assertEqual(notify.send_all([], "Aniloads", "hello"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

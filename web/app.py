@@ -1173,6 +1173,52 @@ def check_download_backend_health(run_state=None):
     }
 
 
+# Display label per notify.py target "kind" — never the raw url/token, see
+# _notify_target_label below.
+_NOTIFY_KIND_LABEL = {"ntfy": "ntfy", "discord": "Discord", "gotify": "Gotify"}
+
+
+def _notify_target_label(target):
+    """"Kind (host)" for a parsed notify.py target — e.g. "Discord
+    (discord.com)", "ntfy (ntfy.sh)". Never the topic/webhook id/token: only
+    the scheme-derived host, same redaction boundary as notify._redact."""
+    kind = target.get("kind")
+    label = _NOTIFY_KIND_LABEL.get(kind, kind or "?")
+    host = urlparse(target.get("url", "")).hostname or "?"
+    return "{} ({})".format(label, host)
+
+
+def check_notify_health():
+    """Notification targets configured via NOTIFY_URL (env-only — there is no
+    dashboard field for it), parsed through notify.py's own parser so this
+    never re-implements or drifts from it. Never renders the url/token —
+    only the service kind and host (see _notify_target_label)."""
+    raw = os.environ.get("NOTIFY_URL", "")
+    raw_entries = [r for r in (e.strip() for e in raw.split(",")) if r] if raw else []
+    if not raw_entries:
+        # Notifications are opt-in — leaving NOTIFY_URL unset is the common
+        # case, not a problem. "ok" (rather than "unknown") so this row never
+        # trips render_health_card's "No problems found · N unknown" wording
+        # and a reader who never configured notifications still sees a plain
+        # "All systems OK".
+        return {"state": "ok", "detail": "Not configured (optional)"}
+    targets = notify.parse_targets(raw)
+    unrecognised = len(raw_entries) - len(targets)
+    if targets:
+        detail = "{} target{}: {}".format(
+            len(targets), "" if len(targets) == 1 else "s",
+            ", ".join(_notify_target_label(t) for t in targets))
+    else:
+        detail = "0 targets"
+    if unrecognised:
+        return {
+            "state": "warn",
+            "detail": "{}; {} unrecognised".format(detail, unrecognised),
+            "hint": "Check NOTIFY_URL — an entry couldn't be parsed (see the bot/dashboard logs).",
+        }
+    return {"state": "ok", "detail": detail}
+
+
 def get_health():
     """Assemble every health row. Cheap to call on every /api/status poll —
     each row is either free (login/staleness) or backed by its own cache.
@@ -1190,6 +1236,7 @@ def get_health():
         ("Disk Space", check_disk_health),
         ("Bot Cycles", lambda: check_bot_staleness(run_state)),
         ("Download Backend", lambda: check_download_backend_health(run_state)),
+        ("Notifications", check_notify_health),
     ]
     rows = []
     for label, check in checks:
@@ -1259,6 +1306,82 @@ def render_health_card():
             '<span class="health-headline">{headline}</span>'
             '<span class="health-detail">{detail}</span></summary>{grid}</details>').format(
                 badge=badge, headline=headline, detail=detail, grid=grid)
+
+
+# Guards the "Send test" button's cooldown check + timestamp write as one
+# atomic step, same reasoning as _run_now_lock: two concurrent /notify-test
+# POSTs must not both pass the cooldown check before either one's write lands.
+_notify_test_lock = threading.Lock()
+_notify_test_last = [0.0]  # time.monotonic() of the last accepted test send
+NOTIFY_TEST_COOLDOWN_SECONDS = 30
+# Bounds how long a POST /notify-test response can be held open — a slow or
+# unreachable target must not be able to hang the dashboard (see send_all's
+# own per-target try/except; this is a second, coarser backstop around the
+# whole batch since a hung urlopen still blocks its own thread).
+NOTIFY_TEST_TIMEOUT_SECONDS = 15
+
+
+def notify_test_cooldown_remaining(now=None):
+    """Seconds remaining before another /notify-test POST is allowed, or 0 if
+    the cooldown has elapsed (or no test has ever been sent). In-memory only
+    — unlike run-now's cooldown this doesn't need to survive a restart, since
+    it only rate-limits an on-demand manual action."""
+    now = now if now is not None else time.monotonic()
+    return max(0, int(NOTIFY_TEST_COOLDOWN_SECONDS - (now - _notify_test_last[0])))
+
+
+def trigger_notify_test():
+    """Send a short test message to every NOTIFY_URL target, through
+    notify.send_all (never re-implemented here).
+
+    Rate-limited via notify_test_cooldown_remaining, and run on a background
+    thread with a bounded join timeout so one slow/unreachable target can't
+    hang the request. Returns (ok, message); ok is False only when the
+    request itself was rejected (cooldown, no targets) — a per-target send
+    failure still returns ok=True, with the failures named (by service+host
+    only, see _notify_target_label — never the url/token) in the message."""
+    with _notify_test_lock:
+        remaining = notify_test_cooldown_remaining()
+        if remaining > 0:
+            return False, "Cooling down — try again in {}s".format(remaining)
+        targets = notify.parse_targets(os.environ.get("NOTIFY_URL", ""))
+        if not targets:
+            return False, "No notification targets configured"
+        _notify_test_last[0] = time.monotonic()
+
+    outcome = {}
+
+    def _run():
+        outcome["results"] = notify.send_all(targets, "Aniloads", "Test notification from the dashboard")
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(NOTIFY_TEST_TIMEOUT_SECONDS)
+    if thread.is_alive():
+        return True, "Test notification sent to {} target(s) — still in progress after {}s".format(
+            len(targets), NOTIFY_TEST_TIMEOUT_SECONDS)
+
+    results = outcome.get("results") or []
+    failed = [_notify_target_label(t) for t, r in zip(targets, results) if not r.get("ok")]
+    ok_count = len(results) - len(failed)
+    if not failed:
+        return True, "Test notification sent OK to {} target(s)".format(ok_count)
+    return True, "Test notification: {} OK, failed: {}".format(ok_count, ", ".join(failed))
+
+
+def render_notify_test_button():
+    """"Send test" button below the Health card — disabled with a reason
+    when no NOTIFY_URL targets are configured, same pattern as
+    render_move_now_button."""
+    targets = notify.parse_targets(os.environ.get("NOTIFY_URL", ""))
+    if targets:
+        return ('<form method="POST" action="/notify-test" style="margin-top:8px;">'
+                '<button type="submit" class="btn btn-ghost btn-sm">Send test notification</button>'
+                '</form>')
+    return ('<form method="POST" action="/notify-test" style="margin-top:8px;">'
+            '<button type="submit" class="btn btn-ghost btn-sm" disabled '
+            'title="No notification targets configured">Send test notification</button>'
+            '</form>')
 
 
 # Alias-tolerant language matching. Site labels are German ("Deutsch",
@@ -1533,12 +1656,13 @@ def _duplicate_msg(entry):
 # Page sections a redirect can land on (each has a matching id in
 # HTML_TEMPLATE). Entry cards use entry_anchor_id() instead.
 ANCHOR_BOT = "bot-activity"
+ANCHOR_HEALTH = "health"
 ANCHOR_MOVER = "file-mover"
 ANCHOR_PREFS = "preferences"
 ANCHOR_SETTINGS = "settings"
 ANCHOR_ADD_FLOW = "add-flow"
 ANCHOR_WATCHLIST = "watchlist"
-SECTION_ANCHORS = (ANCHOR_BOT, ANCHOR_MOVER, ANCHOR_PREFS, ANCHOR_SETTINGS,
+SECTION_ANCHORS = (ANCHOR_BOT, ANCHOR_HEALTH, ANCHOR_MOVER, ANCHOR_PREFS, ANCHOR_SETTINGS,
                    ANCHOR_ADD_FLOW, ANCHOR_WATCHLIST)
 
 # The disclosures on a watchlist card a redirect can re-open.
@@ -2812,9 +2936,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 <div class="section">
   <h2>Health</h2>
+  %%STATUS@health%%
   <div class="card" id="health">
     %%HEALTH%%
   </div>
+  %%NOTIFY_TEST_BUTTON%%
 </div>
 
 <div class="section">
@@ -5750,6 +5876,7 @@ def render_page(status="", search_html="", prefs_open=False, ani_data=None, sear
     page = page.replace("%%RUN_HISTORY_OPEN%%", "open " if history_open else "")
     page = page.replace("%%RUN_HISTORY%%", history_html)
     page = page.replace("%%HEALTH%%", health_html)
+    page = page.replace("%%NOTIFY_TEST_BUTTON%%", render_notify_test_button())
     page = page.replace("%%MOVE_STATUS%%", move_status_html)
     page = page.replace("%%MOVE_LAST_RUN%%", move_last_html)
     page = page.replace("%%MOVE_NOW_BUTTON%%", render_move_now_button())
@@ -6342,6 +6469,15 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 _log.warning("[bot] Run now request rejected: %s", msg)
                 self._redirect_msg("Error: {}".format(msg), level="err", anchor=ANCHOR_BOT)
+
+        elif parsed.path == "/notify-test":
+            ok, msg = trigger_notify_test()
+            if ok:
+                _log.info("[notify] Test notification requested via dashboard: %s", msg)
+                self._redirect_msg(msg, anchor=ANCHOR_HEALTH)
+            else:
+                _log.warning("[notify] Test notification request rejected: %s", msg)
+                self._redirect_msg(msg, level="err", anchor=ANCHOR_HEALTH)
 
         elif parsed.path == "/check-now":
             entry_url = params.get("key", "")

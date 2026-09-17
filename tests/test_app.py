@@ -19,6 +19,7 @@ import types
 import unittest
 import zoneinfo
 from datetime import date, datetime, timedelta, timezone
+from unittest import mock
 from urllib.parse import urlparse, parse_qs, quote
 
 import support
@@ -4041,21 +4042,28 @@ class GetHealthDefaultStateTest(unittest.TestCase):
         self._orig_ani = app.ANI_JSON
         self._orig_rs = app.RUN_STATE_FILE
         self._orig_tvdb_available = app.tvdb.available
+        self._orig_notify_url = os.environ.get("NOTIFY_URL")
         app.ANI_JSON = self._path
         app.RUN_STATE_FILE = os.path.join(tempfile.gettempdir(), "aniloads-no-health-run-state.json")
         app.tvdb.available = False
+        os.environ["NOTIFY_URL"] = ""  # hermetic: never depend on the host's own env
         app._HEALTH_CACHE.clear()
 
     def tearDown(self):
         app.ANI_JSON = self._orig_ani
         app.RUN_STATE_FILE = self._orig_rs
         app.tvdb.available = self._orig_tvdb_available
+        if self._orig_notify_url is None:
+            os.environ.pop("NOTIFY_URL", None)
+        else:
+            os.environ["NOTIFY_URL"] = self._orig_notify_url
         app._HEALTH_CACHE.clear()
 
-    def test_five_rows_returned(self):
+    def test_six_rows_returned(self):
         rows = app.get_health()
         labels = [label for label, _ in rows]
-        self.assertEqual(labels, ["Site Login", "JDownloader", "TVDB", "Disk Space", "Bot Cycles"])
+        self.assertEqual(labels,
+                          ["Site Login", "JDownloader", "TVDB", "Disk Space", "Bot Cycles", "Notifications"])
         for _label, result in rows:
             self.assertIn(result["state"], {"ok", "warn", "fail", "unknown"})
 
@@ -4076,7 +4084,9 @@ class GetHealthResilientToRaisingCheckTest(unittest.TestCase):
         app.check_tvdb_health = boom
         rows = app.get_health()
         labels = [label for label, _ in rows]
-        self.assertEqual(labels, ["Site Login", "JDownloader", "TVDB", "Disk Space", "Bot Cycles"])
+        self.assertEqual(
+            [l for l in labels if l != "Download Backend"],
+            ["Site Login", "JDownloader", "TVDB", "Disk Space", "Bot Cycles", "Notifications"])
         by_label = dict(rows)
         self.assertEqual(by_label["TVDB"]["state"], "unknown")
         self.assertIn("boom", by_label["TVDB"]["detail"])
@@ -7591,3 +7601,228 @@ class MoveRecordTrailFieldsTest(unittest.TestCase):
         app.run_move_cycle()
         rec = next(r for r in app._stuck_items.values() if r["reason"] == "exists")
         self.assertEqual((rec["entry_url"], rec["episode"]), ("http://x/f", 12))
+
+
+class _NotifyUrlEnvMixin:
+    """Save/restore NOTIFY_URL across a test so it never depends on (or
+    leaks into) the host's own environment."""
+
+    def setUp(self):
+        super().setUp()
+        self._orig_notify_url = os.environ.get("NOTIFY_URL")
+
+    def tearDown(self):
+        if self._orig_notify_url is None:
+            os.environ.pop("NOTIFY_URL", None)
+        else:
+            os.environ["NOTIFY_URL"] = self._orig_notify_url
+        super().tearDown()
+
+
+class CheckNotifyHealthTest(_NotifyUrlEnvMixin, unittest.TestCase):
+    """check_notify_health parses NOTIFY_URL through notify.py's own parser
+    (never re-implemented here) — card 2699e1a8."""
+
+    def test_none_configured_is_ok_not_unknown(self):
+        # Notifications are opt-in — an unconfigured NOTIFY_URL must not
+        # degrade render_health_card's compact "All systems OK" summary
+        # (see NotifyHealthCompactSummaryTest below).
+        os.environ["NOTIFY_URL"] = ""
+        result = app.check_notify_health()
+        self.assertEqual(result["state"], "ok")
+        self.assertIn("Not configured", result["detail"])
+
+    def test_blank_entries_only_is_also_none_configured(self):
+        os.environ["NOTIFY_URL"] = " , ,"
+        result = app.check_notify_health()
+        self.assertEqual(result["state"], "ok")
+
+    def test_valid_targets_are_ok_with_kind_and_host(self):
+        os.environ["NOTIFY_URL"] = "https://ntfy.sh/mytopic,discord://123456/abcdefTOKEN"
+        result = app.check_notify_health()
+        self.assertEqual(result["state"], "ok")
+        self.assertIn("2 targets", result["detail"])
+        self.assertIn("ntfy (ntfy.sh)", result["detail"])
+        self.assertIn("Discord (discord.com)", result["detail"])
+        self.assertNotIn("mytopic", result["detail"])
+        self.assertNotIn("abcdefTOKEN", result["detail"])
+        self.assertNotIn("123456", result["detail"])
+
+    def test_one_unrecognised_entry_is_warn(self):
+        os.environ["NOTIFY_URL"] = "https://ntfy.sh/mytopic,not-a-real-scheme://x/y"
+        result = app.check_notify_health()
+        self.assertEqual(result["state"], "warn")
+        self.assertIn("1 unrecognised", result["detail"])
+        self.assertIn("1 target", result["detail"])
+
+    def test_all_entries_unrecognised_is_warn_with_zero_targets(self):
+        os.environ["NOTIFY_URL"] = "not-a-real-scheme://x/y"
+        result = app.check_notify_health()
+        self.assertEqual(result["state"], "warn")
+        self.assertIn("0 targets", result["detail"])
+        self.assertIn("1 unrecognised", result["detail"])
+
+
+class NotifyHealthCompactSummaryTest(_NotifyUrlEnvMixin, unittest.TestCase):
+    """An unconfigured NOTIFY_URL (the common case — notifications are
+    opt-in) must not stop render_health_card's compact summary from saying
+    "All systems OK"; only a genuine warn/fail/unknown row should do that."""
+
+    def setUp(self):
+        super().setUp()
+        self._orig_get_health = app.get_health
+
+    def tearDown(self):
+        app.get_health = self._orig_get_health
+        super().tearDown()
+
+    def test_all_ok_plus_unconfigured_notifications_is_all_systems_ok(self):
+        os.environ["NOTIFY_URL"] = ""
+        app.get_health = lambda: [
+            ("Site Login", {"state": "ok", "detail": "Logged in"}),
+            ("JDownloader", {"state": "ok", "detail": "Reachable"}),
+            ("Notifications", app.check_notify_health()),
+        ]
+        out = app.render_health_card()
+        self.assertIn("All systems OK", out)
+        self.assertNotIn("No problems found", out)
+
+
+class NotifyRedactionTest(_NotifyUrlEnvMixin, unittest.TestCase):
+    """Never render (or log) the NOTIFY_URL's topic/webhook id/token —
+    health row, Send-test button, full page, and the bot/dashboard logs all
+    show only the service kind and host — card 2699e1a8."""
+
+    SECRET = "s3cr3t-webhook-token-abcxyz"
+
+    def setUp(self):
+        super().setUp()
+        os.environ["NOTIFY_URL"] = "discord://999999999/{}".format(self.SECRET)
+        self._orig_ani = app.ANI_JSON
+        fd, self._path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        os.remove(self._path)
+        app.ANI_JSON = self._path
+        app._HEALTH_CACHE.clear()
+
+    def tearDown(self):
+        app.ANI_JSON = self._orig_ani
+        app._HEALTH_CACHE.clear()
+        super().tearDown()
+
+    def test_secret_absent_from_health_card(self):
+        html_out = app.render_health_card()
+        self.assertNotIn(self.SECRET, html_out)
+        self.assertIn("Discord (discord.com)", html_out)
+
+    def test_secret_absent_from_send_test_button(self):
+        html_out = app.render_notify_test_button()
+        self.assertNotIn(self.SECRET, html_out)
+
+    def test_secret_absent_from_full_page(self):
+        page = app.render_page()
+        self.assertNotIn(self.SECRET, page)
+
+    def test_secret_absent_from_logs_on_send_failure(self):
+        targets = app.notify.parse_targets(os.environ["NOTIFY_URL"])
+        with mock.patch.object(app.notify.urllib.request, "urlopen", side_effect=OSError("boom")):
+            with self.assertLogs("notify", level="WARNING") as cm:
+                app.notify.send_all(targets, "Aniloads", "test")
+        self.assertNotIn(self.SECRET, "\n".join(cm.output))
+
+
+class NotifyTestPostTest(_NotifyUrlEnvMixin, unittest.TestCase):
+    """POST /notify-test: behind the existing auth/CSRF gate (Handler.
+    parse_request covers every route uniformly — see RunNowCheckNowPostTest
+    for the same do_POST-bypasses-parse_request test convention), rate-
+    limited, and reports a per-target ok/failed summary — card 2699e1a8."""
+
+    def setUp(self):
+        super().setUp()
+        self._orig_cooldown = app.NOTIFY_TEST_COOLDOWN_SECONDS
+        self._orig_timeout = app.NOTIFY_TEST_TIMEOUT_SECONDS
+        app._notify_test_last[0] = 0.0
+
+    def tearDown(self):
+        app.NOTIFY_TEST_COOLDOWN_SECONDS = self._orig_cooldown
+        app.NOTIFY_TEST_TIMEOUT_SECONDS = self._orig_timeout
+        app._notify_test_last[0] = 0.0
+        super().tearDown()
+
+    def _post(self, path, params):
+        captured = {}
+        h = app.Handler.__new__(app.Handler)
+        h.path = path
+        h._read_post = lambda: params
+        h._redirect_msg = lambda msg, level=None, **kw: captured.update(msg=msg, level=level, **kw)
+        h._redirect = _capture_redirect(captured)
+        h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
+        h.do_POST()
+        return captured
+
+    def test_no_targets_configured_is_rejected(self):
+        os.environ["NOTIFY_URL"] = ""
+        result = self._post("/notify-test", {})
+        self.assertEqual(result.get("level"), "err")
+        self.assertIn("No notification targets configured", result["msg"])
+        self.assertEqual(result.get("anchor"), app.ANCHOR_HEALTH)
+
+    def test_sends_and_reports_per_target_results(self):
+        os.environ["NOTIFY_URL"] = "https://ntfy.sh/topic,discord://1/tok"
+        with mock.patch.object(app.notify, "send_all",
+                                return_value=[{"kind": "ntfy", "ok": True},
+                                              {"kind": "discord", "ok": False, "error": "403"}]) as mock_send:
+            result = self._post("/notify-test", {})
+        self.assertEqual(mock_send.call_count, 1)
+        self.assertNotEqual(result.get("level"), "err")
+        self.assertIn("1 OK", result["msg"])
+        self.assertIn("Discord (discord.com)", result["msg"])
+        self.assertEqual(result.get("anchor"), app.ANCHOR_HEALTH)
+
+    def test_all_targets_ok_message(self):
+        os.environ["NOTIFY_URL"] = "https://ntfy.sh/topic"
+        with mock.patch.object(app.notify, "send_all", return_value=[{"kind": "ntfy", "ok": True}]):
+            result = self._post("/notify-test", {})
+        self.assertNotEqual(result.get("level"), "err")
+        self.assertIn("1 target", result["msg"])
+
+    def test_second_request_within_cooldown_is_rejected(self):
+        os.environ["NOTIFY_URL"] = "https://ntfy.sh/topic"
+        with mock.patch.object(app.notify, "send_all", return_value=[{"kind": "ntfy", "ok": True}]):
+            self._post("/notify-test", {})
+            result = self._post("/notify-test", {})
+        self.assertEqual(result.get("level"), "err")
+        self.assertIn("Cooling down", result["msg"])
+
+    def test_cooldown_elapses(self):
+        os.environ["NOTIFY_URL"] = "https://ntfy.sh/topic"
+        with mock.patch.object(app.notify, "send_all", return_value=[{"kind": "ntfy", "ok": True}]):
+            self._post("/notify-test", {})
+        self.assertGreater(app.notify_test_cooldown_remaining(), 0)
+        future = time.monotonic() + app.NOTIFY_TEST_COOLDOWN_SECONDS + 1
+        self.assertEqual(app.notify_test_cooldown_remaining(now=future), 0)
+
+    def test_secret_never_in_redirect_message(self):
+        secret = "supersecrettoken123"
+        os.environ["NOTIFY_URL"] = "discord://999/{}".format(secret)
+        with mock.patch.object(app.notify, "send_all",
+                                return_value=[{"kind": "discord", "ok": False, "error": "403"}]):
+            result = self._post("/notify-test", {})
+        self.assertNotIn(secret, result["msg"])
+
+    def test_slow_target_does_not_hang_the_response(self):
+        os.environ["NOTIFY_URL"] = "https://ntfy.sh/topic"
+        app.NOTIFY_TEST_TIMEOUT_SECONDS = 0.05
+        release = threading.Event()
+
+        def _slow_send_all(targets, title, message):
+            release.wait(2)
+            return [{"kind": "ntfy", "ok": True}]
+
+        with mock.patch.object(app.notify, "send_all", side_effect=_slow_send_all):
+            start = time.monotonic()
+            result = self._post("/notify-test", {})
+            elapsed = time.monotonic() - start
+        release.set()
+        self.assertLess(elapsed, 1.0)
+        self.assertIn("still in progress", result["msg"])

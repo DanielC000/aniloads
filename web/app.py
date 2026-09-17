@@ -459,8 +459,21 @@ BOT_LOG_FILE = os.path.join(LOG_DIR, "anibot.log")
 BOT_LOG_TAIL_BYTES = 256 * 1024
 
 _BOT_LOG_FILE_LINE_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}\s+(\w+)\s+\S+\s+(.*)$", re.DOTALL)
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d{3}\s+(\w+)\s+\S+\s+(.*)$", re.DOTALL)
 _BOT_LOG_FILE_LEVELS = {"WARNING": "warn", "ERROR": "danger", "CRITICAL": "danger"}
+
+
+def _parse_bot_log_file_ts(ts_str):
+    """The file-log formatter's own asctime prefix as a naive datetime.
+
+    bot/anibot.py's logging.Formatter sets no ``converter``, so asctime is the
+    bot container's LOCAL wall time (compose hands both containers the same
+    TZ) — this value is never passed through ``_to_local``. Returns None on
+    anything that doesn't match its exact shape rather than guessing."""
+    try:
+        return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
 
 
 def read_bot_log_tail(path=None, max_bytes=BOT_LOG_TAIL_BYTES):
@@ -492,16 +505,18 @@ def filter_bot_log_file_lines(lines, limit=BOT_LOG_MAX_LINES):
     """WARNING/ERROR/CRITICAL lines from the bot's real file-log levels,
     newest first, redacted, capped at `limit`. A line that doesn't match the
     formatter's own shape (a wrapped/continuation line) is skipped rather
-    than guessed at."""
+    than guessed at. Returns (tone, ts, text) triples; ts is a naive local
+    datetime, or None when the timestamp can't be parsed."""
     matches = []
     for line in lines:
         m = _BOT_LOG_FILE_LINE_RE.match(line)
         if not m:
             continue
-        tone = _BOT_LOG_FILE_LEVELS.get(m.group(1).upper())
+        tone = _BOT_LOG_FILE_LEVELS.get(m.group(2).upper())
         if tone is None:
             continue
-        matches.append((tone, redact_log_text(m.group(2).strip())))
+        ts = _parse_bot_log_file_ts(m.group(1))
+        matches.append((tone, ts, redact_log_text(m.group(3).strip())))
     matches.reverse()
     return matches[:limit]
 
@@ -527,44 +542,61 @@ _BOT_LOG_DANGER_RE = re.compile(r"\[ERROR\]|\berrors?\b|fehler", re.IGNORECASE)
 def filter_bot_log_lines(raw_lines, limit=BOT_LOG_MAX_LINES):
     """WARNING/ERROR-looking bot log lines from the docker-captured stdout
     tail, newest first, redacted, capped at `limit`. Returns a list of
-    (tone, text) pairs where tone is "danger" (an [ERROR]/"error"/"fehler"
-    line) or "warn" (everything else that matched). Content-heuristic only —
-    see the module comment above; used only when the file log is unavailable."""
+    (tone, ts, text) triples where tone is "danger" (an [ERROR]/"error"/
+    "fehler" line) or "warn" (everything else that matched), and ts is the
+    Docker RFC3339 UTC prefix converted to naive local time (None when the
+    line carries none or it fails to parse). Content-heuristic only — see the
+    module comment above; used only when the file log is unavailable."""
     matches = []
     for line in raw_lines:
         ts_match = re.match(r"(\d{4}-\d{2}-\d{2}T[\d:.]+Z?)\s*(.*)", line)
         content = (ts_match.group(2) if ts_match else line).strip()
         if not content or not _BOT_LOG_PROBLEM_RE.search(content):
             continue
+        ts = None
+        if ts_match:
+            # Docker's timestamp carries nanosecond precision (and a trailing
+            # "Z") that fromisoformat() can't parse on its own; trim to
+            # whole seconds like the run-history ETA math above already does.
+            try:
+                ts = _to_local(datetime.fromisoformat(
+                    ts_match.group(1).rstrip("Z").split(".")[0]))
+            except ValueError:
+                ts = None
         tone = "danger" if _BOT_LOG_DANGER_RE.search(content) else "warn"
-        matches.append((tone, redact_log_text(content)))
+        matches.append((tone, ts, redact_log_text(content)))
     matches.reverse()
     return matches[:limit]
 
 
-def _render_bot_log_rows(matches):
-    return "".join(
-        '<div class="event event--{tone}"><span class="event-msg">{msg}</span></div>'.format(
-            tone=tone, msg=escape(msg))
-        for tone, msg in matches
-    )
+def _render_bot_log_rows(matches, now=None):
+    rows = []
+    for tone, ts, msg in matches:
+        time_html = ('<span class="event-time">{}</span>'.format(
+            escape(format_day_time(ts, now=now))) if ts else "")
+        rows.append(
+            '<div class="event event--{tone}">{time}<span class="event-msg">{msg}</span></div>'.format(
+                tone=tone, time=time_html, msg=escape(msg)))
+    return "".join(rows)
 
 
-def render_bot_log():
+def render_bot_log(now=None):
     """Render the "Recent bot warnings & errors" panel body.
 
     Prefers the bot's own file log (real levels — see BOT_LOG_FILE above).
     Only when that file is absent/unreadable does this fall back to the
     Docker-socket content heuristic, and only then can Docker's own
     availability show through as "Docker socket unavailable" — a working file
-    log never depends on the Docker socket at all.
+    log never depends on the Docker socket at all. ``now`` is the UTC instant
+    (naive) day-qualification is measured from; injectable so tests don't
+    depend on wall-clock drift.
     """
     file_lines = read_bot_log_tail()
     if file_lines is not None:
         matches = filter_bot_log_file_lines(file_lines)
         if not matches:
             return '<p class="faint">No recent warnings or errors.</p>'
-        return _render_bot_log_rows(matches)
+        return _render_bot_log_rows(matches, now=now)
 
     status = docker.get_status()
     if status.get("docker_available") is False:
@@ -575,7 +607,7 @@ def render_bot_log():
         return '<p class="faint">No recent warnings or errors.</p>'
     note = ('<p class="faint">Log file unavailable — showing recent '
             'container output (levels approximate).</p>')
-    return note + _render_bot_log_rows(matches)
+    return note + _render_bot_log_rows(matches, now=now)
 
 
 def load_run_state():
@@ -2935,6 +2967,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
      routine sleep/skip lines stay quiet so the feed reads calm */
   .event { display: flex; gap: var(--s2); align-items: baseline; padding: 2px 0; font-size: var(--fs-xs); line-height: 1.45; }
   .event-label { flex: 0 0 70px; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+  .event-time { flex: 0 0 auto; color: var(--text-faint); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   .event-msg { flex: 1; color: var(--text); word-break: break-word; }
   .event--ok .event-label { color: var(--ok-text); }
   .event--danger .event-label, .event--danger .event-msg { color: var(--danger-text); }

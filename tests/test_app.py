@@ -7905,7 +7905,7 @@ class FilterBotLogLinesTest(unittest.TestCase):
         ])
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0][0], "danger")
-        self.assertIn("Episode 5", matches[0][1])
+        self.assertIn("Episode 5", matches[0][2])
 
     def test_bare_warning_call_site_text_matches(self):
         matches = app.filter_bot_log_lines([
@@ -7919,21 +7919,21 @@ class FilterBotLogLinesTest(unittest.TestCase):
             "2026-09-17T10:00:00Z [ERROR] first failure",
             "2026-09-17T10:00:01Z [ERROR] second failure",
         ])
-        self.assertEqual([m[1] for m in matches],
+        self.assertEqual([m[2] for m in matches],
                           ["[ERROR] second failure", "[ERROR] first failure"])
 
     def test_secrets_are_redacted_in_filtered_output(self):
         matches = app.filter_bot_log_lines([
             "2026-09-17T10:00:00Z [ERROR] myjd_pw=SuperSecret123 login failed",
         ])
-        self.assertNotIn("SuperSecret123", matches[0][1])
+        self.assertNotIn("SuperSecret123", matches[0][2])
 
     def test_limit_caps_result_count(self):
         lines = ["2026-09-17T10:00:0{}Z [ERROR] failure {}".format(i, i) for i in range(5)]
         matches = app.filter_bot_log_lines(lines, limit=2)
         self.assertEqual(len(matches), 2)
         # Still newest-first within the capped set.
-        self.assertEqual([m[1] for m in matches], ["[ERROR] failure 4", "[ERROR] failure 3"])
+        self.assertEqual([m[2] for m in matches], ["[ERROR] failure 4", "[ERROR] failure 3"])
 
 
 class ReadBotLogTailTest(unittest.TestCase):
@@ -7994,8 +7994,8 @@ class FilterBotLogFileLinesTest(unittest.TestCase):
             "2026-09-17 10:00:00,000 WARNING anibot Pushbullet disabled: x",
             "2026-09-17 10:00:01,000 ERROR anibot ani.json ist beschaedigt",
         ])
-        self.assertEqual([tone for tone, _ in matches], ["danger", "warn"])
-        self.assertIn("beschaedigt", matches[0][1])
+        self.assertEqual([tone for tone, _, _ in matches], ["danger", "warn"])
+        self.assertIn("beschaedigt", matches[0][2])
 
     def test_critical_maps_to_danger(self):
         matches = app.filter_bot_log_file_lines([
@@ -8014,7 +8014,7 @@ class FilterBotLogFileLinesTest(unittest.TestCase):
         matches = app.filter_bot_log_file_lines([
             "2026-09-17 10:00:00,000 ERROR anibot myjd_pw=Secret123 login failed",
         ])
-        self.assertNotIn("Secret123", matches[0][1])
+        self.assertNotIn("Secret123", matches[0][2])
 
 
 class RenderBotLogTest(unittest.TestCase):
@@ -8405,3 +8405,85 @@ class StuckAssignCleansEmptiedFolderTest(unittest.TestCase):
         ok, msg = app.stuck_assign(key, "http://x/kaiju", "1", "5")
         self.assertTrue(ok, msg)
         self.assertTrue(os.path.isdir(self.download))
+
+
+class BotLogTimestampsTest(unittest.TestCase):
+    """Card 0cb3ba88: "Recent bot warnings & errors" had no timestamps.
+    filter_bot_log_file_lines()/filter_bot_log_lines() now return
+    (tone, ts, text) triples, and render_bot_log() renders an .event-time
+    span per row from them."""
+
+    def test_file_log_ts_is_naive_local_not_shifted_again(self):
+        # The file log's asctime is already the container's local wall time
+        # (no `converter` override in bot/anibot.py) — even under a non-UTC
+        # display zone, this must come back unchanged, never re-converted.
+        with _display_zone(_CEST):
+            matches = app.filter_bot_log_file_lines([
+                "2026-09-17 14:02:03,000 WARNING anibot Pushbullet disabled",
+            ])
+        self.assertEqual(len(matches), 1)
+        tone, ts, text = matches[0]
+        self.assertEqual(tone, "warn")
+        self.assertEqual(ts, datetime(2026, 9, 17, 14, 2, 3))
+        self.assertEqual(text, "Pushbullet disabled")
+
+    def test_file_log_unparseable_ts_tolerated_as_none(self):
+        # Matches the formatter's shape (right digit counts) but is not a
+        # real calendar date/time — must degrade to no time, not crash.
+        matches = app.filter_bot_log_file_lines([
+            "9999-99-99 99:99:99,000 WARNING anibot weird timestamp",
+        ])
+        self.assertEqual(len(matches), 1)
+        tone, ts, text = matches[0]
+        self.assertEqual(tone, "warn")
+        self.assertIsNone(ts)
+        self.assertEqual(text, "weird timestamp")
+
+    def test_docker_rfc3339_nanosecond_ts_converted_to_local(self):
+        with _display_zone(_CEST):
+            matches = app.filter_bot_log_lines([
+                "2026-09-17T12:02:03.123456789Z [ERROR] Episode 5 failed",
+            ])
+        self.assertEqual(len(matches), 1)
+        tone, ts, text = matches[0]
+        self.assertEqual(tone, "danger")
+        self.assertEqual(ts, datetime(2026, 9, 17, 14, 2, 3))
+        self.assertIn("Episode 5", text)
+
+    def test_docker_line_without_timestamp_still_renders_with_no_time(self):
+        matches = app.filter_bot_log_lines(["Failed to get captcha images"])
+        self.assertEqual(len(matches), 1)
+        tone, ts, text = matches[0]
+        self.assertEqual(tone, "warn")
+        self.assertIsNone(ts)
+        self.assertEqual(text, "Failed to get captcha images")
+
+    def test_render_rows_one_time_element_per_timestamped_row(self):
+        html_out = app._render_bot_log_rows([
+            ("warn", datetime(2026, 9, 17, 14, 2, 3), "with a timestamp"),
+            ("danger", None, "no timestamp here"),
+        ], now=datetime(2026, 9, 17, 20, 0, 0))
+        self.assertEqual(html_out.count('class="event-time"'), 1)
+        self.assertEqual(html_out.count('class="event-msg"'), 2)
+        self.assertIn(">14:02:03<", html_out)
+        self.assertIn("no timestamp here", html_out)
+
+    def test_render_rows_day_qualifies_and_escapes(self):
+        html_out = app._render_bot_log_rows([
+            ("danger", datetime(2026, 9, 17, 14, 2, 3), "<script>alert(1)</script>"),
+        ], now=datetime(2026, 9, 18, 9, 0, 0))
+        self.assertIn(">Yesterday 14:02:03<", html_out)
+        self.assertNotIn("<script>", html_out)
+        self.assertIn("&lt;script&gt;", html_out)
+
+    def test_render_bot_log_end_to_end_shows_time(self):
+        tmp_dir = tempfile.mkdtemp(prefix="aniloads-botlog-ts-")
+        self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
+        orig_file = app.BOT_LOG_FILE
+        app.BOT_LOG_FILE = os.path.join(tmp_dir, "anibot.log")
+        self.addCleanup(setattr, app, "BOT_LOG_FILE", orig_file)
+        with open(app.BOT_LOG_FILE, "w", encoding="utf-8") as f:
+            f.write("2026-09-17 14:02:03,000 ERROR anibot boom\n")
+        html_out = app.render_bot_log(now=datetime(2026, 9, 17, 20, 0, 0))
+        self.assertEqual(html_out.count('class="event-time"'), 1)
+        self.assertIn(">14:02:03<", html_out)

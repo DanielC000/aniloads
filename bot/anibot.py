@@ -58,6 +58,8 @@ from tvdb import TVDBClient
 
 import anistore
 
+import notify
+
 import animeloads as animeloads_module
 
 from animeloads import animeloads, ALLinkExtractionException
@@ -80,10 +82,10 @@ def is_docker():
     return False
 
 def log(message, pushbullet):
-    try:
-        pushbullet.push_note("anibot", message)
-    except:
-        pass
+    # Pushbullet no longer gets a push per call (that pushed every attempt,
+    # not just outcomes) — it now receives the same one-per-cycle summary as
+    # the other notify targets, sent from _notify_cycle(). `pushbullet` is
+    # kept as a parameter for call-site compatibility but is unused here.
     _log.info(message)
 
 def _pushkey_set(pushkey):
@@ -480,6 +482,58 @@ def _record_event(events, kind, anime, episodes=None, detail=None):
     if detail:
         event["detail"] = str(detail)[:200]
     events.append(event)
+
+def _format_cycle_summary(events, login_error=None):
+    """Build one English notification message from a cycle's `events` list,
+    or return None when nothing noteworthy happened (a quiet cycle).
+
+    Noteworthy: downloads, errors, mismatches, or a login failure at
+    startup. Plain "checked"/"skipped"/"unavailable" counts are not."""
+    downloads = [e for e in events if e["kind"] == "download"]
+    errors = [e for e in events if e["kind"] == "error"]
+    mismatches = [e for e in events if e["kind"] == "mismatch"]
+
+    if not (downloads or errors or mismatches or login_error):
+        return None
+
+    parts = []
+    if downloads:
+        total_eps = sum(len(e.get("episodes") or []) for e in downloads) or len(downloads)
+        names = ", ".join(
+            "{} ({})".format(e["anime"], ", ".join(str(x) for x in e["episodes"]))
+            if e.get("episodes") else e["anime"]
+            for e in downloads
+        )
+        noun = "episode" if total_eps == 1 else "episodes"
+        parts.append("{} {} downloaded — {}".format(total_eps, noun, names))
+    if mismatches:
+        parts.append("{} mismatch{}".format(len(mismatches), "" if len(mismatches) == 1 else "es"))
+    if errors:
+        first = "; ".join(
+            "{}: {}".format(e["anime"], e.get("detail") or "error") for e in errors[:3]
+        )
+        parts.append("{} error{}: {}".format(len(errors), "" if len(errors) == 1 else "s", first))
+    if login_error:
+        parts.append("login failed: {}".format(login_error))
+
+    return "Aniloads: " + " · ".join(parts)
+
+
+def _notify_cycle(targets, pushbullet, events, login_error=None):
+    """Send at most one cycle-summary notification to every configured
+    ntfy/Discord/Gotify target plus Pushbullet — quiet cycles send nothing.
+    Best-effort: never raises into the caller."""
+    message = _format_cycle_summary(events, login_error=login_error)
+    if not message:
+        return
+    if targets:
+        notify.send_all(targets, "Aniloads", message)
+    if pushbullet:
+        try:
+            pushbullet.push_note("Aniloads", message)
+        except Exception:
+            pass
+
 
 def write_run_state(started_ts, finished_ts, timedelay, counts, events=None, trigger=None):
     """Persist one per-cycle run-state record and append it to a bounded history.
@@ -1274,7 +1328,8 @@ def startbot():
             jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport, al_user, al_pass = loadconfig()
 
     pb = init_pushbullet(pushkey)
-    
+    notify_targets = notify.parse_targets(os.environ.get("NOTIFY_URL", ""))
+
     # The animeloads() constructor launches headless Firefox/geckodriver to fetch
     # DDoS-Guard cookies. A cold-start Selenium failure (resource contention while
     # the host is still bringing services up, a stale profile/geckodriver hiccup)
@@ -1308,6 +1363,7 @@ def startbot():
             except Exception as e:
                 print("Fehlerhafte Anmeldedaten, fahre mit anonymen Account fort")
                 write_login_state(True, False, error=str(e))
+                _notify_cycle(notify_targets, pb, [], login_error=str(e))
         else:
             print("Überspringe Anmeldung")
             write_login_state(False, False)
@@ -1320,6 +1376,7 @@ def startbot():
             except Exception as e:
                 _log.warning("Fehlerhafte Anmeldedaten, fahre mit anonymen Account fort")
                 write_login_state(True, False, error=str(e))
+                _notify_cycle(notify_targets, pb, [], login_error=str(e))
         else:
             _log.info("Keine Anmeldedaten für Anime-Loads hinterlegt, fahre mit anonymen Account fort")
             write_login_state(False, False)
@@ -1739,6 +1796,7 @@ def startbot():
                     _record_event(events, "complete", name)
                     save_ani()
             write_run_state(run_started, _utcnow_iso(), timedelay, run_counts, events, trigger=trigger)
+            _notify_cycle(notify_targets, pb, events)
             _log.info("Schlafe " + str(timedelay) + " Sekunden")
             sleep_until_next_cycle(timedelay, _run_now_path())
 

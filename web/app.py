@@ -250,6 +250,9 @@ _restore_move_state()
 
 from tvdb import TVDBClient, TVDB_API_KEY  # noqa: E402 — path set above
 import anistore  # noqa: E402 — path set above
+import notify  # noqa: E402 — path set above
+
+NOTIFY_TARGETS = notify.parse_targets(os.environ.get("NOTIFY_URL", ""))
 
 tvdb = TVDBClient()
 
@@ -4321,6 +4324,30 @@ def resolve_pending():
         time.sleep(RESOLVE_PENDING_BATCH_INTERVAL)
 
 
+def _notify_mover_events(events):
+    """Batch this cycle's NEW mover errors / stuck items into one
+    notification, sent off the hot path on its own daemon thread so a slow
+    or unreachable notify target never blocks the mover loop.
+
+    `events` only carries an entry for a NEW stuck item — run_move_cycle()
+    itself skips appending anything for an already-known (repeat) or ignored
+    one, via _stuck_touch's is_new/ignored — so no further dedup is needed
+    here."""
+    if not NOTIFY_TARGETS:
+        return
+    noteworthy = [ev for ev in events if ev.get("type") in ("error", "skip")]
+    if not noteworthy:
+        return
+    lines = "; ".join(ev.get("msg", "") for ev in noteworthy[:5])
+    if len(noteworthy) > 5:
+        lines += " (+{} more)".format(len(noteworthy) - 5)
+    message = "Aniloads: {} mover issue{} — {}".format(
+        len(noteworthy), "" if len(noteworthy) == 1 else "s", lines)
+    threading.Thread(
+        target=notify.send_all, args=(NOTIFY_TARGETS, "Aniloads", message), daemon=True
+    ).start()
+
+
 def move_completed_worker():
     """Background thread: move completed downloads to media library."""
     time.sleep(MOVE_STARTUP_DELAY)
@@ -4338,6 +4365,7 @@ def move_completed_worker():
                 _move_last_run = datetime.now(timezone.utc)
             _move_running = False
             save_move_state()
+            _notify_mover_events(events)
 
             if events:
                 counts = {"moved": 0, "error": 0, "skip": 0, "wait": 0, "cleanup": 0}

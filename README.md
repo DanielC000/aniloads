@@ -209,6 +209,38 @@ The mover is a background thread inside the `anime-web` service (no separate con
    - **Series / default** → parses `SxxExx` per video, applies `tvdb_season`/`episode_offset` overrides, moves into `MEDIA_DIR/<AnimeName>/S<xx>/`
 6. **Cleans up** empty download directories
 
+## Notifications
+
+Both `anime-loads` (the bot) and `anime-web` (the mover) can push notifications to **ntfy**, **Discord**, or **Gotify** via one `NOTIFY_URL` env var — a comma-separated list of target URLs, parsed at startup by the shared `bot/notify.py` module (stdlib only, no extra dependency). Leave it empty (the default) to disable.
+
+| Service | Target | URL form | Example |
+|---------|--------|----------|---------|
+| ntfy | self-hosted, HTTP | `ntfy://[user:pass@]host[:port]/topic` | `ntfy://192.168.1.10/aniloads` |
+| ntfy | secure (HTTPS) | `ntfys://[user:pass@]host[:port]/topic` | `ntfys://ntfy.sh/my-aniloads-topic` |
+| ntfy | public instance shorthand | `https://ntfy.sh/<topic>` | `https://ntfy.sh/my-aniloads-topic` |
+| Discord | webhook | `discord://<webhook_id>/<webhook_token>` | `discord://123456789/abcDEF...` |
+| Discord | plain webhook URL | `https://discord.com/api/webhooks/<id>/<token>` | (paste straight from Discord's "Copy Webhook URL") |
+| Gotify | HTTP | `gotify://host[:port]/<app_token>` | `gotify://192.168.1.10/AbCdEf...` |
+| Gotify | secure (HTTPS) | `gotifys://host[:port]/<app_token>` | `gotifys://gotify.example.com/AbCdEf...` |
+
+The `s` suffix (`ntfys`, `gotifys`) means "secure" (HTTPS), same as `http`/`https` — use the plain scheme for a self-hosted server on your LAN, the `s` scheme once it's behind TLS. A self-hosted ntfy server given as a bare `https://host/topic` URL is **not** recognised (nothing distinguishes it from an arbitrary HTTPS URL) — use `ntfy://`/`ntfys://` for anything other than the public `ntfy.sh`. An unrecognised entry logs one startup warning (the URL redacted to scheme+host — never its topic/token/password) and is otherwise ignored; the rest of the list still works.
+
+Example, one target per service:
+
+```bash
+# anime-loads (bot) — one summary per cycle when something happened
+NOTIFY_URL=ntfys://ntfy.sh/my-aniloads-topic
+```
+
+```bash
+# anime-web (mover) — one batch per cycle for new errors/stuck items
+NOTIFY_URL=discord://123456789/abcDEF...
+```
+
+**Bot**: sends at most one English summary per cycle — only when something happened (downloads, errors, mismatches, or a login failure at startup); a quiet cycle sends nothing. **Behavior change**: Pushbullet (`pushbullet_apikey` in `ani.json`) used to push every log line, including in-progress attempts, in German. It now receives the same one-per-cycle English summary as the other targets instead — local logging (and the German messages) is unaffected, only the pushed volume changed.
+
+**Mover**: batches new mover errors and new stuck downloads into one notification per cycle (a repeat or dashboard-ignored stuck item is not re-sent).
+
 ## Testing
 
 A lightweight, hermetic test suite covers the pure-logic functions (release matching, language prefs, filename/season parsing, the early-release skip helper). It uses stdlib `unittest` only — no extra runtime deps, no network, Selenium, Docker, or filesystem dependence.

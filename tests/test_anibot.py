@@ -1154,5 +1154,144 @@ class WriteRunStateTriggerTest(unittest.TestCase):
         self.assertNotIn("trigger", self._read()["last_run"])
 
 
+class LogNoLongerPushesPerLineTest(unittest.TestCase):
+    """log() must keep logging locally but stop pushing every call to
+    Pushbullet — that behavior moved to the one-per-cycle summary in
+    _notify_cycle(). See LogPushbulletNeverRaisesTest above for the
+    never-raise contract, which still holds now that log() ignores pb."""
+
+    def test_log_never_calls_push_note(self):
+        calls = []
+        fake_pb = mock.Mock()
+        fake_pb.push_note.side_effect = lambda *a, **k: calls.append((a, k))
+        anibot.log("[DOWNLOAD] Lade Episode 5 von Frieren", fake_pb)
+        self.assertEqual(calls, [])
+        fake_pb.push_note.assert_not_called()
+
+
+class FormatCycleSummaryTest(unittest.TestCase):
+    """_format_cycle_summary: quiet cycles return None; noteworthy cycles
+    build one English message from the seeded events list."""
+
+    def test_no_events_and_no_login_error_is_quiet(self):
+        self.assertIsNone(anibot._format_cycle_summary([]))
+
+    def test_only_complete_events_is_quiet(self):
+        events = [{"kind": "complete", "anime": "Frieren"}]
+        self.assertIsNone(anibot._format_cycle_summary(events))
+
+    def test_downloads_are_summarized_with_series_and_episodes(self):
+        events = [
+            {"kind": "download", "anime": "Frieren", "episodes": [27, 28]},
+            {"kind": "download", "anime": "Dandadan", "episodes": [5]},
+        ]
+        message = anibot._format_cycle_summary(events)
+        self.assertTrue(message.startswith("Aniloads: "))
+        self.assertIn("3 episodes downloaded", message)
+        self.assertIn("Frieren (27, 28)", message)
+        self.assertIn("Dandadan (5)", message)
+
+    def test_single_download_uses_singular_noun(self):
+        events = [{"kind": "download", "anime": "Frieren", "episodes": [27]}]
+        message = anibot._format_cycle_summary(events)
+        self.assertIn("1 episode downloaded", message)
+
+    def test_errors_include_first_few_details(self):
+        events = [
+            {"kind": "error", "anime": "Frieren", "detail": "JDownloader unreachable"},
+        ]
+        message = anibot._format_cycle_summary(events)
+        self.assertIn("1 error", message)
+        self.assertIn("Frieren: JDownloader unreachable", message)
+
+    def test_error_count_caps_detail_to_first_three(self):
+        events = [
+            {"kind": "error", "anime": "A{}".format(i), "detail": "boom{}".format(i)}
+            for i in range(5)
+        ]
+        message = anibot._format_cycle_summary(events)
+        self.assertIn("5 errors", message)
+        self.assertIn("A0: boom0", message)
+        self.assertIn("A2: boom2", message)
+        self.assertNotIn("A3: boom3", message)
+
+    def test_mismatches_are_counted(self):
+        events = [{"kind": "mismatch", "anime": "Frieren", "detail": "episode count mismatch"}]
+        message = anibot._format_cycle_summary(events)
+        self.assertIn("1 mismatch", message)
+
+    def test_downloads_and_errors_combine_matching_the_readme_example(self):
+        events = [
+            {"kind": "download", "anime": "Frieren", "episodes": [27, 28]},
+            {"kind": "download", "anime": "Dandadan", "episodes": [5]},
+            {"kind": "error", "anime": "Bleach", "detail": "JDownloader unreachable"},
+        ]
+        message = anibot._format_cycle_summary(events)
+        self.assertEqual(
+            message,
+            "Aniloads: 3 episodes downloaded — Frieren (27, 28), Dandadan (5) "
+            "· 1 error: Bleach: JDownloader unreachable",
+        )
+
+    def test_login_error_alone_is_noteworthy(self):
+        message = anibot._format_cycle_summary([], login_error="invalid credentials")
+        self.assertIn("login failed: invalid credentials", message)
+
+
+class NotifyCycleTest(unittest.TestCase):
+    """_notify_cycle: sends at most one summary to notify targets + Pushbullet
+    per cycle, and sends nothing for a quiet cycle."""
+
+    def setUp(self):
+        self._orig_send_all = anibot.notify.send_all
+        self.sent = []
+        anibot.notify.send_all = lambda targets, title, message: self.sent.append(
+            (targets, title, message))
+
+    def tearDown(self):
+        anibot.notify.send_all = self._orig_send_all
+
+    def test_quiet_cycle_sends_nothing(self):
+        fake_pb = mock.Mock()
+        anibot._notify_cycle(["fake-target"], fake_pb, [])
+        self.assertEqual(self.sent, [])
+        fake_pb.push_note.assert_not_called()
+
+    def test_noteworthy_cycle_notifies_targets_and_pushbullet_once(self):
+        fake_pb = mock.Mock()
+        events = [{"kind": "download", "anime": "Frieren", "episodes": [1]}]
+        anibot._notify_cycle(["fake-target"], fake_pb, events)
+        self.assertEqual(len(self.sent), 1)
+        targets, title, message = self.sent[0]
+        self.assertEqual(targets, ["fake-target"])
+        self.assertEqual(title, "Aniloads")
+        self.assertIn("Frieren", message)
+        fake_pb.push_note.assert_called_once_with("Aniloads", message)
+
+    def test_no_targets_configured_skips_notify_send_all(self):
+        fake_pb = mock.Mock()
+        events = [{"kind": "error", "anime": "Frieren", "detail": "boom"}]
+        anibot._notify_cycle([], fake_pb, events)
+        self.assertEqual(self.sent, [])
+        fake_pb.push_note.assert_called_once()
+
+    def test_disabled_pushbullet_is_skipped_without_raising(self):
+        events = [{"kind": "error", "anime": "Frieren", "detail": "boom"}]
+        anibot._notify_cycle(["fake-target"], "", events)  # pb disabled == ""
+        self.assertEqual(len(self.sent), 1)
+
+    def test_pushbullet_failure_does_not_raise(self):
+        fake_pb = mock.Mock()
+        fake_pb.push_note.side_effect = Exception("network error")
+        events = [{"kind": "error", "anime": "Frieren", "detail": "boom"}]
+        anibot._notify_cycle(["fake-target"], fake_pb, events)  # must not raise
+
+    def test_login_error_notifies_even_with_no_events(self):
+        fake_pb = mock.Mock()
+        anibot._notify_cycle(["fake-target"], fake_pb, [], login_error="bad creds")
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("bad creds", self.sent[0][2])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3966,5 +3966,163 @@ class AddFlowHiddenFieldsTest(unittest.TestCase):
         self.assertEqual(saved["anime"][0]["releaseID"], 111)
 
 
+class _SyncThread:
+    """Stand-in for threading.Thread that runs its target synchronously, so
+    a test can assert on a notify send dispatched onto a daemon thread
+    without racing it."""
+
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+
+    def start(self):
+        self._target(*self._args, **self._kwargs)
+
+
+class NotifyMoverEventsTest(unittest.TestCase):
+    """_notify_mover_events: batches this cycle's NEW mover errors/stuck
+    items into one notification. No network — send_all is patched and the
+    dispatch thread replaced with a synchronous stand-in."""
+
+    def setUp(self):
+        self._orig_targets = app.NOTIFY_TARGETS
+        self._orig_thread = app.threading.Thread
+        app.threading.Thread = _SyncThread
+        self.sent = []
+        self._orig_send_all = app.notify.send_all
+        app.notify.send_all = lambda targets, title, message: self.sent.append(
+            (targets, title, message))
+
+    def tearDown(self):
+        app.NOTIFY_TARGETS = self._orig_targets
+        app.threading.Thread = self._orig_thread
+        app.notify.send_all = self._orig_send_all
+
+    def test_no_targets_configured_sends_nothing(self):
+        app.NOTIFY_TARGETS = []
+        app._notify_mover_events([{"type": "error", "msg": "boom"}])
+        self.assertEqual(self.sent, [])
+
+    def test_no_noteworthy_events_sends_nothing(self):
+        app.NOTIFY_TARGETS = ["fake-target"]
+        app._notify_mover_events([
+            {"type": "moved", "msg": "x -> y"},
+            {"type": "wait", "msg": "still active"},
+            {"type": "cleanup", "msg": "cleaned archive"},
+        ])
+        self.assertEqual(self.sent, [])
+
+    def test_empty_events_sends_nothing(self):
+        app.NOTIFY_TARGETS = ["fake-target"]
+        app._notify_mover_events([])
+        self.assertEqual(self.sent, [])
+
+    def test_error_events_are_batched_into_one_message(self):
+        app.NOTIFY_TARGETS = ["fake-target"]
+        events = [
+            {"type": "error", "msg": "Cannot parse season/episode: foo.mkv"},
+            {"type": "moved", "msg": "bar.mkv -> Show/S01"},
+        ]
+        app._notify_mover_events(events)
+        self.assertEqual(len(self.sent), 1)
+        targets, title, message = self.sent[0]
+        self.assertEqual(targets, ["fake-target"])
+        self.assertEqual(title, "Aniloads")
+        self.assertIn("1 mover issue", message)
+        self.assertIn("Cannot parse season/episode: foo.mkv", message)
+        self.assertNotIn("bar.mkv -> Show/S01", message)
+
+    def test_skip_events_count_as_stuck_items(self):
+        app.NOTIFY_TARGETS = ["fake-target"]
+        events = [{"type": "skip", "msg": "foo.mkv — already exists"}]
+        app._notify_mover_events(events)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("already exists", self.sent[0][2])
+
+    def test_more_than_five_events_are_truncated_with_a_count(self):
+        app.NOTIFY_TARGETS = ["fake-target"]
+        events = [{"type": "error", "msg": "err{}".format(i)} for i in range(7)]
+        app._notify_mover_events(events)
+        message = self.sent[0][2]
+        self.assertIn("7 mover issues", message)
+        self.assertIn("+2 more", message)
+
+
+class NotifyMoverOncePerStuckItemTest(unittest.TestCase):
+    """End-to-end with run_move_cycle(): a stuck item notifies on the cycle
+    it first appears, then goes quiet on later cycles while unresolved, and
+    stays quiet once dashboard-ignored — mirroring the existing
+    'not repeated'/'ignored' coverage in RunMoveCycleTest, but through the
+    notify hook instead of the raw events list."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-move-notify-")
+        self.download = os.path.join(self.tmp, "downloads")
+        self.media = os.path.join(self.tmp, "media")
+        os.makedirs(self.download)
+        os.makedirs(self.media)
+        self._orig = {k: getattr(app, k) for k in
+                      ("DOWNLOAD_DIR", "MEDIA_DIR", "MIN_AGE_MINUTES", "ANI_JSON")}
+        app.DOWNLOAD_DIR = self.download
+        app.MEDIA_DIR = self.media
+        app.MIN_AGE_MINUTES = 5
+        app.ANI_JSON = os.path.join(self.tmp, "ani.json")
+        with open(app.ANI_JSON, "w", encoding="utf-8") as f:
+            json.dump({"anime": []}, f)
+
+        self._orig_stuck = dict(app._stuck_items)
+        app._stuck_items.clear()
+
+        self._orig_targets = app.NOTIFY_TARGETS
+        app.NOTIFY_TARGETS = ["fake-target"]
+        self._orig_thread = app.threading.Thread
+        app.threading.Thread = _SyncThread
+        self.sent = []
+        self._orig_send_all = app.notify.send_all
+        app.notify.send_all = lambda targets, title, message: self.sent.append(
+            (targets, title, message))
+
+    def tearDown(self):
+        for k, v in self._orig.items():
+            setattr(app, k, v)
+        app._stuck_items.clear()
+        app._stuck_items.update(self._orig_stuck)
+        app.NOTIFY_TARGETS = self._orig_targets
+        app.threading.Thread = self._orig_thread
+        app.notify.send_all = self._orig_send_all
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_unparseable_download(self):
+        d = os.path.join(self.download, "Akira")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, "Akira.Movie.1080p.mkv")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("x")
+        past = time.time() - 3600
+        os.utime(p, (past, past))
+
+    def test_notifies_once_then_stays_quiet_while_unresolved(self):
+        self._make_unparseable_download()
+
+        app._notify_mover_events(app.run_move_cycle())
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("Cannot parse season/episode", self.sent[0][2])
+
+        app._notify_mover_events(app.run_move_cycle())
+        self.assertEqual(len(self.sent), 1)  # no repeat notification
+
+    def test_ignored_item_never_notifies_again(self):
+        self._make_unparseable_download()
+        app._notify_mover_events(app.run_move_cycle())
+        self.assertEqual(len(self.sent), 1)
+
+        key = next(iter(app._stuck_items))
+        app.stuck_ignore(key)
+
+        app._notify_mover_events(app.run_move_cycle())
+        self.assertEqual(len(self.sent), 1)  # still just the first notification
+
+
 if __name__ == "__main__":
     unittest.main()

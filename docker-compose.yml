@@ -60,6 +60,7 @@ services:
       - TVDB_HTTP_TIMEOUT=${TVDB_HTTP_TIMEOUT:-10}
       - EARLY_SCRAPE_DAYS=${EARLY_SCRAPE_DAYS:-1}
       - TVDB_PASTDUE_RECHECK_HOURS=${TVDB_PASTDUE_RECHECK_HOURS:-2}
+      - NOTIFY_URL=${NOTIFY_URL:-}
     volumes:
       - "${ANIME_CONFIG_DIR:?set in .env (see .env.example)}:/config"
     networks:
@@ -97,6 +98,7 @@ services:
       - RESOLVE_PENDING_PER_ENTRY_DELAY=${RESOLVE_PENDING_PER_ENTRY_DELAY:-5}
       - RESOLVE_PENDING_BATCH_INTERVAL=${RESOLVE_PENDING_BATCH_INTERVAL:-120}
       - TVDB_HTTP_TIMEOUT=${TVDB_HTTP_TIMEOUT:-10}
+      - NOTIFY_URL=${NOTIFY_URL:-}
     volumes:
       - "${ANIME_CONFIG_DIR:?set in .env (see .env.example)}:/config"
       - "${ANIME_SETUP_DIR:?set in .env (see .env.example)}/web/app.py:/app/app.py:ro"

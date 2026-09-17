@@ -17,6 +17,7 @@ import threading
 import time
 import types
 import unittest
+from unittest import mock
 import zoneinfo
 from datetime import date, datetime, timedelta, timezone
 from unittest import mock
@@ -7826,3 +7827,344 @@ class NotifyTestPostTest(_NotifyUrlEnvMixin, unittest.TestCase):
         release.set()
         self.assertLess(elapsed, 1.0)
         self.assertIn("still in progress", result["msg"])
+
+
+class RedactLogTextTest(unittest.TestCase):
+    """redact_log_text() strips the secret shapes named on the card: URL
+    credentials, MyJD/al_pass/API-key values, and Discord/ntfy/Gotify webhook
+    paths/tokens — whatever else is on the line stays untouched."""
+
+    def test_url_credentials_redacted(self):
+        out = app.redact_log_text("Fetching http://user:hunterpw@example.com/data failed")
+        self.assertNotIn("hunterpw", out)
+        self.assertNotIn("user:hunterpw", out)
+        self.assertIn("failed", out)
+
+    def test_myjd_pw_redacted(self):
+        out = app.redact_log_text("myjd_pw=TopSecret1 login failed")
+        self.assertNotIn("TopSecret1", out)
+        self.assertIn("myjd_pw=<redacted>", out)
+
+    def test_al_pass_redacted(self):
+        out = app.redact_log_text("al_pass=Sekret99 error during login")
+        self.assertNotIn("Sekret99", out)
+        self.assertIn("al_pass=<redacted>", out)
+
+    def test_api_key_redacted(self):
+        out = app.redact_log_text("pushbullet_apikey=o.abc123 warning: nearing rate limit")
+        self.assertNotIn("o.abc123", out)
+        self.assertIn("pushbullet_apikey=<redacted>", out)
+
+    def test_password_to_phrasing_redacted(self):
+        # downloader.py's own "Set MyJD Password to " + myjd_pw print.
+        out = app.redact_log_text("Set MyJD Password to hunter2")
+        self.assertNotIn("hunter2", out)
+        self.assertIn("Password to <redacted>", out)
+
+    def test_discord_webhook_path_redacted(self):
+        out = app.redact_log_text(
+            "notify: send failed for https://discord.com/api/webhooks/"
+            "999999999999999999/tokenABCXYZ: timeout")
+        self.assertNotIn("tokenABCXYZ", out)
+        self.assertNotIn("999999999999999999", out)
+        self.assertIn("discord.com/api/webhooks/<redacted>", out)
+
+    def test_gotify_query_token_redacted(self):
+        out = app.redact_log_text(
+            "notify: send failed for http://gotify.local/message?token=abcDEF123: unauthorized")
+        self.assertNotIn("abcDEF123", out)
+        self.assertIn("token=<redacted>", out)
+
+    def test_ntfy_scheme_url_redacted(self):
+        out = app.redact_log_text("notify: send failed for ntfy://user:pass@ntfy.example.com/mytopic")
+        self.assertNotIn("mytopic", out)
+        self.assertNotIn("user:pass", out)
+
+    def test_plain_text_is_untouched(self):
+        self.assertEqual(app.redact_log_text("[ERROR] Episode 5: JDownloader nicht erreichbar?"),
+                          "[ERROR] Episode 5: JDownloader nicht erreichbar?")
+
+
+class FilterBotLogLinesTest(unittest.TestCase):
+    """filter_bot_log_lines(): picks only WARNING/ERROR-looking lines, newest
+    first, redacted, capped at `limit`. The docker-captured stdout stream has
+    no real logging level (see the function's own docstring), so this matches
+    on content markers — the [ERROR] tag and the English/German words the
+    bot's warn/error call sites actually use."""
+
+    def test_info_lines_are_dropped(self):
+        matches = app.filter_bot_log_lines([
+            "2026-09-17T10:00:00Z [INFO] routine cycle info",
+            "2026-09-17T10:00:01Z [SKIP] up to date",
+        ])
+        self.assertEqual(matches, [])
+
+    def test_bracket_error_tag_matches(self):
+        matches = app.filter_bot_log_lines([
+            "2026-09-17T10:00:00Z [ERROR] Episode 5 von Foo: JDownloader nicht erreichbar?",
+        ])
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0][0], "danger")
+        self.assertIn("Episode 5", matches[0][1])
+
+    def test_bare_warning_call_site_text_matches(self):
+        matches = app.filter_bot_log_lines([
+            "2026-09-17T10:00:00Z Failed to get captcha images",
+        ])
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0][0], "warn")
+
+    def test_newest_first_ordering(self):
+        matches = app.filter_bot_log_lines([
+            "2026-09-17T10:00:00Z [ERROR] first failure",
+            "2026-09-17T10:00:01Z [ERROR] second failure",
+        ])
+        self.assertEqual([m[1] for m in matches],
+                          ["[ERROR] second failure", "[ERROR] first failure"])
+
+    def test_secrets_are_redacted_in_filtered_output(self):
+        matches = app.filter_bot_log_lines([
+            "2026-09-17T10:00:00Z [ERROR] myjd_pw=SuperSecret123 login failed",
+        ])
+        self.assertNotIn("SuperSecret123", matches[0][1])
+
+    def test_limit_caps_result_count(self):
+        lines = ["2026-09-17T10:00:0{}Z [ERROR] failure {}".format(i, i) for i in range(5)]
+        matches = app.filter_bot_log_lines(lines, limit=2)
+        self.assertEqual(len(matches), 2)
+        # Still newest-first within the capped set.
+        self.assertEqual([m[1] for m in matches], ["[ERROR] failure 4", "[ERROR] failure 3"])
+
+
+class ReadBotLogTailTest(unittest.TestCase):
+    """read_bot_log_tail(): missing file, the bounded seek dropping a
+    truncated partial first line, and PermissionError (a container UID
+    mismatch) degrading to None instead of raising."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="aniloads-botlog-tail-")
+        self.path = os.path.join(self.tmp_dir, "anibot.log")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(app.read_bot_log_tail(self.path))
+
+    def test_reads_full_small_file(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("2026-09-17 10:00:00,000 INFO anibot line one\n")
+            f.write("2026-09-17 10:00:01,000 WARNING anibot line two\n")
+        lines = app.read_bot_log_tail(self.path)
+        self.assertEqual(lines, [
+            "2026-09-17 10:00:00,000 INFO anibot line one",
+            "2026-09-17 10:00:01,000 WARNING anibot line two",
+        ])
+
+    def test_bounded_seek_drops_truncated_partial_first_line(self):
+        with open(self.path, "wb") as f:
+            for i in range(50):
+                f.write("2026-09-17 10:00:{:02d},000 INFO anibot line {}\n".format(
+                    i % 60, i).encode("utf-8"))
+        lines = app.read_bot_log_tail(self.path, max_bytes=200)
+        self.assertTrue(lines)
+        for line in lines:
+            self.assertRegex(line, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} ")
+
+    def test_permission_error_returns_none(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("2026-09-17 10:00:00,000 ERROR anibot boom\n")
+        with mock.patch("builtins.open", side_effect=PermissionError("denied")):
+            self.assertIsNone(app.read_bot_log_tail(self.path))
+
+
+class FilterBotLogFileLinesTest(unittest.TestCase):
+    """filter_bot_log_file_lines(): real WARNING/ERROR/CRITICAL levels only,
+    newest first, redacted, a wrapped/continuation line skipped rather than
+    guessed at."""
+
+    def test_info_lines_dropped(self):
+        matches = app.filter_bot_log_file_lines([
+            "2026-09-17 10:00:00,000 INFO anibot routine cycle info",
+        ])
+        self.assertEqual(matches, [])
+
+    def test_warning_and_error_kept_newest_first_with_tone(self):
+        matches = app.filter_bot_log_file_lines([
+            "2026-09-17 10:00:00,000 WARNING anibot Pushbullet disabled: x",
+            "2026-09-17 10:00:01,000 ERROR anibot ani.json ist beschaedigt",
+        ])
+        self.assertEqual([tone for tone, _ in matches], ["danger", "warn"])
+        self.assertIn("beschaedigt", matches[0][1])
+
+    def test_critical_maps_to_danger(self):
+        matches = app.filter_bot_log_file_lines([
+            "2026-09-17 10:00:00,000 CRITICAL anibot meltdown",
+        ])
+        self.assertEqual(matches[0][0], "danger")
+
+    def test_unmatched_continuation_line_skipped(self):
+        matches = app.filter_bot_log_file_lines([
+            "2026-09-17 10:00:00,000 ERROR anibot Traceback (most recent call last):",
+            "  File \"x.py\", line 1, in <module>",
+        ])
+        self.assertEqual(len(matches), 1)
+
+    def test_secrets_redacted(self):
+        matches = app.filter_bot_log_file_lines([
+            "2026-09-17 10:00:00,000 ERROR anibot myjd_pw=Secret123 login failed",
+        ])
+        self.assertNotIn("Secret123", matches[0][1])
+
+
+class RenderBotLogTest(unittest.TestCase):
+    """render_bot_log(): prefers the real-level file log and never touches
+    Docker while it works; falls back to the docker content heuristic
+    (labelled approximate) only when the file is absent/unreadable, and only
+    then can Docker's own unavailability show through."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="aniloads-botlog-render-")
+        self._orig_file = app.BOT_LOG_FILE
+        app.BOT_LOG_FILE = os.path.join(self.tmp_dir, "anibot.log")  # absent by default
+        self._orig_status = app.docker.get_status
+        self._orig_logs = app.docker.get_logs
+
+    def tearDown(self):
+        app.BOT_LOG_FILE = self._orig_file
+        app.docker.get_status = self._orig_status
+        app.docker.get_logs = self._orig_logs
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _write_log(self, *lines):
+        with open(app.BOT_LOG_FILE, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(line + "\n")
+
+    def test_file_log_used_when_present_never_consults_docker(self):
+        self._write_log(
+            "2026-09-17 10:00:00,000 ERROR anibot myjd_pw=Secret1 <script>alert(1)</script>")
+        docker_calls = []
+        app.docker.get_status = lambda *a, **k: docker_calls.append("status")
+        app.docker.get_logs = lambda *a, **k: docker_calls.append("logs")
+        html_out = app.render_bot_log()
+        self.assertEqual(docker_calls, [])
+        self.assertNotIn("Secret1", html_out)
+        self.assertNotIn("<script>", html_out)
+        self.assertIn("&lt;script&gt;", html_out)
+        self.assertIn("event--danger", html_out)
+        self.assertNotIn("levels approximate", html_out)
+
+    def test_file_present_but_no_matching_levels(self):
+        self._write_log("2026-09-17 10:00:00,000 INFO anibot nothing interesting")
+        html_out = app.render_bot_log()
+        self.assertIn("No recent warnings or errors", html_out)
+
+    def test_file_absent_falls_back_to_labelled_docker_heuristic(self):
+        app.docker.get_status = lambda *a, **k: {"docker_available": True}
+        app.docker.get_logs = lambda *a, **k: ["2026-09-17T10:00:00Z [ERROR] Episode 5 failed"]
+        html_out = app.render_bot_log()
+        self.assertIn("levels approximate", html_out)
+        self.assertIn("Episode 5", html_out)
+
+    def test_file_absent_and_docker_unavailable_shows_message(self):
+        app.docker.get_status = lambda *a, **k: {"docker_available": False}
+        html_out = app.render_bot_log()
+        self.assertIn("Docker socket unavailable", html_out)
+
+    def test_permission_error_on_file_falls_back_cleanly(self):
+        self._write_log("2026-09-17 10:00:00,000 ERROR anibot boom")
+        app.docker.get_status = lambda *a, **k: {"docker_available": True}
+        app.docker.get_logs = lambda *a, **k: ["2026-09-17T10:00:00Z [ERROR] fallback line"]
+        with mock.patch("builtins.open", side_effect=PermissionError("denied")):
+            html_out = app.render_bot_log()
+        self.assertIn("levels approximate", html_out)
+        self.assertIn("fallback line", html_out)
+
+
+class ApiBotLogEndpointTest(unittest.TestCase):
+    """The /api/bot-log GET endpoint: JSON content type, wired end-to-end to
+    render_bot_log() (file-log primary, docker fallback), and that it is
+    never bundled into the /api/status poll payload."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="aniloads-botlog-api-")
+        self._orig_file = app.BOT_LOG_FILE
+        app.BOT_LOG_FILE = os.path.join(self.tmp_dir, "anibot.log")  # absent by default
+        self._orig_status = app.docker.get_status
+        self._orig_logs = app.docker.get_logs
+
+    def tearDown(self):
+        app.BOT_LOG_FILE = self._orig_file
+        app.docker.get_status = self._orig_status
+        app.docker.get_logs = self._orig_logs
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _get(self, path):
+        h = app.Handler.__new__(app.Handler)
+        h.path = path
+        captured = {"headers": []}
+        h.send_response = lambda code: captured.__setitem__("code", code)
+        h.send_header = lambda k, v: captured["headers"].append((k, v))
+        h.end_headers = lambda: None
+        h.wfile = types.SimpleNamespace(write=lambda b: captured.__setitem__("body", b))
+        h.do_GET()
+        return captured
+
+    def test_returns_json_content_type(self):
+        app.docker.get_status = lambda *a, **k: {"docker_available": True, "running": True}
+        app.docker.get_logs = lambda *a, **k: []
+        captured = self._get("/api/bot-log")
+        self.assertEqual(captured["code"], 200)
+        content_types = [v for k, v in captured["headers"] if k == "Content-Type"]
+        self.assertTrue(any("application/json" in v for v in content_types))
+        json.loads(captured["body"].decode("utf-8"))  # valid JSON
+
+    def test_docker_unavailable_state_when_file_absent(self):
+        app.docker.get_status = lambda *a, **k: {"docker_available": False}
+        captured = self._get("/api/bot-log")
+        payload = json.loads(captured["body"].decode("utf-8"))
+        self.assertIn("Docker socket unavailable", payload["html"])
+
+    def test_file_log_used_end_to_end(self):
+        with open(app.BOT_LOG_FILE, "w", encoding="utf-8") as f:
+            f.write("2026-09-17 10:00:00,000 ERROR anibot myjd_pw=SuperSecret "
+                     "Episode 5 failed <script>\n")
+        captured = self._get("/api/bot-log")
+        payload = json.loads(captured["body"].decode("utf-8"))
+        html_out = payload["html"]
+        self.assertNotIn("SuperSecret", html_out)
+        self.assertIn("&lt;script&gt;", html_out)
+        self.assertNotIn("levels approximate", html_out)
+
+    def test_falls_back_to_docker_heuristic_when_file_absent(self):
+        app.docker.get_status = lambda *a, **k: {"docker_available": True, "running": True}
+        app.docker.get_logs = lambda *a, **k: [
+            "2026-09-17T10:00:00Z [INFO] normal cycle info",
+            "2026-09-17T10:00:01Z [ERROR] Episode 5 von Foo: myjd_pw=SuperSecret failed <script>",
+            "2026-09-17T10:00:02Z Failed to get captcha images",
+        ]
+        captured = self._get("/api/bot-log")
+        payload = json.loads(captured["body"].decode("utf-8"))
+        html_out = payload["html"]
+        self.assertNotIn("normal cycle info", html_out)
+        self.assertNotIn("SuperSecret", html_out)
+        self.assertIn("&lt;script&gt;", html_out)
+        self.assertIn("levels approximate", html_out)
+        # Newest first: the captcha warning (later timestamp) precedes the
+        # earlier [ERROR] line.
+        self.assertLess(html_out.index("captcha"), html_out.index("Episode 5"))
+
+    def test_api_status_payload_has_no_bot_log_key(self):
+        app.docker.get_status = lambda *a, **k: {"docker_available": True, "running": True}
+        app.docker.get_logs = lambda *a, **k: []
+        h = app.Handler.__new__(app.Handler)
+        h.path = "/api/status"
+        captured = {}
+        h.send_response = lambda code: captured.__setitem__("code", code)
+        h.send_header = lambda *a: None
+        h.end_headers = lambda: None
+        h.wfile = types.SimpleNamespace(write=lambda b: captured.__setitem__("body", b))
+        h.do_GET()
+        payload = json.loads(captured["body"].decode("utf-8"))
+        self.assertNotIn("bot_log", payload)

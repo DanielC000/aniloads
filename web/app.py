@@ -413,6 +413,171 @@ def parse_bot_logs(raw_lines):
     return runs
 
 
+# ---------------------------------------------------------------------------
+# Raw bot log view (Recent bot warnings & errors)
+# ---------------------------------------------------------------------------
+
+BOT_LOG_MAX_LINES = 200
+
+# No general-purpose redactor existed for free-text log lines — bot/notify.py's
+# _redact() only reshapes a single already-parsed target URL down to
+# scheme+host, which doesn't help with a raw log line that embeds a secret
+# inline. Each rule below targets one secret shape named in the card: URL
+# credentials, MyJD/al_pass/API-key values, and Discord/ntfy/Gotify webhook
+# paths/tokens (whether the bot logged the canonical "scheme://host/path"
+# form notify.py builds, or the "?token=" query form _send_gotify() sends).
+_REDACT_RULES = (
+    (re.compile(r"://[^\s/@]+:[^\s/@]+@"), "://<redacted>@"),
+    (re.compile(r"(?i)(discord(?:app)?\.com/api/webhooks/)\d+/[^\s/?\"']+"), r"\1<redacted>"),
+    (re.compile(r"(?i)(ntfy\.sh/)[^\s\"']+"), r"\1<redacted>"),
+    (re.compile(r"(?i)((?:ntfys?|gotifys?)://)\S+"), r"\1<redacted>"),
+    (re.compile(
+        r"(?i)\b(api[_-]?key|apikey|access[_-]?token|token|myjd_pw|myjd_pass(?:word)?|"
+        r"al_pass|pushbullet_apikey)\b\s*[:=]\s*\S+"),
+     r"\1=<redacted>"),
+    (re.compile(r"(?i)(password\s+to)\s+\S+"), r"\1 <redacted>"),
+)
+
+
+def redact_log_text(text):
+    """Strip credentials/secrets from one bot log line before it reaches the
+    dashboard. See _REDACT_RULES above for exactly what it covers."""
+    for pattern, repl in _REDACT_RULES:
+        text = pattern.sub(repl, text)
+    return text
+
+
+# bot/anibot.py's own rotating file log (LOG_FILE there) writes real levels —
+# "%(asctime)s %(levelname)s %(name)s %(message)s" — unlike its stdout handler
+# (message-only, see the docker-fallback heuristic below). The dashboard
+# container mounts the same LOG_DIR volume the bot writes into (LOG_DIR is
+# already used above for this container's OWN anime-web.log), so this is the
+# primary source: real WARNING/ERROR/CRITICAL levels, no guessing.
+BOT_LOG_FILE = os.path.join(LOG_DIR, "anibot.log")
+# Bounded so a 14-day rotated file is never read whole — only enough of the
+# tail to comfortably hold BOT_LOG_MAX_LINES worth of recent entries.
+BOT_LOG_TAIL_BYTES = 256 * 1024
+
+_BOT_LOG_FILE_LINE_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}\s+(\w+)\s+\S+\s+(.*)$", re.DOTALL)
+_BOT_LOG_FILE_LEVELS = {"WARNING": "warn", "ERROR": "danger", "CRITICAL": "danger"}
+
+
+def read_bot_log_tail(path=None, max_bytes=BOT_LOG_TAIL_BYTES):
+    """Up to the last `max_bytes` of the bot's file log, as decoded text
+    lines. Never loads the whole (possibly 14-day, rotated) file. Returns
+    None if the file is missing or unreadable for any reason — including a
+    PermissionError from a container UID mismatch — so the caller can fall
+    back to the docker-log heuristic."""
+    path = BOT_LOG_FILE if path is None else path
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            offset = max(0, size - max_bytes)
+            f.seek(offset)
+            data = f.read()
+    except OSError:
+        return None
+    text = data.decode("utf-8", errors="replace")
+    if offset > 0:
+        # Seeking into the middle of the file lands mid-line — the bytes
+        # before the first newline are a truncated partial line, not a real
+        # entry, and must be dropped rather than mis-parsed.
+        _, _, text = text.partition("\n")
+    return text.splitlines()
+
+
+def filter_bot_log_file_lines(lines, limit=BOT_LOG_MAX_LINES):
+    """WARNING/ERROR/CRITICAL lines from the bot's real file-log levels,
+    newest first, redacted, capped at `limit`. A line that doesn't match the
+    formatter's own shape (a wrapped/continuation line) is skipped rather
+    than guessed at."""
+    matches = []
+    for line in lines:
+        m = _BOT_LOG_FILE_LINE_RE.match(line)
+        if not m:
+            continue
+        tone = _BOT_LOG_FILE_LEVELS.get(m.group(1).upper())
+        if tone is None:
+            continue
+        matches.append((tone, redact_log_text(m.group(2).strip())))
+    matches.reverse()
+    return matches[:limit]
+
+
+# Fallback only, used when the file log is absent/unreadable. The
+# docker-captured stdout stream carries no real logging level: the bot's
+# stdout handler formats records as "%(message)s" only (see bot/anibot.py),
+# so a _log.warning()/_log.error() call is byte-for-byte indistinguishable on
+# the wire from an _log.info() one except by its own wording. This matches on
+# the content markers the bot's own messages actually carry — the [ERROR] tag
+# the log() helper prefixes user-facing failures with, plus the English/German
+# words its direct _log.warning()/_log.error() calls tend to use — rather than
+# a true level field, which never survives the docker socket. Labelled
+# "approximate" in the rendered panel so this guesswork is never mistaken for
+# the real thing.
+_BOT_LOG_PROBLEM_RE = re.compile(
+    r"\[ERROR\]|\berrors?\b|\bwarnings?\b|\bfailed\b|fehler|fehlgeschlagen",
+    re.IGNORECASE,
+)
+_BOT_LOG_DANGER_RE = re.compile(r"\[ERROR\]|\berrors?\b|fehler", re.IGNORECASE)
+
+
+def filter_bot_log_lines(raw_lines, limit=BOT_LOG_MAX_LINES):
+    """WARNING/ERROR-looking bot log lines from the docker-captured stdout
+    tail, newest first, redacted, capped at `limit`. Returns a list of
+    (tone, text) pairs where tone is "danger" (an [ERROR]/"error"/"fehler"
+    line) or "warn" (everything else that matched). Content-heuristic only —
+    see the module comment above; used only when the file log is unavailable."""
+    matches = []
+    for line in raw_lines:
+        ts_match = re.match(r"(\d{4}-\d{2}-\d{2}T[\d:.]+Z?)\s*(.*)", line)
+        content = (ts_match.group(2) if ts_match else line).strip()
+        if not content or not _BOT_LOG_PROBLEM_RE.search(content):
+            continue
+        tone = "danger" if _BOT_LOG_DANGER_RE.search(content) else "warn"
+        matches.append((tone, redact_log_text(content)))
+    matches.reverse()
+    return matches[:limit]
+
+
+def _render_bot_log_rows(matches):
+    return "".join(
+        '<div class="event event--{tone}"><span class="event-msg">{msg}</span></div>'.format(
+            tone=tone, msg=escape(msg))
+        for tone, msg in matches
+    )
+
+
+def render_bot_log():
+    """Render the "Recent bot warnings & errors" panel body.
+
+    Prefers the bot's own file log (real levels — see BOT_LOG_FILE above).
+    Only when that file is absent/unreadable does this fall back to the
+    Docker-socket content heuristic, and only then can Docker's own
+    availability show through as "Docker socket unavailable" — a working file
+    log never depends on the Docker socket at all.
+    """
+    file_lines = read_bot_log_tail()
+    if file_lines is not None:
+        matches = filter_bot_log_file_lines(file_lines)
+        if not matches:
+            return '<p class="faint">No recent warnings or errors.</p>'
+        return _render_bot_log_rows(matches)
+
+    status = docker.get_status()
+    if status.get("docker_available") is False:
+        return '<p class="faint">Docker socket unavailable</p>'
+    raw_logs = docker.get_logs(tail=500)
+    matches = filter_bot_log_lines(raw_logs)
+    if not matches:
+        return '<p class="faint">No recent warnings or errors.</p>'
+    note = ('<p class="faint">Log file unavailable — showing recent '
+            'container output (levels approximate).</p>')
+    return note + _render_bot_log_rows(matches)
+
+
 def load_run_state():
     """Read the bot's persisted run-state record (written each cycle by
     bot/anibot.py next to ani.json). Returns {} when absent or unreadable, so
@@ -2932,6 +3097,35 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
     </div>
   </div>
+  <details id="bot-log">
+    <summary>Recent bot warnings &amp; errors</summary>
+    <div class="card" id="bot-log-body" aria-live="polite">
+      <p class="faint">Not loaded yet &mdash; open to fetch.</p>
+    </div>
+  </details>
+  <script>
+  // Fetched only when opened, never on the /api/status poll — pulling a
+  // fresh 500-line docker log tail on every 10s poll would be wasteful when
+  // nobody is looking at it.
+  (function() {
+    var d = document.getElementById('bot-log');
+    var body = document.getElementById('bot-log-body');
+    if (!d || !body) return;
+    var loading = false;
+    d.addEventListener('toggle', function() {
+      if (!d.open || loading) return;
+      loading = true;
+      body.innerHTML = '<p class="faint">Loading&hellip;</p>';
+      fetch('/api/bot-log')
+        .then(function(r) { return r.json(); })
+        .then(function(data) { body.innerHTML = data.html; })
+        .catch(function() {
+          body.innerHTML = '<p class="faint">Failed to load bot log.</p>';
+        })
+        .then(function() { loading = false; });
+    });
+  })();
+  </script>
 </div>
 
 <div class="section">
@@ -6143,6 +6337,18 @@ class Handler(BaseHTTPRequestHandler):
             })
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(payload.encode("utf-8"))
+            return
+
+        if parsed.path == "/api/bot-log":
+            # Fetched lazily by the client only when the "Recent bot
+            # warnings & errors" <details> is opened — never on the
+            # /api/status poll — so the file (or, as a fallback, a fresh
+            # 500-line docker tail) is only read when someone actually looks.
+            payload = json.dumps({"html": render_bot_log()})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(payload.encode("utf-8"))
             return

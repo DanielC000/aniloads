@@ -2396,7 +2396,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
   .wl-head { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--s3); }
   .wl-title { min-width: 0; flex: 1 1 auto; }
-  .wl-url { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-faint); font-size: var(--fs-xs); text-decoration: none; }
+  .wl-url { position: relative; display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-faint); font-size: var(--fs-xs); text-decoration: none; }
   a.wl-url:hover { color: var(--accent); text-decoration: underline; }
   .wl-check { margin: 0; flex: none; }
   .wl-status { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: var(--s2); row-gap: 2px; margin-top: var(--s3); font-size: var(--fs-sm); color: var(--text-muted); }
@@ -2414,7 +2414,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .wl-status--danger .wl-status-head { color: var(--danger-text); }
   /* Paused: a neutral pause glyph in place of the dot */
   .wl-status--paused .wl-status-dot { width: 8px; height: 10px; border-radius: 0; background: none; border-left: 3px solid var(--text-muted); border-right: 3px solid var(--text-muted); }
-  .wl-card .anime-meta { margin-top: var(--s2); }
+  .wl-status--pending .wl-status-dot { background: var(--accent); }
+  .wl-card .anime-meta, .wl-pending .anime-meta { margin-top: var(--s2); }
+  /* Pending: not a real entry yet, so a dashed edge and only Remove below */
+  .wl-pending { border-style: dashed; }
+  .wl-pending > .wl-remove { margin-top: var(--s3); }
 
   .wl-panels { display: flex; flex-wrap: wrap; column-gap: var(--s5); margin-top: var(--s3); padding-top: var(--s1); border-top: 1px solid var(--border); }
   .wl-panel[open] { flex-basis: 100%; }
@@ -2484,7 +2488,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .form-row { flex-wrap: wrap; }
     .form-row select { flex: 1 1 100%; }
     /* 44px touch targets on phones */
-    .wl-card .btn, .wl-panel > summary, .wl-card .folder-input, .ep-add-row input[type=number], input[type=number].wl-num, select.wl-select { min-height: 44px; }
+    .wl-card .btn, .wl-pending .btn, .wl-panel > summary, .wl-card .folder-input, .ep-add-row input[type=number], input[type=number].wl-num, select.wl-select { min-height: 44px; }
     .wl-field { flex: 1 1 120px; }
     .wl-card .folder-input { max-width: none; flex-basis: 100%; }
     .wl-chip, .wl-tool input, .wl-tool select { min-height: 44px; }
@@ -3530,57 +3534,10 @@ def render_watchlist(anime_list, pending_list=None, entry_outcomes=None, focus=N
         return '<div class="empty">No anime in watchlist. Add some above!</div>'
     html = ""
 
-    if pending_list:
-        for i, a in enumerate(pending_list):
-            name = a.get("name", "Unknown")
-            url = a.get("url", "")
-            remove_confirm = confirm_attr("Remove {}?".format(name))
-            pref_audio = a.get("pref_audio_language", a.get("pref_language", ""))
-            pref_sub = a.get("pref_sub_language", "")
-            pref_res = a.get("pref_resolution", "")
-            pref_badges = ""
-            if pref_audio:
-                pref_badges += '<span class="badge badge-lang">Dub: {}</span> '.format(escape(pref_audio.title()))
-            if pref_sub:
-                pref_badges += '<span class="badge badge-sub">Sub: {}</span> '.format(escape(pref_sub.title()))
-            if pref_res:
-                pref_badges += '<span class="badge badge-res">{}p</span> '.format(escape(str(pref_res)))
-
-            if a.get("no_match"):
-                status_badge = '<span class="badge badge-warn">No match</span>'
-                no_match_line = (
-                    '<div class="anime-meta muted">No release matches your '
-                    'language preference &mdash; adjust Preferences, or remove.</div>'
-                )
-            elif pending_resolve_error(a):
-                status_badge = '<span class="badge badge-warn">Resolve failed</span>'
-                no_match_line = '<p class="wl-checked wl-checked--danger">{}</p>'.format(
-                    escape(pending_resolve_error(a)))
-            else:
-                status_badge = '<span class="badge badge-accent">Resolving</span>'
-                no_match_line = ""
-
-            anchor = entry_anchor_id(url)
-            html += """
-            <div class="card card-accent wl-pending" data-state="pending" data-name="{fname}" id="{anchor}">
-              {banner}
-              <div style="display:flex;justify-content:space-between;align-items:start;gap:12px;">
-                <div>
-                  <div class="anime-name">{name} {status_badge}</div>
-                  <div class="anime-url">{url}</div>
-                  <div class="anime-meta">{pref_badges}</div>
-                  {no_match_line}
-                </div>
-                <form method="POST" action="/remove-pending" style="margin:0;">
-                  <input type="hidden" name="key" value="{key}">
-                  <button type="submit" class="btn btn-danger btn-sm" onclick="{remove_confirm}">Remove</button>
-                </form>
-              </div>
-            </div>""".format(name=escape(name), url=escape(url), pref_badges=pref_badges,
-                             status_badge=status_badge, no_match_line=no_match_line, key=escape(url),
-                             remove_confirm=remove_confirm, fname=escape(str(name).casefold()),
-                             anchor=anchor,
-                             banner=focus.get("banner", "") if focus.get("anchor") == anchor else "")
+    for i, a in enumerate(pending_list or []):
+        anchor = entry_anchor_id(a.get("url", ""))
+        html += render_pending_card(
+            i, a, banner=focus.get("banner", "") if focus.get("anchor") == anchor else "")
 
     for i, a in enumerate(anime_list):
         outcome = entry_outcomes.get(a.get("url"))
@@ -4172,6 +4129,95 @@ def _render_download_rows(i, entry, key, name):
     return rows
 
 
+def _render_remove_confirm(name, key, action, note):
+    """Two-step remove, in the page rather than a window.confirm(): the first
+    click only opens a panel that names the series; Cancel closes it again.
+    ``key`` is the already-escaped entry URL."""
+    return (
+        '<details class="wl-remove"><summary class="btn btn-sm btn-danger-quiet">'
+        'Remove from watchlist{sr}</summary>'
+        '<div class="wl-remove-confirm" role="group" aria-label="Confirm removal of {name}">'
+        '<p>Remove <strong>{name}</strong> from the watchlist? {note}</p>'
+        '<div class="wl-inline">'
+        '<form method="POST" action="{action}">{key}'
+        '<button type="submit" class="btn btn-danger btn-sm">Remove {name}</button></form>'
+        '<button type="button" class="btn btn-ghost btn-sm" '
+        'onclick="this.closest(\'details\').open = false">Cancel</button>'
+        '</div></div></details>').format(
+            sr=_sr(" " + name), name=escape(name), key=_key_input(key),
+            action=action, note=escape(note))
+
+
+def _status_line_html(tone, headline, details=()):
+    return (
+        '<p class="wl-status wl-status--{tone}">'
+        '<span class="wl-status-dot" aria-hidden="true"></span>'
+        '<span class="wl-status-head">{head}</span>{details}</p>').format(
+            tone=tone, head=escape(headline),
+            details="".join('<span class="wl-status-detail">{}</span>'.format(escape(d))
+                            for d in details))
+
+
+def _pref_facts(entry):
+    """(label, title) badges for an entry's per-series release preferences."""
+    facts = []
+    pref_audio = entry.get("pref_audio_language", entry.get("pref_language", ""))
+    if pref_audio:
+        facts.append(("Dub: {}".format(pref_audio.title()), "Preferred audio"))
+    if entry.get("pref_sub_language"):
+        facts.append(("Sub: {}".format(entry["pref_sub_language"].title()), "Preferred subtitles"))
+    if entry.get("pref_resolution"):
+        facts.append(("{}p".format(entry["pref_resolution"]), "Preferred resolution"))
+    return facts
+
+
+def _facts_html(facts):
+    if not facts:
+        return ""
+    return '<div class="anime-meta">{}</div>'.format(" ".join(
+        '<span class="badge badge-neutral" title="{}">{}</span>'.format(escape(t), escape(label))
+        for label, t in facts))
+
+
+def render_pending_card(i, a, banner=""):
+    """A watchlist entry the resolver has not turned into a full entry yet.
+    Same shape as render_watchlist_card, minus the actions that need a
+    resolved release: a status line saying where resolving stands, and Remove."""
+    name = a.get("name", "Unknown")
+    url = a.get("url", "")
+    failure = pending_resolve_error(a)
+    if a.get("no_match"):
+        status_html = _status_line_html("danger", "No matching release")
+        note_html = ('<p class="wl-checked">No release matches your language preference. '
+                     'Adjust Preferences, or remove it.</p>')
+    elif failure:
+        status_html = _status_line_html("danger", "Resolve failed")
+        note_html = '<p class="wl-checked wl-checked--danger">{}</p>'.format(escape(failure))
+    else:
+        status_html = _status_line_html("pending", "Resolving", ["finding a release"])
+        note_html = ""
+
+    return """
+        <article class="card wl-pending" data-state="pending" data-name="{fname}" id="{anchor}" aria-labelledby="wl-pending-name-{i}">
+          {banner}
+          <div class="wl-head">
+            <div class="wl-title">
+              <h3 class="anime-name" id="wl-pending-name-{i}">{name}</h3>
+              {url_html}
+            </div>
+          </div>
+          {status_html}{note_html}
+          {facts_html}
+          {remove_html}
+        </article>""".format(
+        i=i, fname=escape(str(name).casefold()), anchor=entry_anchor_id(url), banner=banner,
+        name=escape(name), url_html=_watchlist_url_html(url),
+        status_html=status_html, note_html=note_html, facts_html=_facts_html(_pref_facts(a)),
+        remove_html=_render_remove_confirm(
+            name, escape(url), "/remove-pending", "Nothing has been downloaded for it yet."),
+    )
+
+
 def _render_edit_panel(i, entry, key, name, is_open=False):
     folder = entry.get("customPackage", entry.get("name", "Unknown"))
     rows = _render_download_rows(i, entry, key, name)
@@ -4222,21 +4268,8 @@ def _render_edit_panel(i, entry, key, name, is_open=False):
             '<button type="submit" class="btn btn-ghost btn-sm">Mark incomplete{sr}</button>'
             '</form></div></div>').format(key=_key_input(key), sr=_sr(" for {}".format(name)))
 
-    # Two-step remove, in the page rather than a window.confirm(): the first
-    # click only opens a panel that names the series; Cancel closes it again.
-    rows += (
-        '<details class="wl-remove"><summary class="btn btn-sm btn-danger-quiet">'
-        'Remove from watchlist{sr}</summary>'
-        '<div class="wl-remove-confirm" role="group" aria-label="Confirm removal of {name}">'
-        '<p>Remove <strong>{name}</strong> from the watchlist? '
-        'Episodes already downloaded stay on disk.</p>'
-        '<div class="wl-inline">'
-        '<form method="POST" action="/remove">{key}'
-        '<button type="submit" class="btn btn-danger btn-sm">Remove {name}</button></form>'
-        '<button type="button" class="btn btn-ghost btn-sm" '
-        'onclick="this.closest(\'details\').open = false">Cancel</button>'
-        '</div></div></details>').format(
-            sr=_sr(" " + name), name=escape(name), key=_key_input(key))
+    rows += _render_remove_confirm(name, key, "/remove",
+                                   "Episodes already downloaded stay on disk.")
 
     return ('<details class="wl-panel wl-edit"{open}><summary>Edit{sr}</summary>'
             '<div class="wl-panel-body">{rows}</div></details>').format(
@@ -4252,13 +4285,7 @@ def render_watchlist_card(i, a, outcome=None, open_panel=None, banner=""):
     key = escape(url)
 
     tone, headline, details = watchlist_status(a)
-    status_html = (
-        '<p class="wl-status wl-status--{tone}">'
-        '<span class="wl-status-dot" aria-hidden="true"></span>'
-        '<span class="wl-status-head">{head}</span>{details}</p>').format(
-            tone=tone, head=escape(headline),
-            details="".join('<span class="wl-status-detail">{}</span>'.format(escape(d))
-                            for d in details))
+    status_html = _status_line_html(tone, headline, details)
 
     # Badges carry facts only; every action lives in a panel below.
     facts = []
@@ -4270,18 +4297,8 @@ def render_watchlist_card(i, a, outcome=None, open_panel=None, banner=""):
                       "Linked to TVDB"))
         if a.get("episode_offset", 0) != 0:
             facts.append(("Offset {:+d}".format(a["episode_offset"]), "TVDB episode offset"))
-    pref_audio = a.get("pref_audio_language", a.get("pref_language", ""))
-    if pref_audio:
-        facts.append(("Dub: {}".format(pref_audio.title()), "Preferred audio"))
-    if a.get("pref_sub_language"):
-        facts.append(("Sub: {}".format(a["pref_sub_language"].title()), "Preferred subtitles"))
-    if a.get("pref_resolution"):
-        facts.append(("{}p".format(a["pref_resolution"]), "Preferred resolution"))
-    facts_html = ""
-    if facts:
-        facts_html = '<div class="anime-meta">{}</div>'.format(" ".join(
-            '<span class="badge badge-neutral" title="{}">{}</span>'.format(escape(t), escape(label))
-            for label, t in facts))
+    facts += _pref_facts(a)
+    facts_html = _facts_html(facts)
 
     # While paused, Check now would do nothing: the header offers Resume.
     if a.get("paused"):

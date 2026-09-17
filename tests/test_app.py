@@ -558,7 +558,7 @@ class RenderWatchlistPendingTest(unittest.TestCase):
         out = app.render_watchlist(
             [], [{"name": "Foo", "url": "http://x", "no_match": True}])
         self.assertIn("No release matches your language preference", out)
-        self.assertIn("badge-warn", out)
+        self.assertIn("wl-status--danger", out)
         self.assertNotIn("Resolving", out)
 
     def test_normal_pending_renders_resolving(self):
@@ -1545,8 +1545,9 @@ class ConfirmAttrTest(unittest.TestCase):
     def test_render_watchlist_pending_apostrophe_button_is_safe(self):
         out = app.render_watchlist(
             [], [{"name": "Frieren: Beyond Journey's End", "url": "http://x"}])
-        self.assertIn('onclick="return confirm(', out)
-        self.assertNotIn("confirm('Remove", out)
+        # Pending Remove confirms in the page too: no window.confirm at all.
+        self.assertNotIn("confirm(", out)
+        self.assertIn("Remove <strong>Frieren: Beyond Journey&#x27;s End</strong>", out)
 
 
 class RedirectMsgEncodingTest(unittest.TestCase):
@@ -6223,8 +6224,8 @@ class WatchlistFilterTest(unittest.TestCase):
 
     def test_cards_carry_attrs_and_pending_is_marked(self):
         out = app.render_watchlist(self.ENTRIES, [{"name": "Queued", "url": "https://x/q"}])
-        self.assertIn('class="card card-accent wl-pending" data-state="pending" data-name="queued"', out)
-        self.assertEqual(out.count("<article "), len(self.ENTRIES))
+        self.assertIn('class="card wl-pending" data-state="pending" data-name="queued"', out)
+        self.assertEqual(out.count('<article class="card wl-card"'), len(self.ENTRIES))
         self.assertIn('aria-labelledby="wl-name-3" data-state="complete" data-tvdb="1" '
                       'data-name="done" data-added="3"', out)
 
@@ -6267,3 +6268,89 @@ class WatchlistFilterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RenderPendingCardTest(unittest.TestCase):
+    """Pending cards share the redesigned entry card's pieces: status line,
+    truncated URL link, in-page remove confirm naming the series."""
+
+    URL = "https://www.anime-loads.org/media/pend"
+
+    def test_resolving_status_line(self):
+        out = app.render_watchlist([], [{"name": "Pend", "url": self.URL}])
+        self.assertIn('<p class="wl-status wl-status--pending">', out)
+        self.assertIn('<span class="wl-status-head">Resolving</span>'
+                      '<span class="wl-status-detail">finding a release</span>', out)
+        self.assertNotIn("wl-status--danger", out)
+        self.assertNotIn("badge-accent", out)
+
+    def test_failed_status_line_escapes_reason(self):
+        entry = {"name": "Pend", "url": self.URL,
+                 "resolve_error": {"reason": "Timeout <script>x</script>", "ts": "2026-09-17T18:44:00Z"}}
+        out = app.render_watchlist([], [entry])
+        self.assertIn('<p class="wl-status wl-status--danger">', out)
+        self.assertIn('<span class="wl-status-head">Resolve failed</span>', out)
+        self.assertIn('<p class="wl-checked wl-checked--danger">', out)
+        self.assertIn("failed: Timeout &lt;script&gt;x&lt;/script&gt;. Retrying automatically.", out)
+        self.assertNotIn("<script>x", out)
+
+    def test_url_uses_truncated_link_not_raw_text(self):
+        out = app.render_watchlist([], [{"name": "Pend", "url": self.URL}])
+        self.assertIn(app._watchlist_url_html(self.URL), out)
+        self.assertNotIn("anime-url", out)
+
+    def test_remove_confirm_names_series_and_posts_to_remove_pending(self):
+        out = app.render_watchlist([], [{"name": "A <b>&", "url": self.URL}])
+        self.assertIn('<details class="wl-remove"><summary class="btn btn-sm btn-danger-quiet">'
+                      'Remove from watchlist<span class="sr-only"> A &lt;b&gt;&amp;</span></summary>', out)
+        self.assertIn('aria-label="Confirm removal of A &lt;b&gt;&amp;"', out)
+        self.assertIn("Remove <strong>A &lt;b&gt;&amp;</strong> from the watchlist?", out)
+        self.assertIn('<form method="POST" action="/remove-pending">'
+                      '<input type="hidden" name="key" value="{}">'.format(self.URL), out)
+        self.assertIn(">Remove A &lt;b&gt;&amp;</button>", out)
+        self.assertNotIn("<b>", out)
+
+    def test_anchor_and_filter_attrs_preserved(self):
+        anchor = app.entry_anchor_id(self.URL)
+        out = app.render_watchlist([], [{"name": "Pend", "url": self.URL}])
+        self.assertIn('class="card wl-pending" data-state="pending" data-name="pend" id="{}"'
+                      .format(anchor), out)
+        self.assertIn('aria-labelledby="wl-pending-name-0"', out)
+        self.assertIn('<h3 class="anime-name" id="wl-pending-name-0">Pend</h3>', out)
+
+    def test_focus_banner_lands_on_pending_card(self):
+        anchor = app.entry_anchor_id(self.URL)
+        out = app.render_watchlist(
+            [], [{"name": "Other", "url": "https://x/o"}, {"name": "Pend", "url": self.URL}],
+            focus={"anchor": anchor, "banner": "<p>BANNER</p>"})
+        self.assertEqual(out.count("<p>BANNER</p>"), 1)
+        self.assertLess(out.index('id="{}"'.format(anchor)), out.index("<p>BANNER</p>"))
+
+    def test_pref_badges_shared_with_entry_card(self):
+        entry = {"name": "Pend", "url": self.URL, "pref_audio_language": "german",
+                 "pref_resolution": 1080}
+        out = app.render_watchlist([], [entry])
+        self.assertIn('<span class="badge badge-neutral" title="Preferred audio">Dub: German</span>', out)
+        self.assertIn('<span class="badge badge-neutral" title="Preferred resolution">1080p</span>', out)
+
+    def test_pending_buttons_get_phone_touch_targets(self):
+        self.assertIn(".wl-pending .btn", app.HTML_TEMPLATE)
+
+    def test_remove_pending_redirects_to_watchlist(self):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        orig = app.ANI_JSON
+        app.ANI_JSON = path
+        try:
+            app.save_ani({"pending": [{"name": "Pend", "url": self.URL}]})
+            captured = {}
+            handler = app.Handler.__new__(app.Handler)
+            handler.path = "/remove-pending"
+            handler._read_post = lambda: {"key": self.URL}
+            handler._redirect_msg = lambda msg, level=None, **kw: captured.update(msg=msg, **kw)
+            handler.do_POST()
+            self.assertEqual(app.load_ani()["pending"], [])
+            self.assertEqual(captured, {"msg": "Removed: Pend", "anchor": app.ANCHOR_WATCHLIST})
+        finally:
+            app.ANI_JSON = orig
+            os.remove(path)

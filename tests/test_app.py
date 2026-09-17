@@ -5448,10 +5448,11 @@ class DashboardLandmarksTest(unittest.TestCase):
         self.assertLess(t.index("<main>"), t.index("%%WATCHLIST%%"))
         self.assertLess(t.index("%%WATCHLIST%%"), t.index("</main>"))
 
-    def test_run_history_collapses_on_narrow_screens(self):
+    def test_run_history_starts_closed_and_remembers_the_reader(self):
         t = app.HTML_TEMPLATE
-        self.assertIn('<details open id="run-history-panel">', t)
-        self.assertIn("matchMedia('(max-width: 600px)')", t)
+        self.assertIn('<details %%RUN_HISTORY_OPEN%%id="run-history-panel">', t)
+        self.assertNotIn("matchMedia('(max-width: 600px)')", t)
+        self.assertIn("'aniloads.run-history-open'", t)
 
     def test_per_episode_js_builder_is_gone(self):
         self.assertNotIn("expandEps", app.HTML_TEMPLATE)
@@ -6597,3 +6598,106 @@ class ManualPlacementMoverTest(unittest.TestCase):
         self.assertIn("moved", self._types(events))
         self.assertTrue(os.path.isfile(
             os.path.join(self.media, "Frieren", "S02", "Frieren.S02E01.mkv")))
+
+
+class JumpBarAndCompactPanelsTest(unittest.TestCase):
+    """Section jump bar, Health folding to one line when nothing is wrong,
+    and Run History starting closed unless the reader paged it."""
+
+    DATA = {"settings": {}, "anime": [
+        {"name": "A", "url": "https://www.anime-loads.org/media/a", "episodes": 1}]}
+    OK = ("Site Login", {"state": "ok", "detail": "Logged in"})
+
+    def setUp(self):
+        self._orig_get_health = app.get_health
+
+    def tearDown(self):
+        app.get_health = self._orig_get_health
+
+    def page(self, **kw):
+        return app.render_page(ani_data=self.DATA, **kw)
+
+    def test_all_ok_health_folds_to_one_closed_line(self):
+        app.get_health = lambda: [self.OK, ("TVDB", {"state": "ok", "detail": "Reachable"})]
+        out = app.render_health_card()
+        self.assertTrue(out.startswith('<details class="health-compact"><summary>'))
+        summary = out[:out.index("</summary>")]
+        self.assertIn("All systems OK", summary)
+        self.assertIn("2 checks", summary)
+        self.assertNotIn(" open", out[:out.index("<summary>")])
+        # The rows are still there behind the summary.
+        self.assertEqual(out.count('class="health-row"'), 2)
+
+    def test_unknown_rows_fold_but_do_not_claim_all_ok(self):
+        app.get_health = lambda: [self.OK, ("TVDB", {"state": "unknown", "detail": "no key"})]
+        out = app.render_health_card()
+        self.assertIn('class="health-compact"', out)
+        self.assertNotIn("All systems OK", out)
+        self.assertIn("1 OK, 1 unknown", out)
+
+    def test_any_warn_or_fail_shows_the_full_panel(self):
+        for state in ("warn", "fail"):
+            app.get_health = lambda s=state: [self.OK, ("Disk Space", {"state": s, "detail": "x"})]
+            out = app.render_health_card()
+            self.assertTrue(out.startswith('<div class="health-grid">'), state)
+            self.assertNotIn("health-compact", out)
+
+    def test_poll_fragment_carries_the_compact_state(self):
+        app.get_health = lambda: [self.OK]
+        captured = {}
+        h = app.Handler.__new__(app.Handler)
+        h.path = "/api/status"
+        h.send_response = lambda code: None
+        h.send_header = lambda k, v: None
+        h.end_headers = lambda: None
+        h.wfile = types.SimpleNamespace(write=lambda b: captured.__setitem__("body", b))
+        h.do_GET()
+        self.assertIn('class="health-compact"', json.loads(captured["body"])["health"])
+        # The poll keeps a reader-expanded summary open across updates.
+        self.assertIn(".health-compact[open]", app.HTML_TEMPLATE)
+
+    def test_run_history_open_only_with_runs_param(self):
+        self.assertFalse(app.run_history_open({}))
+        self.assertFalse(app.run_history_open(parse_qs("msg=x&at=watchlist")))
+        self.assertTrue(app.run_history_open(parse_qs("runs=40")))
+        self.assertTrue(app.run_history_open(parse_qs("runs=40&msg=x&at=entry-a-1")))
+        self.assertIn('<details id="run-history-panel">', self.page())
+        self.assertIn('<details open id="run-history-panel">', self.page(history_open=True))
+
+    def test_get_with_runs_renders_run_history_open(self):
+        def get(path):
+            captured = {}
+            h = app.Handler.__new__(app.Handler)
+            h.path = path
+            h._respond = lambda code, body: captured.__setitem__("kw", body)
+            orig = app.render_page
+            app.render_page = lambda **kw: kw
+            try:
+                h.do_GET()
+            finally:
+                app.render_page = orig
+            return captured["kw"]
+        self.assertFalse(get("/")["history_open"])
+        self.assertTrue(get("/?runs=40")["history_open"])
+        self.assertTrue(get(app.status_url("Saved", anchor="watchlist", runs=40))["history_open"])
+
+    def test_jump_bar_links_to_existing_sections(self):
+        page = self.page()
+        nav = page[page.index('<nav class="jump" aria-label="Page sections">'):]
+        nav = nav[:nav.index("</nav>")]
+        hrefs = re.findall(r'href="#([a-z-]+)"', nav)
+        self.assertEqual(hrefs, ["watchlist", "add-flow", "bot-activity", "file-mover", "settings"])
+        for anchor in hrefs:
+            self.assertIn(anchor, app.SECTION_ANCHORS)
+            self.assertEqual(page.count('id="{}"'.format(anchor)), 1)
+        # The jump bar sits before the first section, and the Settings link
+        # opens its disclosure.
+        self.assertLess(page.index('class="jump"'), page.index('id="bot-activity"'))
+        self.assertIn("id !== 'settings'", page)
+
+    def test_full_page_ids_are_unique(self):
+        app.get_health = lambda: [self.OK]
+        c = _ControlCollector()
+        c.feed(self.page())
+        self.assertEqual(len(c.ids), len(set(c.ids)))
+        self.assertNotIn("%%", self.page())

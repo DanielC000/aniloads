@@ -1177,10 +1177,18 @@ def render_health_card():
     """Render the Health panel: one row per check, a status badge, and (for
     anything not ok) a one-line actionable hint. Never renders a credential,
     username, or raw host/port — only booleans, counts, and generic detail
-    strings."""
+    strings.
+
+    With nothing in warn/fail the rows fold behind a one-line summary (a
+    closed ``<details>``), so a healthy stack costs one line of the page; any
+    warn/fail shows every row. Rendered here, inside the polled fragment, so
+    the 10s poll flips between the two states on its own."""
+    health = get_health()
     rows = []
-    for label, result in get_health():
+    states = []
+    for label, result in health:
         state = result.get("state", "unknown")
+        states.append(state)
         badge_cls = _HEALTH_BADGE.get(state, "badge-neutral")
         badge_label = _HEALTH_LABEL.get(state, "Unknown")
         hint_html = ""
@@ -1198,7 +1206,20 @@ def render_health_card():
                 detail=escape(result.get("detail", "")), hint=hint_html,
             )
         )
-    return '<div class="health-grid">{}</div>'.format("".join(rows))
+    grid = '<div class="health-grid">{}</div>'.format("".join(rows))
+    if not states or "warn" in states or "fail" in states:
+        return grid
+    unknown = states.count("unknown")
+    if unknown:
+        badge, headline = ('<span class="badge badge-neutral">OK</span>', "No problems found")
+        detail = "{} OK, {} unknown".format(len(states) - unknown, unknown)
+    else:
+        badge, headline = ('<span class="badge badge-ok">OK</span>', "All systems OK")
+        detail = "{} checks".format(len(states))
+    return ('<details class="health-compact"><summary>{badge}'
+            '<span class="health-headline">{headline}</span>'
+            '<span class="health-detail">{detail}</span></summary>{grid}</details>').format(
+                badge=badge, headline=headline, detail=detail, grid=grid)
 
 
 # Alias-tolerant language matching. Site labels are German ("Deutsch",
@@ -2361,6 +2382,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .status-ok { background: var(--ok-bg); color: var(--ok-text); }
   .status-err { background: var(--danger-bg); color: var(--danger-text); }
   .section { margin-bottom: var(--s6); }
+
+  /* Section jump bar: sticky, so the watchlist is one tap from anywhere.
+     scroll-padding keeps every #anchor landing clear of it. */
+  html { scroll-padding-top: 56px; }
+  .jump { position: sticky; top: 0; z-index: 10; margin: calc(-1 * var(--s3)) 0 var(--s5); padding: var(--s2) 0; background: var(--bg); border-bottom: 1px solid var(--border); }
+  .jump ul { list-style: none; display: flex; gap: var(--s1); }
+  .jump a { display: inline-flex; align-items: center; min-height: 36px; padding: 0 var(--s3); border-radius: var(--radius-sm); color: var(--text-muted); font-size: var(--fs-sm); font-weight: 500; text-decoration: none; white-space: nowrap; transition: background-color var(--tr), color var(--tr); }
+  .jump a:hover { background: var(--surface-2); color: var(--text-heading); }
   .toggle { display: flex; align-items: center; gap: var(--s2); }
   .toggle input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--accent); }
   .prefs-current { display: flex; gap: var(--s2); flex-wrap: wrap; margin-top: var(--s2); }
@@ -2378,6 +2407,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .status-dot.unknown { background: var(--text-faint); }
 
   /* Health panel */
+  .health-compact > summary { list-style: none; display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; min-height: 32px; font-size: var(--fs-sm); color: var(--text); }
+  .health-compact > summary::-webkit-details-marker { display: none; }
+  .health-compact > summary::after { content: ""; flex: none; width: 6px; height: 6px; margin-left: auto; border-right: 1.5px solid var(--text-muted); border-bottom: 1.5px solid var(--text-muted); transform: rotate(45deg); transition: transform var(--tr); }
+  .health-compact[open] > summary::after { transform: rotate(-135deg); }
+  .health-compact > summary:hover .health-headline { color: var(--accent); }
+  .health-headline { font-weight: 600; color: var(--text-heading); transition: color var(--tr); }
   .health-grid { display: flex; flex-direction: column; gap: var(--s3); }
   .health-row { padding: var(--s2) 0; border-bottom: 1px solid var(--border); }
   .health-row:last-child { border-bottom: none; padding-bottom: 0; }
@@ -2526,6 +2561,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .wl-chip, .wl-tool input, .wl-tool select { min-height: 44px; }
     .wl-tool, .wl-tool-q { flex: 1 1 100%; max-width: none; }
     .status-close { width: 44px; height: 44px; margin: -12px -12px -12px 0; }
+    .jump { margin-left: calc(-1 * var(--s4)); margin-right: calc(-1 * var(--s4)); padding: 0 var(--s2); }
+    .jump ul { justify-content: space-between; gap: 0; }
+    .jump a { min-height: 44px; padding: 0 var(--s2); }
+    .health-compact > summary { min-height: 44px; }
   }
   @media (prefers-reduced-motion: reduce) {
     * { transition: none !important; animation: none !important; }
@@ -2537,6 +2576,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <header>
   <h1>Anime-Loads Dashboard</h1>
 </header>
+<nav class="jump" aria-label="Page sections">
+  <ul>
+    <li><a href="#watchlist">Watchlist</a></li>
+    <li><a href="#add-flow">Add</a></li>
+    <li><a href="#bot-activity">Activity</a></li>
+    <li><a href="#file-mover">Mover</a></li>
+    <li><a href="#settings">Settings</a></li>
+  </ul>
+</nav>
 
 <main>
 %%STATUS_MSG%%
@@ -2575,17 +2623,29 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </div>
 
 <div class="section">
-  <details open id="run-history-panel">
+  <details %%RUN_HISTORY_OPEN%%id="run-history-panel">
     <summary>Run History</summary>
     <div class="card" id="run-history">
       %%RUN_HISTORY%%
     </div>
   </details>
   <script>
-  // Phones: start Run History collapsed so the watchlist isn't a long scroll away.
+  // Run History starts closed so the watchlist isn't a long scroll away. The
+  // server opens it for a ?runs= page; a #run-history-panel link opens it
+  // here; otherwise the reader's last choice (per browser) wins.
   (function() {
     var d = document.getElementById('run-history-panel');
-    if (d && window.matchMedia && window.matchMedia('(max-width: 600px)').matches) d.open = false;
+    if (!d) return;
+    var KEY = 'aniloads.run-history-open';
+    if (!d.open) {
+      if (location.hash === '#run-history-panel') d.open = true;
+      else try { d.open = localStorage.getItem(KEY) === '1'; } catch (e) {}
+    }
+    d.querySelector('summary').addEventListener('click', function() {
+      setTimeout(function() {
+        try { localStorage.setItem(KEY, d.open ? '1' : '0'); } catch (e) {}
+      }, 0);
+    });
   })();
   </script>
 </div>
@@ -2781,6 +2841,25 @@ function scrapeBusy(form, label) {
   }
 })();
 
+// Jump bar and #links: a section that lives inside a closed disclosure
+// (Settings, Run History) opens before the browser scrolls to it.
+(function() {
+  function openAt(hash) {
+    var id;
+    try { id = decodeURIComponent((hash || '').slice(1)); } catch (e) { return; }
+    if (id !== 'settings' && id !== 'run-history-panel') return;
+    var el = document.getElementById(id);
+    var d = el && (el.tagName === 'DETAILS' ? el : el.querySelector(':scope > details'));
+    if (d) d.open = true;
+  }
+  document.addEventListener('click', function(e) {
+    var a = e.target.closest && e.target.closest('a[href^="#"]');
+    if (a) openAt(a.getAttribute('href'));
+  });
+  window.addEventListener('hashchange', function() { openAt(location.hash); });
+  openAt(location.hash);
+})();
+
 // Watchlist filter + sort, client-side. Cards carry their state as data-*
 // from the server; the 10s poll never touches #wl-list, so this only runs
 // on load and on input. The chosen chip and sort persist per browser.
@@ -2906,8 +2985,12 @@ function scrapeBusy(form, label) {
             // the reader had open (by their stable per-cycle key) and re-open
             // them, or a poll would silently collapse what they were reading.
             var open = openRunKeys(el);
+            // Same for a healthy Health summary the reader expanded.
+            var healthOpen = !!el.querySelector('.health-compact[open]');
             el.innerHTML = d[key];
             restoreRunKeys(el, open);
+            var compact = healthOpen && el.querySelector('.health-compact');
+            if (compact) compact.open = true;
           }
         });
         if (d.bot_running) {
@@ -3305,6 +3388,13 @@ def parse_runs_param(qs):
     except (TypeError, ValueError):
         return RUN_HISTORY_PAGE
     return max(RUN_HISTORY_PAGE, min(n, RUN_HISTORY_MAX))
+
+
+def run_history_open(qs):
+    """Whether the page renders Run History expanded: only when the reader
+    paged it (``?runs=``, which every redirect carries along via the
+    Referer). A plain load leaves it closed for the page script to decide."""
+    return "runs" in qs
 
 
 def render_run_history_more(total, max_runs):
@@ -5111,8 +5201,12 @@ def validate_settings_form(params, auth_enabled):
 
 
 def render_page(status="", search_html="", prefs_open=False, ani_data=None, search_query="",
-                max_runs=RUN_HISTORY_PAGE, status_at=None, open_panel=None):
-    """``status_at`` is the anchor the action redirected to (see status_url):
+                max_runs=RUN_HISTORY_PAGE, status_at=None, open_panel=None,
+                history_open=False):
+    """``history_open`` renders Run History expanded (see run_history_open);
+    otherwise the page script restores the reader's saved choice.
+
+    ``status_at`` is the anchor the action redirected to (see status_url):
     the ``status`` banner renders next to it rather than at the page top, and
     the section's disclosure (or the card's ``open_panel``) is open again. An
     anchor that no longer exists (e.g. a removed entry) falls back to the top."""
@@ -5152,6 +5246,7 @@ def render_page(status="", search_html="", prefs_open=False, ani_data=None, sear
     page = page.replace("%%BOT_STATUS%%", bot_status_html)
     page = page.replace("%%LAST_RUN%%", last_run_html)
     page = page.replace("%%NEXT_RUN%%", next_run_html)
+    page = page.replace("%%RUN_HISTORY_OPEN%%", "open " if history_open else "")
     page = page.replace("%%RUN_HISTORY%%", history_html)
     page = page.replace("%%HEALTH%%", health_html)
     page = page.replace("%%MOVE_STATUS%%", move_status_html)
@@ -5430,7 +5525,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             page = render_page(status=status, search_html=search_html, search_query=search_query,
                                max_runs=parse_runs_param(qs),
-                               status_at=status_at, open_panel=open_panel)
+                               status_at=status_at, open_panel=open_panel,
+                               history_open=run_history_open(qs))
         except anistore.CorruptStoreError as e:
             _log.error("[watchlist] ani.json is corrupt, refusing to render it: %s", e)
             status = render_status_banner(

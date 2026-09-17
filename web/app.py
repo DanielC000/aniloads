@@ -2371,6 +2371,31 @@ def _move_subtitles(dir_path, video_stem, target_dir, new_stem):
             pass
 
 
+def _cleanup_download_dir(dir_path):
+    """Delete known junk files and remove now-empty directories under
+    ``dir_path`` (bottom-up). Refuses to touch DOWNLOAD_DIR itself or
+    anything outside it (realpath containment), so a caller can pass a
+    package folder without re-deriving this safety check itself.
+    """
+    real_dir = os.path.realpath(dir_path)
+    if real_dir == os.path.realpath(DOWNLOAD_DIR) or not _is_within_media_dir(dir_path, DOWNLOAD_DIR):
+        return
+    for root, _dirs, files in os.walk(dir_path):
+        for f in files:
+            if os.path.splitext(f)[1].lower() in _JUNK_EXTS:
+                try:
+                    os.unlink(os.path.join(root, f))
+                except OSError:
+                    pass
+    # Remove empty directories bottom-up
+    for root, dirs, files in os.walk(dir_path, topdown=False):
+        if not files and not dirs:
+            try:
+                os.rmdir(root)
+            except OSError:
+                pass
+
+
 _STUCK_ASSIGNABLE_REASONS = ("parse", "loose")
 
 
@@ -2442,7 +2467,9 @@ def stuck_assign(key, entry_url, season_raw, episode_raw):
     if rec.get("reason") == "parse":
         video_stem = os.path.splitext(src_name)[0]
         new_stem = os.path.splitext(new_filename)[0]
-        _move_subtitles(os.path.dirname(src_path), video_stem, target_dir, new_stem)
+        src_dir = os.path.dirname(src_path)
+        _move_subtitles(src_dir, video_stem, target_dir, new_stem)
+        _cleanup_download_dir(src_dir)
 
     dest_short = "{}/{}".format(anime_name, season_dir)
     msg = "{} → {}/{}".format(src_name, dest_short, new_filename)
@@ -2708,20 +2735,7 @@ def run_move_cycle():
         # Delete only known junk (release nfo/readme, thumbnails, ...); leave
         # subtitles (already moved above, if matched) and any unrecognized
         # extension in place rather than destroying something we don't know.
-        for root, _dirs, files in os.walk(dir_path):
-            for f in files:
-                if os.path.splitext(f)[1].lower() in _JUNK_EXTS:
-                    try:
-                        os.unlink(os.path.join(root, f))
-                    except OSError:
-                        pass
-        # Remove empty directories bottom-up
-        for root, dirs, files in os.walk(dir_path, topdown=False):
-            if not files and not dirs:
-                try:
-                    os.rmdir(root)
-                except OSError:
-                    pass
+        _cleanup_download_dir(dir_path)
 
     return events
 
@@ -7504,9 +7518,19 @@ def _run_and_record_move_cycle():
             _log.debug("[mover] %s", summary)
 
 
+def _move_startup_wait():
+    """Wait up to MOVE_STARTUP_DELAY for an early Move Now trigger, so a
+    manual trigger during a container restart's startup delay starts the
+    first cycle promptly instead of being swallowed until the delay ends.
+    Falls through once the delay elapses either way, same as the poll
+    loop's own wait+clear below."""
+    _move_trigger.wait(timeout=MOVE_STARTUP_DELAY)
+    _move_trigger.clear()
+
+
 def move_completed_worker():
     """Background thread: move completed downloads to media library."""
-    time.sleep(MOVE_STARTUP_DELAY)
+    _move_startup_wait()
     global _move_running
 
     while True:

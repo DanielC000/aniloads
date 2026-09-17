@@ -8207,3 +8207,201 @@ class RenderActivityWaitingForConfigWithoutDockerTest(unittest.TestCase):
         self.assertEqual(
             status_html,
             '<span class="status-dot running"></span>Waiting for configuration')
+
+
+class MoveStartupWaitTest(unittest.TestCase):
+    """_move_startup_wait(): the mover thread's startup delay must not
+    swallow an early Move Now trigger (card f5f5c053, bug 1) — it should
+    fall through as soon as _move_trigger is set, not sleep the full
+    MOVE_STARTUP_DELAY regardless."""
+
+    def setUp(self):
+        self._orig_delay = app.MOVE_STARTUP_DELAY
+        self._orig_trigger_state = app._move_trigger.is_set()
+        app._move_trigger.clear()
+
+    def tearDown(self):
+        app.MOVE_STARTUP_DELAY = self._orig_delay
+        app._move_trigger.clear()
+        if self._orig_trigger_state:
+            app._move_trigger.set()
+
+    def test_early_trigger_returns_promptly_not_after_full_delay(self):
+        app.MOVE_STARTUP_DELAY = 5
+
+        def trigger_soon():
+            time.sleep(0.05)
+            app._move_trigger.set()
+
+        threading.Thread(target=trigger_soon, daemon=True).start()
+
+        start = time.time()
+        app._move_startup_wait()
+        elapsed = time.time() - start
+
+        # Bounded wait: well under the 5s delay, proving the trigger woke
+        # it rather than the full sleep expiring.
+        self.assertLess(elapsed, 2.0)
+        self.assertFalse(app._move_trigger.is_set())
+
+    def test_no_trigger_falls_through_after_delay_elapses(self):
+        app.MOVE_STARTUP_DELAY = 0.1
+        start = time.time()
+        app._move_startup_wait()
+        elapsed = time.time() - start
+        self.assertGreaterEqual(elapsed, 0.1)
+        self.assertFalse(app._move_trigger.is_set())
+
+
+class CleanupDownloadDirTest(unittest.TestCase):
+    """_cleanup_download_dir(): shared helper reused by both run_move_cycle
+    and stuck_assign (card f5f5c053, bug 2) — junk-only removal and
+    bottom-up empty-dir pruning, refusing to ever remove DOWNLOAD_DIR
+    itself or anything outside it."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-cleanup-")
+        self.download = os.path.join(self.tmp, "downloads")
+        os.makedirs(self.download)
+        self._orig_dl = app.DOWNLOAD_DIR
+        app.DOWNLOAD_DIR = self.download
+
+    def tearDown(self):
+        app.DOWNLOAD_DIR = self._orig_dl
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_empty_package_folder_removed(self):
+        pkg = os.path.join(self.download, "Some.Release")
+        os.makedirs(pkg)
+        app._cleanup_download_dir(pkg)
+        self.assertFalse(os.path.exists(pkg))
+
+    def test_folder_with_only_junk_removed(self):
+        pkg = os.path.join(self.download, "Some.Release")
+        os.makedirs(pkg)
+        with open(os.path.join(pkg, "release.nfo"), "w") as f:
+            f.write("junk")
+        app._cleanup_download_dir(pkg)
+        self.assertFalse(os.path.exists(pkg))
+
+    def test_folder_with_remaining_real_file_kept(self):
+        pkg = os.path.join(self.download, "Some.Release")
+        os.makedirs(pkg)
+        keep = os.path.join(pkg, "Some.Release.mkv")
+        with open(keep, "w") as f:
+            f.write("video")
+        app._cleanup_download_dir(pkg)
+        self.assertTrue(os.path.isdir(pkg))
+        self.assertTrue(os.path.isfile(keep))
+
+    def test_never_removes_download_dir_itself(self):
+        with open(os.path.join(self.download, "release.nfo"), "w") as f:
+            f.write("junk")
+        app._cleanup_download_dir(self.download)
+        self.assertTrue(os.path.isdir(self.download))
+        # Junk directly in DOWNLOAD_DIR is untouched too — the guard bails
+        # out before the walk when the target IS the root.
+        self.assertTrue(os.path.isfile(os.path.join(self.download, "release.nfo")))
+
+    def test_refuses_path_outside_download_dir(self):
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "release.nfo"), "w") as f:
+            f.write("junk")
+        app._cleanup_download_dir(outside)
+        self.assertTrue(os.path.isdir(outside))
+        self.assertTrue(os.path.isfile(os.path.join(outside, "release.nfo")))
+
+
+class StuckAssignCleansEmptiedFolderTest(unittest.TestCase):
+    """stuck_assign(): after a successful "parse" assign, the now-empty
+    source package folder is removed via the shared cleanup helper (card
+    f5f5c053, bug 2) — a "loose" file's parent is DOWNLOAD_DIR and must
+    never be removed."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-assign-cleanup-")
+        self.download = os.path.join(self.tmp, "downloads")
+        self.media = os.path.join(self.tmp, "media")
+        self.movies = os.path.join(self.tmp, "movies")
+        for d in (self.download, self.media, self.movies):
+            os.makedirs(d)
+        self.ani_path = os.path.join(self.tmp, "ani.json")
+
+        self._orig = {k: getattr(app, k) for k in
+                      ("DOWNLOAD_DIR", "MEDIA_DIR", "MOVIE_MEDIA_DIR", "ANI_JSON")}
+        app.DOWNLOAD_DIR = self.download
+        app.MEDIA_DIR = self.media
+        app.MOVIE_MEDIA_DIR = self.movies
+        app.ANI_JSON = self.ani_path
+        with open(self.ani_path, "w", encoding="utf-8") as f:
+            json.dump({"anime": [{"name": "Kaiju No 8", "url": "http://x/kaiju",
+                                   "media_type": "series"}]}, f)
+
+        self._orig_stuck = dict(app._stuck_items)
+        app._stuck_items.clear()
+        self._orig_move_history_file = app.MOVE_HISTORY_FILE
+        app.MOVE_HISTORY_FILE = os.path.join(self.tmp, "move_history.json")
+        self._orig_move_history = list(app._move_history)
+        app._move_history.clear()
+
+    def tearDown(self):
+        for k, v in self._orig.items():
+            setattr(app, k, v)
+        app._stuck_items.clear()
+        app._stuck_items.update(self._orig_stuck)
+        app.MOVE_HISTORY_FILE = self._orig_move_history_file
+        app._move_history.clear()
+        app._move_history.extend(self._orig_move_history)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _age(self, path):
+        past = time.time() - 3600
+        os.utime(path, (past, past))
+
+    def _make_parse_stuck(self, folder, filename):
+        d = os.path.join(self.download, folder)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("x")
+        self._age(path)
+        app.run_move_cycle()
+        stuck = [v for v in app._stuck_items.values() if v["reason"] == "parse"]
+        self.assertEqual(len(stuck), 1)
+        return stuck[0]["key"]
+
+    def _make_loose_stuck(self, filename):
+        path = os.path.join(self.download, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("x")
+        self._age(path)
+        app.run_move_cycle()
+        stuck = [v for v in app._stuck_items.values() if v["reason"] == "loose"]
+        self.assertEqual(len(stuck), 1)
+        return stuck[0]["key"]
+
+    def test_emptied_package_folder_is_removed(self):
+        key = self._make_parse_stuck("Kaiju No 8", "Kaiju.No.8.Movie.1080p.mkv")
+        pkg_dir = os.path.join(self.download, "Kaiju No 8")
+        self.assertTrue(os.path.isdir(pkg_dir))
+        ok, msg = app.stuck_assign(key, "http://x/kaiju", "1", "5")
+        self.assertTrue(ok, msg)
+        self.assertFalse(os.path.exists(pkg_dir))
+
+    def test_folder_with_another_file_is_kept(self):
+        key = self._make_parse_stuck("Kaiju No 8", "Kaiju.No.8.Movie.1080p.mkv")
+        pkg_dir = os.path.join(self.download, "Kaiju No 8")
+        other = os.path.join(pkg_dir, "other-release.mkv")
+        with open(other, "w", encoding="utf-8") as f:
+            f.write("still downloading")
+        ok, msg = app.stuck_assign(key, "http://x/kaiju", "1", "5")
+        self.assertTrue(ok, msg)
+        self.assertTrue(os.path.isdir(pkg_dir))
+        self.assertTrue(os.path.isfile(other))
+
+    def test_loose_file_assign_never_removes_download_dir(self):
+        key = self._make_loose_stuck("Kaiju No 8 E05.mkv")
+        ok, msg = app.stuck_assign(key, "http://x/kaiju", "1", "5")
+        self.assertTrue(ok, msg)
+        self.assertTrue(os.path.isdir(self.download))

@@ -1653,6 +1653,21 @@ def _rename_season_episode(filename, new_season, new_episode):
     )
 
 
+def _stuck_target_filename(filename, season, episode):
+    """Build the destination filename for a manually-assigned stuck item.
+
+    Reuses ``_rename_season_episode`` when the source already carries an
+    SxxExx token (a "loose" file may already be correctly named, just sitting
+    in the wrong place) so the existing zero-padding rules apply; a "parse"
+    item never matches (that's why it's stuck), so a fresh SxxExx tag is
+    appended ahead of the extension instead.
+    """
+    if _SEASON_EP_RE.match(filename):
+        return _rename_season_episode(filename, season, episode)
+    stem, ext = os.path.splitext(filename)
+    return "{} - S{:02d}E{:02d}{}".format(stem, season, episode, ext)
+
+
 def _lookup_anime_entries():
     """Load the anime list once per cycle for move lookups."""
     return load_ani().get("anime", [])
@@ -1678,6 +1693,7 @@ def _entry_to_match(entry, folder_name):
         "year": entry.get("year"),
         "display_title": entry.get("display_title") or entry.get("name", ""),
         "matched": True,
+        "url": entry.get("url", ""),
     }
 
 
@@ -1750,6 +1766,7 @@ def match_anime_entry(parsed_name, dir_basename, anime_list, parsed_season=None)
         "year": None,
         "display_title": parsed_name,
         "matched": False,
+        "url": "",
     }
 
 
@@ -1993,6 +2010,89 @@ def _move_subtitles(dir_path, video_stem, target_dir, new_stem):
             pass
 
 
+_STUCK_ASSIGNABLE_REASONS = ("parse", "loose")
+
+
+def stuck_assign(key, entry_url, season_raw, episode_raw):
+    """Manually assign a season/episode to a "parse" or "loose" stuck item
+    and move it through the normal library layout, one-off.
+
+    Security: the source path is resolved from the server-side stuck store
+    ONLY (``key`` is the sole path-bearing input trusted from the form —
+    never ``rec["path"]`` re-derived from anything the client sent), the
+    target entry is resolved by URL via ``find_entry_by_url`` (never a raw
+    folder name from the form), season/episode are bounded ints, an existing
+    target is refused, and both source and target containment are re-checked
+    with ``os.path.realpath`` right before the move — the same defenses
+    ``run_move_cycle`` applies to an automatic move. Returns ``(ok, msg)``.
+    """
+    with _move_lock:
+        rec = _stuck_items.get(key)
+        rec = dict(rec) if rec else None
+    if rec is None or rec.get("reason") not in _STUCK_ASSIGNABLE_REASONS:
+        return False, "Error: stuck item not found"
+
+    src_path = _safe_download_path(rec["path"])
+    if src_path is None or not os.path.isfile(src_path):
+        return False, "Error: source file no longer exists"
+
+    anime_list = _lookup_anime_entries()
+    _, entry = find_entry_by_url(anime_list, entry_url)
+    if entry is None:
+        return False, "Error: choose a watchlist entry"
+    if entry.get("media_type") == "movie":
+        return False, "Error: movies aren't supported here — edit that entry directly instead"
+
+    try:
+        season = int(season_raw)
+        episode = int(episode_raw)
+    except (TypeError, ValueError):
+        return False, "Error: season and episode must be numbers"
+    if not (1 <= season <= 99) or not (1 <= episode <= 9999):
+        return False, "Error: season and episode are out of range"
+
+    match = _entry_to_match(entry, entry.get("customPackage") or entry.get("name", ""))
+    anime_name = find_existing_media_folder(match["folder_name"]) or match["folder_name"]
+    if not anime_name:
+        return False, "Error: watchlist entry has no usable folder name"
+
+    src_name = os.path.basename(src_path)
+    new_filename = _stuck_target_filename(src_name, season, episode)
+    season_dir = "S{:02d}".format(season)
+    target_dir = os.path.join(MEDIA_DIR, anime_name, season_dir)
+
+    if not _is_within_media_dir(target_dir, MEDIA_DIR):
+        return False, "Error: unsafe folder name, refusing to move outside the media library"
+
+    target_path = os.path.join(target_dir, new_filename)
+    if os.path.exists(target_path):
+        return False, "Error: {} already exists".format(new_filename)
+
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        shutil.move(src_path, target_path)
+    except OSError as e:
+        return False, "Error: failed to move {}: {}".format(src_name, e)
+
+    # Subtitle sidecars are only chased for a "parse" item, whose source dir
+    # is a real single package folder — a "loose" file's dirname is
+    # DOWNLOAD_DIR itself, and _move_subtitles walks recursively, so reusing
+    # it there could sweep in an unrelated package's sidecar.
+    if rec.get("reason") == "parse":
+        video_stem = os.path.splitext(src_name)[0]
+        new_stem = os.path.splitext(new_filename)[0]
+        _move_subtitles(os.path.dirname(src_path), video_stem, target_dir, new_stem)
+
+    dest_short = "{}/{}".format(anime_name, season_dir)
+    msg = "{} → {}/{}".format(src_name, dest_short, new_filename)
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    with _move_lock:
+        _stuck_items.pop(key, None)
+        _move_history.append({"type": "moved", "msg": msg, "time": ts})
+    save_move_state()
+    return True, msg
+
+
 def run_move_cycle():
     """Scan download directory and move completed anime to media library.
 
@@ -2182,6 +2282,18 @@ def run_move_cycle():
                 ep_offset = match["episode_offset"]
                 if ep_offset:
                     episode += ep_offset
+
+                # A season/offset set from the dashboard (no tvdb_id required —
+                # see apply_entry_edit) can carry an offset that undershoots a
+                # low parsed episode (e.g. offset -12 on E05): guard the result
+                # rather than file a bogus E00 or negative episode.
+                if episode < 1:
+                    msg = "{} — offset {:+d} gives episode {} (from parsed {})".format(
+                        filename, ep_offset, episode, orig_episode)
+                    is_new, ignored, _ = _stuck_touch(rel_path, "bad_offset", entry_name, msg)
+                    if is_new and not ignored:
+                        events.append({"type": "error", "msg": msg})
+                    continue
 
                 # Rebuild the SxxExx token in the filename itself whenever the
                 # season or episode was overridden — Plex's scanner reads
@@ -3540,13 +3652,90 @@ _STUCK_REASON_LABELS = {
     "unmatched": "No watchlist match",
     "unsafe_folder": "Unsafe folder name (blocked)",
     "loose": "Not in a package folder",
+    "bad_offset": "Offset gives episode ≤ 0 — check the entry's offset",
 }
 
 
-def render_move_stuck():
+def _stuck_folder_prefill(rec, anime_list):
+    """Best-effort ``(entry_url, season)`` guess to prefill the assign form.
+
+    Only a "parse" item (stuck inside a real package folder) gets a
+    folder-name guess, reusing the same ``match_anime_entry`` logic the
+    mover itself uses for an automatic move. A "loose" item's ``dir`` is
+    just the bare filename, not a folder — there's nothing folder-shaped to
+    match against, so its entry is always picked by hand.
+    """
+    if rec.get("reason") != "parse":
+        return "", ""
+    match = match_anime_entry("", rec.get("dir", ""), anime_list)
+    if not match.get("matched"):
+        return "", ""
+    season = match.get("tvdb_season")
+    return match.get("url", ""), ("" if season is None else str(season))
+
+
+def _render_stuck_assign_form(rec, anime_list, idx):
+    """The "assign season/episode and move" form for a "parse"/"loose" stuck
+    item — the only two reasons the mover can't resolve on its own but a
+    human easily can from the dashboard. Movies are excluded from the entry
+    picker (they have no season/episode of their own); the Edit panel is
+    where a movie's own metadata gets fixed instead."""
+    if rec.get("reason") not in _STUCK_ASSIGNABLE_REASONS:
+        return ""
+
+    series_entries = [e for e in anime_list
+                       if e.get("media_type") != "movie" and e.get("url")]
+    if not series_entries:
+        return '<p class="wl-edit-hint">No series in the watchlist to assign to.</p>'
+
+    prefill_url, prefill_season = _stuck_folder_prefill(rec, anime_list)
+    options = '<option value="">-- choose series --</option>'
+    for e in series_entries:
+        url = e.get("url", "")
+        name = e.get("display_title") or e.get("name", "")
+        options += '<option value="{v}"{sel}>{t}</option>'.format(
+            v=escape(url, quote=True), t=escape(name),
+            sel=" selected" if url == prefill_url else "")
+
+    key_input = '<input type="hidden" name="key" value="{}">'.format(escape(rec.get("key", "")))
+    return """
+          <form method="POST" action="/move-stuck-assign" style="margin-top:10px;">
+            {key_input}
+            <div class="wl-prefs" role="group" aria-label="Assign season and episode">
+              <div class="wl-field">
+                <label for="assign-entry-{idx}">Series</label>
+                <select id="assign-entry-{idx}" name="entry" class="wl-select" required>{options}</select>
+              </div>
+              <div class="wl-field" style="flex-basis:90px;">
+                <label for="assign-season-{idx}">Season</label>
+                <input type="number" id="assign-season-{idx}" name="season" min="1" max="99"
+                       value="{season}" inputmode="numeric" required class="wl-num">
+              </div>
+              <div class="wl-field" style="flex-basis:90px;">
+                <label for="assign-episode-{idx}">Episode</label>
+                <input type="number" id="assign-episode-{idx}" name="episode" min="1" max="9999"
+                       inputmode="numeric" required class="wl-num">
+              </div>
+              <button type="submit" class="btn btn-sm">Assign &amp; move</button>
+            </div>
+            <p class="wl-edit-hint">Movies aren't listed here — edit that entry directly instead.</p>
+          </form>""".format(key_input=key_input, idx=idx, options=options,
+                            season=escape(prefill_season))
+
+
+def render_move_stuck(anime_list=None):
     """Render the stuck-downloads list: parse failures, already-exists
     conflicts, and unmatched downloads the mover won't touch again on its
     own until a user picks an action."""
+    if anime_list is None:
+        # A corrupt ani.json must degrade this list, not the whole /api/status
+        # endpoint (render_page always passes an already-loaded anime_list —
+        # this fallback only matters for that other caller).
+        try:
+            anime_list = _lookup_anime_entries()
+        except anistore.CorruptStoreError:
+            anime_list = []
+
     with _move_lock:
         items = [dict(v) for v in _stuck_items.values() if not v.get("ignored")]
 
@@ -3556,7 +3745,7 @@ def render_move_stuck():
     items.sort(key=lambda r: r.get("first_seen", ""))
 
     html = ""
-    for rec in items:
+    for idx, rec in enumerate(items):
         key = rec.get("key", "")
         reason = rec.get("reason", "")
         label = _STUCK_REASON_LABELS.get(reason, "Stuck")
@@ -3584,16 +3773,27 @@ def render_move_stuck():
                 <button type="submit" class="btn btn-warning btn-sm">Move anyway</button>
               </form>""".format(key_input=key_input)
 
+        # The folder a "parse" item is stuck inside — not otherwise shown,
+        # and needed context for picking the right series below.
+        folder_line = ""
+        if reason == "parse" and rec.get("dir"):
+            folder_line = '<div class="anime-meta">Folder: {}</div>'.format(escape(rec["dir"]))
+
+        assign_form = _render_stuck_assign_form(rec, anime_list, idx)
+
         html += """
         <div class="card card-accent">
           <div style="display:flex;justify-content:space-between;align-items:start;gap:12px;">
             <div>
               <div class="anime-name">{label}</div>
               <div class="anime-meta">{msg}</div>
+              {folder_line}
             </div>
             <div>{actions}</div>
           </div>
-        </div>""".format(label=escape(label), msg=escape(msg), actions=actions)
+          {assign_form}
+        </div>""".format(label=escape(label), msg=escape(msg), actions=actions,
+                          folder_line=folder_line, assign_form=assign_form)
 
     return html
 
@@ -5227,7 +5427,7 @@ def render_page(status="", search_html="", prefs_open=False, ani_data=None, sear
 
     move_status_html, move_last_html = render_move_status()
     move_history_html = render_move_history()
-    move_stuck_html = render_move_stuck()
+    move_stuck_html = render_move_stuck(anime_list)
 
     health_html = render_health_card()
 
@@ -5865,6 +6065,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect_msg("Will move on next cycle: {}".format(msg), anchor=ANCHOR_MOVER)
             else:
                 self._redirect_msg("Error: stuck item not found", level="err", anchor=ANCHOR_MOVER)
+
+        elif parsed.path == "/move-stuck-assign":
+            key = params.get("key", "")
+            ok, msg = stuck_assign(key, params.get("entry", ""),
+                                    params.get("season", ""), params.get("episode", ""))
+            if ok:
+                _log.info("[mover] Manually assigned stuck item: %s", msg)
+                self._redirect_msg("Moved: {}".format(msg), anchor=ANCHOR_MOVER)
+            else:
+                _log.warning("[mover] Manual assign rejected: %s", msg)
+                self._redirect_msg(msg, level="err", anchor=ANCHOR_MOVER)
 
         elif parsed.path == "/save-prefs":
             try:

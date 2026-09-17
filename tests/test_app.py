@@ -2832,6 +2832,32 @@ class RunMoveCycleTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(
             os.path.join(self.media, "Bleach", "S01", "Bleach.S01E17.mkv")))
 
+    def test_negative_offset_taking_episode_to_zero_or_below_goes_stuck(self):
+        # A season/offset set from the dashboard's Edit panel (card
+        # 363098a6) needs no tvdb_id, so a steep negative offset on a low
+        # parsed episode is directly reachable — must not file a bogus E00
+        # or negative episode.
+        self._write_ani([{"name": "Frieren", "media_type": "series", "episode_offset": -12}])
+        self._make_dl("Frieren.S01", ["Frieren.S01E05.mkv"])
+        events = app.run_move_cycle()
+        self.assertIn("error", self._types(events))
+        err = [e for e in events if e["type"] == "error"][0]
+        self.assertIn("gives episode -7", err["msg"])
+        stuck = [v for v in app._stuck_items.values() if v["reason"] == "bad_offset"]
+        self.assertEqual(len(stuck), 1)
+        # Left in place for a human to fix the entry's offset — not moved.
+        self.assertFalse(os.path.isdir(os.path.join(self.media, "Frieren")))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.download, "Frieren.S01", "Frieren.S01E05.mkv")))
+
+    def test_offset_taking_episode_to_exactly_zero_goes_stuck(self):
+        self._write_ani([{"name": "Frieren", "media_type": "series", "episode_offset": -5}])
+        self._make_dl("Frieren.S01", ["Frieren.S01E05.mkv"])
+        events = app.run_move_cycle()
+        stuck = [v for v in app._stuck_items.values() if v["reason"] == "bad_offset"]
+        self.assertEqual(len(stuck), 1)
+        self.assertIn("gives episode 0", stuck[0]["msg"])
+
     def test_episode_offset_preserves_three_digit_episode_width(self):
         self._write_ani([{"name": "LongShow", "media_type": "series", "episode_offset": 5}])
         self._make_dl("LongShow.S01", ["LongShow.S01E001.mkv"])
@@ -6701,3 +6727,342 @@ class JumpBarAndCompactPanelsTest(unittest.TestCase):
         c.feed(self.page())
         self.assertEqual(len(c.ids), len(set(c.ids)))
         self.assertNotIn("%%", self.page())
+
+
+class StuckAssignTest(unittest.TestCase):
+    """stuck_assign(): manually assigning a season/episode to a "parse" or
+    "loose" stuck item and moving it through the normal move/rename path
+    (_rename_season_episode / _safe_folder_segment / _is_within_media_dir),
+    same as an automatic move. Real filesystem fixtures in a sandbox."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-assign-")
+        self.download = os.path.join(self.tmp, "downloads")
+        self.media = os.path.join(self.tmp, "media")
+        self.movies = os.path.join(self.tmp, "movies")
+        for d in (self.download, self.media, self.movies):
+            os.makedirs(d)
+        self.ani_path = os.path.join(self.tmp, "ani.json")
+
+        self._orig = {k: getattr(app, k) for k in
+                      ("DOWNLOAD_DIR", "MEDIA_DIR", "MOVIE_MEDIA_DIR", "ANI_JSON")}
+        app.DOWNLOAD_DIR = self.download
+        app.MEDIA_DIR = self.media
+        app.MOVIE_MEDIA_DIR = self.movies
+        app.ANI_JSON = self.ani_path
+        self._write_ani([])
+
+        self._orig_stuck = dict(app._stuck_items)
+        app._stuck_items.clear()
+        self._orig_move_history_file = app.MOVE_HISTORY_FILE
+        app.MOVE_HISTORY_FILE = os.path.join(self.tmp, "move_history.json")
+        self._orig_move_history = list(app._move_history)
+        app._move_history.clear()
+
+    def tearDown(self):
+        for k, v in self._orig.items():
+            setattr(app, k, v)
+        app._stuck_items.clear()
+        app._stuck_items.update(self._orig_stuck)
+        app.MOVE_HISTORY_FILE = self._orig_move_history_file
+        app._move_history.clear()
+        app._move_history.extend(self._orig_move_history)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_ani(self, anime):
+        with open(self.ani_path, "w", encoding="utf-8") as f:
+            json.dump({"anime": anime}, f)
+
+    def _age(self, path):
+        past = time.time() - 3600
+        os.utime(path, (past, past))
+
+    def _make_parse_stuck(self, folder, filename):
+        """A package-folder download with an unparseable video, run through
+        one move cycle so it's recorded as a real "parse" stuck item — never
+        hand-crafted — and return its key."""
+        d = os.path.join(self.download, folder)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("x")
+        self._age(path)
+        app.run_move_cycle()
+        stuck = [v for v in app._stuck_items.values() if v["reason"] == "parse"]
+        self.assertEqual(len(stuck), 1)
+        return stuck[0]["key"]
+
+    def _make_loose_stuck(self, filename):
+        """A video sitting loose in the download root, run through one move
+        cycle so it's recorded as a real "loose" stuck item; return its key."""
+        path = os.path.join(self.download, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("x")
+        self._age(path)
+        app.run_move_cycle()
+        stuck = [v for v in app._stuck_items.values() if v["reason"] == "loose"]
+        self.assertEqual(len(stuck), 1)
+        return stuck[0]["key"]
+
+    def test_assign_parse_item_moves_and_appends_season_episode_tag(self):
+        self._write_ani([{"name": "Kaiju No 8", "url": "http://x/kaiju", "media_type": "series"}])
+        key = self._make_parse_stuck("Kaiju No 8", "Kaiju.No.8.Movie.1080p.mkv")
+        ok, msg = app.stuck_assign(key, "http://x/kaiju", "1", "5")
+        self.assertTrue(ok, msg)
+        dest = os.path.join(self.media, "Kaiju No 8", "S01",
+                             "Kaiju.No.8.Movie.1080p - S01E05.mkv")
+        self.assertTrue(os.path.isfile(dest))
+        self.assertNotIn(key, app._stuck_items)
+
+    def test_assign_loose_item_happy_path(self):
+        # DoD example: a stuck "Kaiju No 8 E05.mkv" -> assign S01E05.
+        self._write_ani([{"name": "Kaiju No 8", "url": "http://x/kaiju", "media_type": "series"}])
+        key = self._make_loose_stuck("Kaiju No 8 E05.mkv")
+        ok, msg = app.stuck_assign(key, "http://x/kaiju", "1", "5")
+        self.assertTrue(ok, msg)
+        dest = os.path.join(self.media, "Kaiju No 8", "S01", "Kaiju No 8 E05 - S01E05.mkv")
+        self.assertTrue(os.path.isfile(dest))
+        self.assertFalse(os.path.isfile(os.path.join(self.download, "Kaiju No 8 E05.mkv")))
+        self.assertNotIn(key, app._stuck_items)
+
+    def test_assign_preserves_existing_token_via_rename_not_append(self):
+        # A "loose" file may already carry a correct SxxExx token (it's
+        # stuck only for not being in a package folder) — the existing token
+        # is rewritten via _rename_season_episode, not appended a second time.
+        self._write_ani([{"name": "Kaiju No 8", "url": "http://x/kaiju", "media_type": "series"}])
+        key = self._make_loose_stuck("Kaiju.No.8.S01E05.mkv")
+        ok, msg = app.stuck_assign(key, "http://x/kaiju", "2", "9")
+        self.assertTrue(ok, msg)
+        dest = os.path.join(self.media, "Kaiju No 8", "S02", "Kaiju.No.8.S02E09.mkv")
+        self.assertTrue(os.path.isfile(dest))
+
+    def test_assign_records_move_history(self):
+        self._write_ani([{"name": "Kaiju No 8", "url": "http://x/kaiju", "media_type": "series"}])
+        key = self._make_loose_stuck("Kaiju No 8 E05.mkv")
+        ok, msg = app.stuck_assign(key, "http://x/kaiju", "1", "5")
+        self.assertTrue(ok, msg)
+        self.assertTrue(app._move_history)
+        last = app._move_history[-1]
+        self.assertEqual(last["type"], "moved")
+        self.assertIn("Kaiju No 8 E05.mkv", last["msg"])
+
+    # --- Traversal / validation: the form carries only the stuck record's
+    # key — the source path must come from the server-side store, never the
+    # form, and every other field is bounded/validated server-side too. ---
+
+    def test_assign_key_not_in_stuck_list_rejected(self):
+        ok, msg = app.stuck_assign("does-not-exist", "http://x/kaiju", "1", "5")
+        self.assertFalse(ok)
+        self.assertEqual(msg, "Error: stuck item not found")
+
+    def test_assign_wrong_reason_not_actionable_here(self):
+        # An "exists"/"unmatched"/"unsafe_folder" stuck item has its own
+        # dedicated action — this route only ever acts on "parse"/"loose".
+        app._stuck_items["k-exists"] = {
+            "key": "k-exists", "reason": "exists", "ignored": False,
+            "msg": "x", "path": "d/x.mkv", "dir": "d",
+            "first_seen": "t", "last_seen": "t",
+        }
+        ok, msg = app.stuck_assign("k-exists", "http://x/kaiju", "1", "5")
+        self.assertFalse(ok)
+        self.assertEqual(msg, "Error: stuck item not found")
+
+    def test_assign_unknown_entry_url_rejected(self):
+        self._write_ani([{"name": "Kaiju No 8", "url": "http://x/kaiju", "media_type": "series"}])
+        key = self._make_loose_stuck("Kaiju No 8 E05.mkv")
+        ok, msg = app.stuck_assign(key, "../../etc/passwd", "1", "5")
+        self.assertFalse(ok)
+        self.assertIn("choose a watchlist entry", msg)
+        self.assertIn(key, app._stuck_items)
+        self.assertTrue(os.path.isfile(os.path.join(self.download, "Kaiju No 8 E05.mkv")))
+
+    def test_assign_dotdot_season_rejected_not_numeric(self):
+        self._write_ani([{"name": "Kaiju No 8", "url": "http://x/kaiju", "media_type": "series"}])
+        key = self._make_loose_stuck("Kaiju No 8 E05.mkv")
+        ok, msg = app.stuck_assign(key, "http://x/kaiju", "..", "5")
+        self.assertFalse(ok)
+        self.assertIn("numbers", msg)
+        self.assertIn(key, app._stuck_items)
+
+    def test_assign_out_of_range_season_rejected(self):
+        self._write_ani([{"name": "Kaiju No 8", "url": "http://x/kaiju", "media_type": "series"}])
+        key = self._make_loose_stuck("Kaiju No 8 E05.mkv")
+        ok, msg = app.stuck_assign(key, "http://x/kaiju", "0", "5")
+        self.assertFalse(ok)
+        self.assertIn("out of range", msg)
+
+    def test_assign_movie_entry_rejected(self):
+        self._write_ani([{"name": "Akira", "url": "http://x/akira", "media_type": "movie", "year": 1988}])
+        key = self._make_loose_stuck("Akira E05.mkv")
+        ok, msg = app.stuck_assign(key, "http://x/akira", "1", "5")
+        self.assertFalse(ok)
+        self.assertIn("movies aren't supported", msg.lower())
+        self.assertIn(key, app._stuck_items)
+
+    def test_assign_existing_target_refused_not_overwritten(self):
+        self._write_ani([{"name": "Kaiju No 8", "url": "http://x/kaiju", "media_type": "series"}])
+        key = self._make_loose_stuck("Kaiju No 8 E05.mkv")
+        dest_dir = os.path.join(self.media, "Kaiju No 8", "S01")
+        os.makedirs(dest_dir)
+        dest_path = os.path.join(dest_dir, "Kaiju No 8 E05 - S01E05.mkv")
+        with open(dest_path, "w") as f:
+            f.write("existing")
+        ok, msg = app.stuck_assign(key, "http://x/kaiju", "1", "5")
+        self.assertFalse(ok)
+        self.assertIn("already exists", msg)
+        with open(dest_path) as f:
+            self.assertEqual(f.read(), "existing")
+        # Not consumed — still there to retry with a different season/episode.
+        self.assertIn(key, app._stuck_items)
+        self.assertTrue(os.path.isfile(os.path.join(self.download, "Kaiju No 8 E05.mkv")))
+
+    def test_assign_source_missing_rejected(self):
+        self._write_ani([{"name": "Kaiju No 8", "url": "http://x/kaiju", "media_type": "series"}])
+        key = self._make_loose_stuck("Kaiju No 8 E05.mkv")
+        os.remove(os.path.join(self.download, "Kaiju No 8 E05.mkv"))
+        ok, msg = app.stuck_assign(key, "http://x/kaiju", "1", "5")
+        self.assertFalse(ok)
+        self.assertIn("no longer exists", msg)
+
+
+class RenderMoveStuckAssignFormTest(unittest.TestCase):
+    """render_move_stuck(anime_list): the assign form for "parse"/"loose"
+    items, its folder-name-match prefill, and movie exclusion."""
+
+    def setUp(self):
+        self._orig_stuck = dict(app._stuck_items)
+        app._stuck_items.clear()
+
+    def tearDown(self):
+        app._stuck_items.clear()
+        app._stuck_items.update(self._orig_stuck)
+
+    def test_parse_item_renders_assign_form_prefilled_from_folder_match(self):
+        app._stuck_items["k1"] = {
+            "key": "k1", "reason": "parse", "ignored": False, "msg": "boom",
+            "path": "Kaiju No 8/x.mkv", "dir": "Kaiju No 8",
+            "first_seen": "t", "last_seen": "t",
+        }
+        anime_list = [{"name": "Kaiju No 8", "url": "http://x/kaiju",
+                        "media_type": "series", "tvdb_season": 2}]
+        out = app.render_move_stuck(anime_list)
+        self.assertIn("/move-stuck-assign", out)
+        self.assertIn("Folder: Kaiju No 8", out)
+        self.assertIn('value="http://x/kaiju" selected', out)
+        self.assertIn('value="2"', out)
+
+    def test_loose_item_renders_assign_form_without_prefill(self):
+        # Per the card: a loose file's entry is always picked by hand.
+        app._stuck_items["k2"] = {
+            "key": "k2", "reason": "loose", "ignored": False, "msg": "boom",
+            "path": "x.mkv", "dir": "x.mkv",
+            "first_seen": "t", "last_seen": "t",
+        }
+        anime_list = [{"name": "Kaiju No 8", "url": "http://x/kaiju", "media_type": "series"}]
+        out = app.render_move_stuck(anime_list)
+        self.assertIn("/move-stuck-assign", out)
+        self.assertNotIn("selected", out)
+
+    def test_movies_excluded_from_assign_entry_options(self):
+        app._stuck_items["k3"] = {
+            "key": "k3", "reason": "loose", "ignored": False, "msg": "boom",
+            "path": "x.mkv", "dir": "x.mkv",
+            "first_seen": "t", "last_seen": "t",
+        }
+        anime_list = [{"name": "Akira", "url": "http://x/akira", "media_type": "movie"}]
+        out = app.render_move_stuck(anime_list)
+        self.assertIn("No series in the watchlist to assign to", out)
+        self.assertNotIn("http://x/akira", out)
+
+    def test_other_reasons_have_no_assign_form(self):
+        app._stuck_items["k4"] = {
+            "key": "k4", "reason": "exists", "ignored": False, "msg": "boom",
+            "path": "d/x.mkv", "dir": "d",
+            "first_seen": "t", "last_seen": "t",
+        }
+        out = app.render_move_stuck([])
+        self.assertNotIn("/move-stuck-assign", out)
+
+    def test_corrupt_ani_json_degrades_to_empty_entry_list(self):
+        # render_move_stuck()'s own default-load path (the /api/status
+        # caller) must never 500 on a corrupt ani.json.
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        app._stuck_items["k5"] = {
+            "key": "k5", "reason": "loose", "ignored": False, "msg": "boom",
+            "path": "x.mkv", "dir": "x.mkv",
+            "first_seen": "t", "last_seen": "t",
+        }
+        orig = app.ANI_JSON
+        app.ANI_JSON = path
+        try:
+            out = app.render_move_stuck()
+            self.assertIn("No series in the watchlist to assign to", out)
+        finally:
+            app.ANI_JSON = orig
+            os.remove(path)
+
+
+class HandlerPostMoveStuckAssignTest(unittest.TestCase):
+    """do_POST /move-stuck-assign: routing + the full assign-and-move flow
+    through the real dispatcher (auth/CSRF gate already covered generically
+    by do_POST; see HandlerPostRoutingTest for the sibling stuck-* routes)."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="aniloads-post-assign-")
+        self._orig = {k: getattr(app, k) for k in
+                      ("DOWNLOAD_DIR", "MEDIA_DIR", "ANI_JSON", "MOVE_HISTORY_FILE")}
+        app.DOWNLOAD_DIR = os.path.join(self._tmp, "downloads")
+        app.MEDIA_DIR = os.path.join(self._tmp, "media")
+        os.makedirs(app.DOWNLOAD_DIR)
+        os.makedirs(app.MEDIA_DIR)
+        app.ANI_JSON = os.path.join(self._tmp, "ani.json")
+        app.MOVE_HISTORY_FILE = os.path.join(self._tmp, "move_history.json")
+        with open(app.ANI_JSON, "w", encoding="utf-8") as f:
+            json.dump({"anime": [{"name": "Kaiju No 8", "url": "http://x/kaiju",
+                                   "media_type": "series"}]}, f)
+
+        self._orig_stuck = dict(app._stuck_items)
+        app._stuck_items.clear()
+
+    def tearDown(self):
+        for k, v in self._orig.items():
+            setattr(app, k, v)
+        app._stuck_items.clear()
+        app._stuck_items.update(self._orig_stuck)
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _post(self, path, params):
+        captured = {}
+        h = app.Handler.__new__(app.Handler)
+        h.path = path
+        h._read_post = lambda: params
+        h._redirect_msg = lambda msg, level=None, **kw: captured.update(msg=msg, level=level, **kw)
+        h._redirect = _capture_redirect(captured)
+        h._respond = lambda code, html_body: captured.__setitem__("html", html_body)
+        h.do_POST()
+        return captured
+
+    def test_move_stuck_assign_happy_path_via_post(self):
+        src = os.path.join(app.DOWNLOAD_DIR, "Kaiju No 8 E05.mkv")
+        with open(src, "w") as f:
+            f.write("x")
+        app._stuck_items["k5"] = {
+            "key": "k5", "reason": "loose", "ignored": False, "msg": "boom",
+            "path": "Kaiju No 8 E05.mkv", "dir": "Kaiju No 8 E05.mkv",
+            "first_seen": "t", "last_seen": "t",
+        }
+        result = self._post("/move-stuck-assign",
+                             {"key": "k5", "entry": "http://x/kaiju", "season": "1", "episode": "5"})
+        self.assertTrue(result["msg"].startswith("Moved:"))
+        self.assertNotIn("k5", app._stuck_items)
+        dest = os.path.join(app.MEDIA_DIR, "Kaiju No 8", "S01", "Kaiju No 8 E05 - S01E05.mkv")
+        self.assertTrue(os.path.isfile(dest))
+
+    def test_move_stuck_assign_missing_key_errors(self):
+        result = self._post("/move-stuck-assign",
+                             {"key": "nope", "entry": "http://x/kaiju", "season": "1", "episode": "1"})
+        self.assertEqual(result["msg"], "Error: stuck item not found")
+        self.assertEqual(result.get("level"), "err")

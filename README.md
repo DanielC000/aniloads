@@ -47,7 +47,7 @@ cp .env.example .env
 # (compose fails fast if any are unset). The TVDB API key is optional.
 ```
 
-`.env.example` documents every variable. The required block (`ANIME_*` host paths, `ANIME_NETWORK`, `PUID`/`PGID`, `DOCKER_GID`) has no defaults, so an unset value stops the deploy loudly rather than guessing.
+`.env.example` documents every variable `docker-compose.yml` passes into the containers (a few internal knobs it doesn't pass are listed under [Other environment variables](#other-environment-variables)). The required block (`ANIME_*` host paths, `ANIME_NETWORK`, `PUID`/`PGID`, `DOCKER_GID`) has no defaults, so an unset value stops the deploy loudly rather than guessing.
 
 The TVDB API key is free — get one at https://thetvdb.com/dashboard/account/apikey. If omitted, the stack works without TVDB features.
 
@@ -65,10 +65,11 @@ Then build and start the stack from the repo root:
 docker compose up -d --build
 ```
 
-This builds the bot image from `bot/` and starts all three services. Re-run the same command after pulling changes to rebuild and restart.
+This builds the `anime-loads:local` image from `bot/` and starts all three services. Both `anime-loads` and `anime-web` run that image.
 
-> Homelab/submodule deployments may wrap this in their own tooling; the command
-> above is the self-contained path from a fresh clone.
+**After every pull or repo update, rebuild the image before restarting.** Use the same `docker compose up -d --build`, or `docker compose build` followed by the restart. A plain `docker compose restart` or `up -d` without `--build` isn't enough. `anime-web` live-mounts only `web/app.py` from the checkout, but `app.py` imports `tvdb`, `anistore`, `notify` and `config_defaults` from the image's copy of `bot/`. If you skip the rebuild, a new `app.py` runs against stale modules and the dashboard can crash on import.
+
+> Homelab/submodule deployments may wrap this in their own tooling; the command above is the self-contained path from a fresh clone.
 
 ### 3. JDownloader Initial Setup
 
@@ -90,10 +91,10 @@ Settings in `ani.json > settings`:
 |-------|-------|-------------|
 | `browserengine` | `0` | Firefox (bundled in image) |
 | `hoster` | `1` | 0 = DDownload, 1 = Rapidgator |
-| `jdhost` | `jdownloader` | Docker network hostname |
+| `jdhost` | `""` | JDownloader host. Seeded empty on purpose; set it to `jdownloader` to use the bundled compose JDownloader service (its container name on the Docker network), or leave it empty and set `myjd_user` for MyJDownloader |
 | `timedelay` | `600` | Poll interval in seconds |
-| `al_user` | *(optional)* | anime-loads.org login — recommended for reliable downloads |
-| `al_pass` | *(optional)* | anime-loads.org password |
+| `al_user` | *(not seeded)* | Legacy fallback for the anime-loads.org login; the `AL_USER` env var takes precedence. See [Known Quirks](#known-quirks) for what the login does |
+| `al_pass` | *(not seeded)* | Legacy fallback for the password; `AL_PASS` takes precedence |
 
 ### 5. Dashboard
 
@@ -112,7 +113,7 @@ Open http://SERVER_IP:8085. Features:
 
 ### Run Now / Check Now
 
-"Run Now" and "Check Now" write a trigger file (`run_now` in the shared config dir) instead of restarting the bot container: the bot's inter-cycle sleep wakes early (within a few seconds) when the file appears, and consumes it at the start of the cycle it triggers — a request made while a cycle is already running is honored right after that cycle finishes, never by interrupting it (no killed JDownloader hand-off, no forced browser re-init/re-login). "Check Now" additionally sets `force_check` on that one watchlist entry so its next triggered cycle bypasses the skip logic (see "Smart Skip-Checking" above).
+"Run Now" and "Check Now" write a trigger file (`run_now` in the shared config dir) instead of restarting the bot container: the bot's inter-cycle sleep wakes early (within a few seconds) when the file appears, and consumes it at the start of the cycle it triggers — a request made while a cycle is already running is honored right after that cycle finishes, never by interrupting it (no killed JDownloader hand-off, no forced browser re-init/re-login). "Check Now" additionally sets `force_check` on that one watchlist entry so its next triggered cycle bypasses the skip logic (see "Smart Skip-Checking" below).
 
 Both actions share one cooldown — `RUN_NOW_COOLDOWN_SECONDS` (default 120) — to protect anime-loads.org from being hit repeatedly; the dashboard shows how long until the next request is allowed. Restarting the bot container is still available directly via Docker (`docker restart anime-loads`) if ever needed, but is no longer wired into the dashboard UI.
 
@@ -189,7 +190,7 @@ The bot avoids unnecessary Selenium scrapes by checking completion status before
 
 Completion is automatic. To re-enable checking (e.g. surprise continuation), use the "Mark Incomplete" button on the dashboard.
 
-Each card's **Check Now** button bypasses steps 1-4 above for that entry's next triggered cycle only (set via `force_check`, cleared by the bot after one scrape) — use it to force an immediate scrape of an entry that would otherwise be skipped (e.g. to test a fix, or check a release the site published early). See "Run Now / Check Now" below.
+Each card's **Check Now** button bypasses steps 1-4 above for that entry's next triggered cycle only (set via `force_check`, cleared by the bot after one scrape) — use it to force an immediate scrape of an entry that would otherwise be skipped (e.g. to test a fix, or check a release the site published early). See "Run Now / Check Now" above.
 
 ## File Paths
 
@@ -204,6 +205,22 @@ Paths inside the containers are fixed; the host directories behind them are supp
 | `/data/media/anime movies/` | Anime movies library — move target for movies (`MOVIE_MEDIA_DIR`) |
 
 Host directories map to these via `.env`: `ANIME_CONFIG_DIR` → `/config`, `ANIME_DATA_DIR` → `/data`, `ANIME_DOWNLOAD_DIR` → JDownloader's `/output`, and `ANIME_SETUP_DIR` → the checked-out repo (the web container live-mounts `web/app.py` from it). See `.env.example` for the expected format and neutral example paths (e.g. `/srv/...`).
+
+**Invariant:** `ANIME_DOWNLOAD_DIR` must be exactly `${ANIME_DATA_DIR}/downloads/anime`. JDownloader writes into `ANIME_DOWNLOAD_DIR`, but the mover reads `/data/downloads/anime` (`DOWNLOAD_DIR` is hard-coded in `docker-compose.yml`), which is `ANIME_DATA_DIR/downloads/anime` on the host. Point them anywhere else and the mover watches an empty directory while finished downloads pile up unmoved.
+
+### Other environment variables
+
+These are read by the code but not passed through by `docker-compose.yml`, so setting them in `.env` has no effect; add them to the service's `environment:` block (e.g. in a compose override) if you need to change one. `DOWNLOAD_DIR`, `MEDIA_DIR`, `MOVIE_MEDIA_DIR` (table above), `CONFIG_DIR=/config` and `PORT=8080` are also read by the web service, but compose pins them to those values.
+
+| Variable | Default | Read by | Purpose |
+|----------|---------|---------|---------|
+| `LOG_DIR` | `/config/logs` | bot, web | Directory for `anibot.log` / `anime-web.log` |
+| `RUN_NOW_SLEEP_SLICE` | `5` | bot | Seconds between checks for the `run_now` trigger file during the inter-cycle sleep |
+| `BOT_CONTAINER` | `anime-loads` | web | Docker container name the dashboard reads status and logs from |
+| `JD_HEALTH_TIMEOUT` | `2` | web | Connect timeout (seconds) for the health panel's JDownloader port-9666 probe |
+| `JD_HEALTH_CACHE_SECONDS` | `60` | web | How long the JDownloader health result is cached |
+| `DISK_HEALTH_CACHE_SECONDS` | `60` | web | How long the disk-space health result is cached |
+| `TVDB_HEALTH_CACHE_SECONDS` | `600` | web | How long the TVDB health result is cached |
 
 ## File Mover Behaviour
 
@@ -277,7 +294,7 @@ The local fork (`bot/`) fixes this by:
 
 ## Known Quirks
 
-- **Login recommended**: The site's adblock detection is aggressive for anonymous users. Adding `al_user`/`al_pass` to settings improves reliability.
+- **Login needed for multi-episode fetches**: Set `AL_USER`/`AL_PASS` in `.env` (the `al_user`/`al_pass` fields in `ani.json` are a fallback). The bot logs in once at startup; if no credentials are set, or the login fails, it runs anonymously. Anonymous single-episode downloads still work, but when an entry needs two or more episodes in one cycle the bot uses batch Click'n'Load, which requires a login — that entry is skipped with a "Login required for batch download" error, and there is no per-episode fallback. The dashboard's health panel shows whether the login worked.
 - **CNL timeout**: The bot logs "request timed out (links likely added)" — this is expected. JDownloader's addcrypted2 endpoint processes the links but doesn't always send a response.
 - **Search speed**: Dashboard search uses headless Firefox to bypass DDoS-Guard. First search takes ~60s (Firefox startup).
 - **Pending entries**: When adding via URL, entries go to a `pending` queue. A background resolver fetches release info and auto-selects the best release.

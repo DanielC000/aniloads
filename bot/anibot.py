@@ -1256,7 +1256,7 @@ def addAnime():
     while(jdhost == False):
         print("Noch keine oder Fehlerhafte konfiguration, leite weiter zu Einstellungen")
         editconfig()
-        jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, al_user, al_pass = loadconfig()
+        jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport, al_user, al_pass = loadconfig()
 
     al = animeloads(browser=browser, browserloc=browserlocation)
     exit = False
@@ -2337,12 +2337,12 @@ def startbot():
             sleep_until_next_cycle(timedelay, _run_now_path())
 
 def removeAnime():
-    jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, al_user, al_pass = loadconfig()
- 
+    jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport, al_user, al_pass = loadconfig()
+
     while(jdhost == False):
         print("Noch keine oder Fehlerhafte konfiguration, leite weiter zu Einstellungen")
         editconfig()
-        jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, al_user, al_pass = loadconfig()
+        jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport, al_user, al_pass = loadconfig()
 
     os.makedirs(os.path.dirname(botfolder), exist_ok=True)
     f = open(botfile, "r", encoding="utf-8")

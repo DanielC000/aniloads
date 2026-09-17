@@ -2115,3 +2115,50 @@ class HealthcheckMainTest(unittest.TestCase):
             json.dump({"last_run": {"finished_ts": finished, "timedelay": 600}}, f)
         result = self._run()
         self.assertEqual(result.returncode, 1)
+
+
+class InteractiveConfigUnpackTest(unittest.TestCase):
+    """loadconfig() returns a 13-tuple. addAnime()/removeAnime() unpack it on
+    first load, and again after editconfig() if the first load is invalid
+    (jdhost == False) -- a wrong-arity unpack at either call site raises
+    ValueError before the CLI ever gets to prompt the user. Drives both call
+    sites with a stubbed loadconfig/editconfig/input and no real browser."""
+
+    _INVALID = (False,) * 13
+    _VALID = ("jdhost", "hoster", "browser", "browserloc", "pushkey", 600,
+              "myjd_user", "myjd_pass", "myjd_device", False, None,
+              "al_user", "al_pass")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-interactive-")
+        self._orig_botfile = anibot.botfile
+        self._orig_botfolder = anibot.botfolder
+        anibot.botfile = os.path.join(self.tmp, "ani.json")
+        anibot.botfolder = self.tmp
+        with open(anibot.botfile, "w", encoding="utf-8") as f:
+            json.dump({"anime": []}, f)
+
+    def tearDown(self):
+        anibot.botfile = self._orig_botfile
+        anibot.botfolder = self._orig_botfolder
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_add_anime_reload_after_editconfig_does_not_raise(self):
+        with mock.patch.object(anibot, "loadconfig", side_effect=[self._INVALID, self._VALID]), \
+             mock.patch.object(anibot, "editconfig", return_value=None), \
+             mock.patch.object(anibot, "animeloads", return_value=mock.MagicMock()), \
+             mock.patch("builtins.input", return_value="exit"):
+            anibot.addAnime()
+
+    def test_remove_anime_reload_after_editconfig_does_not_raise(self):
+        with mock.patch.object(anibot, "loadconfig", side_effect=[self._INVALID, self._VALID]), \
+             mock.patch.object(anibot, "editconfig", return_value=None), \
+             mock.patch("builtins.input", return_value="exit"):
+            anibot.removeAnime()
+
+    def test_remove_anime_first_load_does_not_raise(self):
+        # Covers removeAnime's first loadconfig() call directly -- it used to
+        # be wrong-arity even without ever reaching the retry branch.
+        with mock.patch.object(anibot, "loadconfig", return_value=self._VALID), \
+             mock.patch("builtins.input", return_value="exit"):
+            anibot.removeAnime()

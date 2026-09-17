@@ -1147,9 +1147,19 @@ def _lookup_anime_entries():
 
 
 def _entry_to_match(entry, folder_name):
-    """Build a match dict from an ani.json entry."""
+    """Build a match dict from an ani.json entry.
+
+    Runs folder_name through _safe_folder_segment so a legacy/hand-edited
+    customPackage saved before save-time sanitization existed (e.g. a stored
+    "a/b" or "../../etc") maps to the same flat, contained folder a fresh
+    save would now produce, instead of creating nested or escaping
+    directories in the mover. A customPackage that's already a safe single
+    segment — including one with ``:``/``?``/etc, common in anime-loads
+    release names — passes through unchanged, so it keeps matching its
+    existing library folder.
+    """
     return {
-        "folder_name": folder_name,
+        "folder_name": _safe_folder_segment(folder_name),
         "tvdb_season": entry.get("tvdb_season"),
         "episode_offset": entry.get("episode_offset", 0) or 0,
         "media_type": entry.get("media_type", "series"),
@@ -1236,6 +1246,31 @@ def _sanitize_folder(name):
     return re.sub(r'[<>:"/\\|?*]', '', name).strip()
 
 
+def _safe_folder_segment(name):
+    """Make ``name`` safe to use as a single path segment under the media dir.
+
+    Unlike ``_sanitize_folder`` (Plex movie naming — deletes every
+    Windows-illegal character), this only removes what could ever let a
+    stored folder name escape or nest: path separators (``/`` ``\\``), NUL
+    and other control characters. It deliberately LEAVES ``: ? * " < > |``
+    alone — those are legal on the Linux filesystem the library actually
+    lives on, and anime-loads release names routinely contain them
+    (``Re:ZERO -Starting Life in Another World-``, `` ...Girls in a
+    Dungeon?``); stripping them would silently rename an existing library
+    folder and split it in two. Separators are deleted rather than replaced,
+    so what's left is always a single path segment — that's what keeps a
+    traversal attempt (``../../etc``) from ever containing another separator
+    to traverse with. The one case that doesn't neutralize is a segment
+    that's ALL dots (``.`` or ``..``), which is still a traversal segment on
+    its own — reject those (and anything that sanitizes to nothing), same as
+    other invalid input.
+    """
+    cleaned = re.sub(r'[/\\\x00-\x1f]', '', name).strip()
+    if re.fullmatch(r'\.+', cleaned):
+        return ""
+    return cleaned
+
+
 _TOKEN_SPLIT_RE = re.compile(r'[._\s\-]+')
 
 
@@ -1267,6 +1302,24 @@ def _movie_target_name(display_title, year):
     if year:
         return "{} ({})".format(base, year)
     return base
+
+
+def _is_within_media_dir(target_dir, base_dir):
+    """True if target_dir resolves to somewhere inside base_dir.
+
+    Last-line defense for the mover: name sanitization should already keep
+    every target inside base_dir, but this catches anything that slips
+    through (a legacy entry saved before sanitization existed, an unforeseen
+    edge case) before a single file gets moved.
+    """
+    base = os.path.realpath(base_dir)
+    real = os.path.realpath(target_dir)
+    try:
+        return os.path.commonpath([base, real]) == base
+    except ValueError:
+        # commonpath raises when the paths don't share a root (e.g. different
+        # drives on Windows) — definitely not contained.
+        return False
 
 
 def find_existing_media_folder(anime_name):
@@ -1501,6 +1554,14 @@ def run_move_cycle():
             movie_folder_base = dir_match["folder_name"] or dir_match["display_title"]
             movie_folder = _movie_target_name(movie_folder_base, dir_match["year"])
             target_dir = os.path.join(MOVIE_MEDIA_DIR, movie_folder)
+            if not _is_within_media_dir(target_dir, MOVIE_MEDIA_DIR):
+                msg = "{} — unsafe folder name, refusing to move outside the media library".format(entry_name)
+                for filepath in video_files:
+                    rel_path = os.path.relpath(filepath, DOWNLOAD_DIR)
+                    is_new, ignored, _ = _stuck_touch(rel_path, "unsafe_folder", entry_name, msg)
+                    if is_new and not ignored:
+                        events.append({"type": "error", "msg": msg})
+                continue
             for filepath in video_files:
                 src_name = os.path.basename(filepath)
                 ext = os.path.splitext(src_name)[1].lower()
@@ -1591,6 +1652,13 @@ def run_move_cycle():
                 season_dir = 'S{:02d}'.format(season)
                 target_dir = os.path.join(MEDIA_DIR, anime_name, season_dir)
                 target_path = os.path.join(target_dir, filename)
+
+                if not _is_within_media_dir(target_dir, MEDIA_DIR):
+                    msg = "{} — unsafe folder name, refusing to move outside the media library".format(filename)
+                    is_new, ignored, _ = _stuck_touch(rel_path, "unsafe_folder", entry_name, msg)
+                    if is_new and not ignored:
+                        events.append({"type": "error", "msg": msg})
+                    continue
 
                 if os.path.exists(target_path):
                     msg = "{} \u2014 already exists".format(filename)
@@ -2522,6 +2590,7 @@ _STUCK_REASON_LABELS = {
     "parse": "Can't parse season/episode",
     "exists": "Already exists in library",
     "unmatched": "No watchlist match",
+    "unsafe_folder": "Unsafe folder name (blocked)",
 }
 
 
@@ -3352,7 +3421,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(200, render_page(search_html=search_html))
                 return
 
-            folder_name = custom_folder if custom_folder else name
+            folder_name_raw = custom_folder if custom_folder else name
+            folder_name = _safe_folder_segment(folder_name_raw)
+            if not folder_name:
+                self._redirect_msg("Error: invalid folder name")
+                return
+
             entry = {
                 "url": url,
                 "name": name,
@@ -3411,8 +3485,11 @@ class Handler(BaseHTTPRequestHandler):
                 season_info = ", season {}".format(entry["tvdb_season"])
             _log.info("[watchlist] Added: %s (folder=%s, tvdb_id=%s%s)",
                       name, folder_name, entry.get("tvdb_id", "-"), season_info)
+            folder_display = (
+                folder_name if folder_name == folder_name_raw
+                else "{} (saved as '{}')".format(folder_name_raw, folder_name))
             self._redirect_msg("Added: {} (folder: {}{})".format(
-                name, folder_name, season_info))
+                name, folder_display, season_info))
 
         elif parsed.path == "/tvdb-search":
             url = params.get("url", "").strip()
@@ -3691,7 +3768,8 @@ class Handler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/update-folder":
             entry_url = params.get("key", "")
-            folder = params.get("folder", "").strip()
+            folder_raw = params.get("folder", "").strip()
+            folder = _safe_folder_segment(folder_raw)
             outcome = {}
 
             def _update_folder(data):
@@ -3706,7 +3784,8 @@ class Handler(BaseHTTPRequestHandler):
 
             update_ani(_update_folder)
             if outcome.get("result") == "updated":
-                self._redirect_msg("Folder updated: {} -> {}".format(outcome["name"], folder))
+                shown = folder if folder == folder_raw else "{} (saved as '{}')".format(folder_raw, folder)
+                self._redirect_msg("Folder updated: {} -> {}".format(outcome["name"], shown))
             else:
                 self._redirect_msg("Error: entry not found or empty folder")
 

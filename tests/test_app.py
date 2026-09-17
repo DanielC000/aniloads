@@ -278,6 +278,96 @@ class MatchAnimeEntryTest(unittest.TestCase):
         self.assertEqual(res["media_type"], "series")
         self.assertEqual(res["display_title"], "Some.Anime")
 
+    def test_legacy_hostile_custompackage_is_sanitized_flat(self):
+        # A customPackage saved before save-time sanitization existed
+        # (hand-edited ani.json, or an entry from before this fix) must still
+        # come back as a single, contained path segment.
+        anime = [{"name": "Bleach", "customPackage": "a/b", "tvdb_season": 1}]
+        res = app.match_anime_entry("xxx", "Bleach.S01E01.1080p", anime)
+        self.assertEqual(res["folder_name"], "ab")
+
+    def test_legacy_traversal_custompackage_is_sanitized(self):
+        anime = [{"name": "Bleach", "customPackage": "../../etc"}]
+        res = app.match_anime_entry("xxx", "Bleach.S01E01.1080p", anime)
+        self.assertEqual(res["folder_name"], "....etc")
+        self.assertNotIn("/", res["folder_name"])
+
+    def test_custompackage_with_colon_and_question_mark_unchanged(self):
+        # These are legal on the Linux media filesystem and common in
+        # anime-loads release names — must round-trip unchanged so an
+        # existing library folder of the same name keeps matching (a real
+        # regression: stripping them would split an existing show into a
+        # second, differently-named folder).
+        anime = [{"name": "ReZERO", "customPackage":
+                  "Re:ZERO -Starting Life in Another World-"}]
+        res = app.match_anime_entry("xxx", "ReZERO.S01E01.1080p", anime)
+        self.assertEqual(res["folder_name"], "Re:ZERO -Starting Life in Another World-")
+
+        anime2 = [{"name": "DanMachi", "customPackage":
+                   "Is It Wrong to Try to Pick Up Girls in a Dungeon?"}]
+        res2 = app.match_anime_entry("xxx", "DanMachi.S01E01.1080p", anime2)
+        self.assertEqual(res2["folder_name"],
+                          "Is It Wrong to Try to Pick Up Girls in a Dungeon?")
+
+
+class SafeFolderSegmentTest(unittest.TestCase):
+    """_safe_folder_segment is the choke point for every watchlist folder
+    name — save paths (/update-folder, /add-release) and the mover's legacy
+    hand-edited-entry path (_entry_to_match) all route through it. Unlike
+    _sanitize_folder (Plex movie naming), it only strips what could let a
+    name escape or nest a path — it must leave ``: ? * " < > |`` alone since
+    those are legal on the actual (Linux) media filesystem and common in
+    anime-loads release titles."""
+
+    def test_strips_path_separators(self):
+        self.assertEqual(app._safe_folder_segment("../../etc"), "....etc")
+        self.assertEqual(app._safe_folder_segment("C:\\x"), "C:x")
+
+    def test_slash_separated_title_flattens_to_one_segment(self):
+        # Documented mapping: "Fate/stay night" -> "Fatestay night" — the
+        # words merge (no separator inserted) because separators are
+        # deleted, not replaced.
+        self.assertEqual(app._safe_folder_segment("Fate/stay night"), "Fatestay night")
+
+    def test_bare_dot_segments_rejected_as_empty(self):
+        self.assertEqual(app._safe_folder_segment(".."), "")
+        self.assertEqual(app._safe_folder_segment("."), "")
+        self.assertEqual(app._safe_folder_segment("...."), "")
+
+    def test_whitespace_only_rejected_as_empty(self):
+        self.assertEqual(app._safe_folder_segment("   "), "")
+
+    def test_control_chars_stripped(self):
+        self.assertEqual(app._safe_folder_segment("A\x00B\x1f"), "AB")
+
+    def test_normal_names_unchanged(self):
+        self.assertEqual(app._safe_folder_segment("Fate & Zero's Rebellion"),
+                          "Fate & Zero's Rebellion")
+        self.assertEqual(app._safe_folder_segment("\u30c9\u30e9\u30b4\u30f3\u30dc\u30fc\u30eb"),
+                          "\u30c9\u30e9\u30b4\u30f3\u30dc\u30fc\u30eb")
+
+    def test_leading_dot_title_unaffected(self):
+        # Real anime titles starting with a dot (".hack//SIGN") must not be
+        # treated as a dot-only traversal segment — only a segment that is
+        # ENTIRELY dots is rejected.
+        self.assertEqual(app._safe_folder_segment(".hack"), ".hack")
+
+    def test_colon_question_mark_and_other_windows_illegal_chars_preserved(self):
+        # These are legal on the actual (Linux) media filesystem and common
+        # in anime-loads release names — must NOT be stripped here (that's
+        # _sanitize_folder's job, for Plex movie naming only).
+        self.assertEqual(
+            app._safe_folder_segment("Re:ZERO -Starting Life in Another World-"),
+            "Re:ZERO -Starting Life in Another World-")
+        self.assertEqual(
+            app._safe_folder_segment("Is It Wrong to Try to Pick Up Girls in a Dungeon?"),
+            "Is It Wrong to Try to Pick Up Girls in a Dungeon?")
+
+    def test_movie_target_name_still_uses_sanitize_folder_unchanged(self):
+        # _sanitize_folder (movie path) is untouched by this fix — it still
+        # deletes Windows-illegal characters, including ':' and '?'.
+        self.assertEqual(app._movie_target_name("Re:ZERO?", 2016), "ReZERO (2016)")
+
 
 class MovieTargetNameTest(unittest.TestCase):
     def test_with_year(self):
@@ -1512,6 +1602,99 @@ class WatchlistMutationKeyByUrlTest(unittest.TestCase):
         self.assertEqual(app.find_entry_by_url(entries, "http://x/b"),
                          (1, entries[1]))
 
+    def test_update_folder_sanitizes_traversal(self):
+        a = {"name": "A", "url": "http://x/a"}
+        app.save_ani({"anime": [a]})
+        result = self._post("/update-folder", {"key": "http://x/a", "folder": "../../etc"})
+        entry = app.load_ani()["anime"][0]
+        self.assertEqual(entry["customPackage"], "....etc")
+        self.assertNotIn("Error", result["msg"])
+        self.assertIn("saved as", result["msg"])
+
+    def test_update_folder_flattens_slash_no_nesting(self):
+        a = {"name": "A", "url": "http://x/a"}
+        app.save_ani({"anime": [a]})
+        self._post("/update-folder", {"key": "http://x/a", "folder": "a/b"})
+        entry = app.load_ani()["anime"][0]
+        self.assertEqual(entry["customPackage"], "ab")
+
+    def test_update_folder_strips_backslash_keeps_colon(self):
+        # ':' is legal on the actual (Linux) media filesystem — only the
+        # backslash (a path separator on Windows) is removed.
+        a = {"name": "A", "url": "http://x/a"}
+        app.save_ani({"anime": [a]})
+        self._post("/update-folder", {"key": "http://x/a", "folder": "C:\\x"})
+        entry = app.load_ani()["anime"][0]
+        self.assertEqual(entry["customPackage"], "C:x")
+
+    def test_update_folder_colon_and_question_mark_preserved(self):
+        # Real anime-loads release names routinely carry these — must not be
+        # stripped, or a fresh save would diverge from the existing library
+        # folder name for the same show.
+        a = {"name": "A", "url": "http://x/a"}
+        app.save_ani({"anime": [a]})
+        result = self._post("/update-folder", {
+            "key": "http://x/a",
+            "folder": "Re:ZERO -Starting Life in Another World-",
+        })
+        entry = app.load_ani()["anime"][0]
+        self.assertEqual(entry["customPackage"], "Re:ZERO -Starting Life in Another World-")
+        self.assertNotIn("saved as", result["msg"])
+
+    def test_update_folder_rejects_dot_dot_no_save(self):
+        a = {"name": "A", "url": "http://x/a", "customPackage": "Original"}
+        app.save_ani({"anime": [a]})
+        result = self._post("/update-folder", {"key": "http://x/a", "folder": ".."})
+        entry = app.load_ani()["anime"][0]
+        self.assertEqual(entry["customPackage"], "Original")  # unchanged
+        self.assertTrue(result["msg"].startswith("Error"))
+
+    def test_update_folder_rejects_whitespace_only_no_save(self):
+        a = {"name": "A", "url": "http://x/a", "customPackage": "Original"}
+        app.save_ani({"anime": [a]})
+        result = self._post("/update-folder", {"key": "http://x/a", "folder": "   "})
+        entry = app.load_ani()["anime"][0]
+        self.assertEqual(entry["customPackage"], "Original")
+        self.assertTrue(result["msg"].startswith("Error"))
+
+    def test_update_folder_normal_names_unchanged(self):
+        a = {"name": "A", "url": "http://x/a"}
+        app.save_ani({"anime": [a]})
+        result = self._post("/update-folder",
+                             {"key": "http://x/a", "folder": "Fate & Zero's Return"})
+        entry = app.load_ani()["anime"][0]
+        self.assertEqual(entry["customPackage"], "Fate & Zero's Return")
+        self.assertNotIn("saved as", result["msg"])
+
+    def test_add_release_sanitizes_custom_folder(self):
+        app.save_ani({"anime": []})
+        result = self._post("/add-release", {
+            "url": "http://x/new", "name": "New Show",
+            "custom_folder": "../../etc", "tvdb_skip": "1",
+        })
+        entries = app.load_ani()["anime"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["customPackage"], "....etc")
+        self.assertIn("saved as", result["msg"])
+
+    def test_add_release_rejects_dot_dot_custom_folder(self):
+        app.save_ani({"anime": []})
+        result = self._post("/add-release", {
+            "url": "http://x/new2", "name": "New Show 2",
+            "custom_folder": "..", "tvdb_skip": "1",
+        })
+        self.assertEqual(app.load_ani().get("anime", []), [])
+        self.assertTrue(result["msg"].startswith("Error"))
+
+    def test_add_release_fallback_name_with_slash_flattens(self):
+        app.save_ani({"anime": []})
+        result = self._post("/add-release", {
+            "url": "http://x/fate", "name": "Fate/stay night", "tvdb_skip": "1",
+        })
+        entries = app.load_ani()["anime"]
+        self.assertEqual(entries[0]["customPackage"], "Fatestay night")
+        self.assertIn("saved as", result["msg"])
+
 
 class ConfigUtf8Test(unittest.TestCase):
     """load_ani/load_run_state must read/write UTF-8 regardless of the
@@ -2266,6 +2449,90 @@ class RunMoveCycleTest(unittest.TestCase):
         self.assertEqual(events, [])
         # Still present (so it isn't rediscovered as "new"), just ignored.
         self.assertIn(key, app._stuck_items)
+
+    def test_hostile_existing_custom_package_traversal_never_escapes(self):
+        # A customPackage saved before save-time sanitization existed (hand-
+        # edited ani.json, or a pre-fix entry) must not let the mover write
+        # outside MEDIA_DIR — sanitization at match time flattens it first.
+        self._write_ani([{"name": "Naruto", "media_type": "series",
+                           "customPackage": "../../etc"}])
+        self._make_dl("Naruto.S01", ["Naruto.S01E05.mkv"])
+        events = app.run_move_cycle()
+        self.assertIn("moved", self._types(events))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.media, "....etc", "S01", "Naruto.S01E05.mkv")))
+        # Nothing landed outside the sandboxed media dir.
+        self.assertFalse(os.path.isdir(os.path.join(self.tmp, "etc")))
+
+    def test_hostile_existing_custom_package_slash_flattens_no_nesting(self):
+        self._write_ani([{"name": "Bleach", "media_type": "series",
+                           "customPackage": "a/b"}])
+        self._make_dl("Bleach.S01", ["Bleach.S01E05.mkv"])
+        app.run_move_cycle()
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.media, "ab", "S01", "Bleach.S01E05.mkv")))
+        self.assertFalse(os.path.isdir(os.path.join(self.media, "a")))
+
+    def test_colon_title_matches_existing_folder_without_touching_filesystem(self):
+        # Regression guard: ':' and '?' are legal on the real (Linux) media
+        # filesystem and common in anime-loads release names, so match-time
+        # sanitization must leave them alone — otherwise an existing library
+        # folder using them would stop matching and get a second, mangled
+        # folder created alongside it. Exercised at the match_anime_entry
+        # level (not a real os.makedirs) because ':'/'?' are themselves
+        # illegal in a real directory name on this Windows dev/CI host, even
+        # though they're legal on the Linux host this code actually runs on.
+        existing_folder = "Re:ZERO -Starting Life in Another World-"
+        self._write_ani([{"name": "ReZERO", "media_type": "series",
+                           "customPackage": existing_folder}])
+        match = app.match_anime_entry("rezero", "ReZERO.S01", app._lookup_anime_entries())
+        self.assertEqual(match["folder_name"], existing_folder)
+
+    def test_mover_containment_check_blocks_series_escape(self):
+        # Defense-in-depth: even if something upstream of the mover ever
+        # hands back an unsanitized folder_name, the mover's own realpath
+        # containment check must refuse to write outside MEDIA_DIR.
+        orig_match = app.match_anime_entry
+
+        def fake_match(parsed_name, dir_basename, anime_list, parsed_season=None):
+            return {
+                "folder_name": "../../escaped", "tvdb_season": None,
+                "episode_offset": 0, "media_type": "series", "year": None,
+                "display_title": "Evil", "matched": True,
+            }
+
+        app.match_anime_entry = fake_match
+        try:
+            self._make_dl("Whatever.S01", ["Whatever.S01E01.mkv"])
+            events = app.run_move_cycle()
+        finally:
+            app.match_anime_entry = orig_match
+
+        self.assertIn("error", self._types(events))
+        escaped_dir = os.path.realpath(os.path.join(self.media, "..", "escaped"))
+        self.assertFalse(os.path.isdir(escaped_dir))
+        stuck = [v for v in app._stuck_items.values() if v["reason"] == "unsafe_folder"]
+        self.assertEqual(len(stuck), 1)
+
+    def test_mover_containment_check_blocks_movie_escape(self):
+        # _movie_target_name already sanitizes internally, so to exercise the
+        # mover's OWN containment check for the movie branch (defense in
+        # depth against a future regression there), patch it out directly
+        # rather than going through match_anime_entry.
+        self._write_ani([{"name": "Evil", "media_type": "movie"}])
+        orig_target_name = app._movie_target_name
+        app._movie_target_name = lambda display_title, year: "../../escaped"
+        try:
+            self._make_dl("Evil.Movie", ["Evil.Movie.mkv"])
+            events = app.run_move_cycle()
+        finally:
+            app._movie_target_name = orig_target_name
+
+        self.assertIn("error", self._types(events))
+        escaped_dir = os.path.realpath(os.path.join(self.movies, "..", "escaped"))
+        self.assertFalse(os.path.isdir(escaped_dir))
+        stuck = [v for v in app._stuck_items.values() if v["reason"] == "unsafe_folder"]
+        self.assertEqual(len(stuck), 1)
 
 
 class MoveStatePersistenceTest(unittest.TestCase):

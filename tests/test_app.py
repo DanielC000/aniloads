@@ -3722,7 +3722,7 @@ class RunNowTriggerTest(unittest.TestCase):
     def test_cooldown_elapses(self):
         app.trigger_run_now()
         self.assertGreater(app.run_now_cooldown_remaining(), 0)
-        future = datetime.utcnow() + timedelta(seconds=app.RUN_NOW_COOLDOWN_SECONDS + 1)
+        future = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=app.RUN_NOW_COOLDOWN_SECONDS + 1)
         self.assertEqual(app.run_now_cooldown_remaining(now=future), 0)
 
     def test_per_entry_check_now_sets_force_check(self):

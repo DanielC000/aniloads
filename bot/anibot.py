@@ -4,7 +4,7 @@ from logging.handlers import TimedRotatingFileHandler
 
 from getpass import getpass
 
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 
 LOG_DIR = os.environ.get("LOG_DIR", "/config/logs")
 LOG_FILE = os.path.join(LOG_DIR, "anibot.log")
@@ -461,8 +461,8 @@ EVENTS_CAP = 40
 
 def _utcnow_iso():
     """UTC timestamp as RFC3339-ish ISO8601 with a trailing Z. Matches the
-    dashboard's UTC clock (datetime.utcnow) so its next-run math stays correct."""
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    dashboard's UTC clock (datetime.now(timezone.utc)) so its next-run math stays correct."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def _run_state_path():
     """Path to run_state.json, alongside the watchlist (ani.json). Derived from

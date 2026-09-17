@@ -816,7 +816,7 @@ def run_now_cooldown_remaining(now=None):
     file's own presence/mtime — the bot deletes that file within a few
     seconds of consuming it (see sleep_until_next_cycle's slice_seconds),
     well before the RUN_NOW_COOLDOWN_SECONDS window is actually up."""
-    now = now or datetime.utcnow()
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
     last = _load_run_now_last().get("last_requested_at")
     if not last:
         return 0
@@ -872,7 +872,7 @@ def trigger_run_now(entry_url=None):
                 return False, "Entry not found"
             name = outcome.get("name")
 
-        now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         if not _write_run_now_trigger(now_iso):
             return False, "Failed to write run-now trigger"
         _write_small_json(RUN_NOW_STATE_FILE, {"last_requested_at": now_iso})

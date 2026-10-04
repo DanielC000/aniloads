@@ -74,6 +74,13 @@ Both gaps are fixed structurally, not by special-casing the year string:
 returns the corrected `folder_name` ("Tokyo Revengers"), its existing
 case-insensitive directory listing lookup already finds the real folder.
 
+## Subtitle sidecars are only chased for a package-folder item
+
+Subtitle sidecars are only chased for a "parse"/"unmatched" item, whose source dir is a real
+single package folder — a "loose" file's dirname is `DOWNLOAD_DIR` itself, and
+`_move_subtitles` walks recursively, so reusing it there could sweep in an unrelated package's
+sidecar.
+
 ## Scope note: why "Move anyway" became "assign to a watchlist entry"
 
 The fix above only helps a download whose entry can be algorithmically

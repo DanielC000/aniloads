@@ -9,6 +9,11 @@ of the cycle it triggers (`consume_run_now_trigger`) — a request arriving mid-
 there until that point, so it is always honored *after* the running cycle, never by
 interrupting it.
 
+`web/app.py`'s `RUN_NOW_STATE_FILE` is separate, dashboard-only bookkeeping for the
+`/run-now`/`/check-now` cooldown. The bot deletes `RUN_NOW_FILE` within a few seconds of
+consuming it, well before the cooldown window is up, so the cooldown can't be tracked off that
+file's own presence/mtime alone — it needs its own persisted `last_requested_at`.
+
 ## Do not
 
 Don't make a run-now request interrupt an in-flight cycle — it must only wake the inter-cycle

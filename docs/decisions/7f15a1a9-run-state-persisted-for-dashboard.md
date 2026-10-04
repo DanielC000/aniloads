@@ -15,6 +15,12 @@ independent of the rolling log tail. A run-now request is consumed at the START 
 it triggers — a request that arrived mid-cycle just sits in the file until that point, so it
 is always honored *after* the previous cycle finished, never by interrupting it.
 
+`web/app.py`'s `get_activity()` treats the persisted run-state record (when present) as
+authoritative for `last_run`/`next_run` — it survives the log-tail rollover that log-parsing
+alone is vulnerable to. The log-parsed `runs` still drive the event feed as a fallback.
+`run_state` is also surfaced on the result so a sibling run-history UI can render one summary
+per run from it directly.
+
 ## Do not
 
 Don't go back to deriving `last_run`/`next_run` from the container log tail — under verbose

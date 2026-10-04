@@ -55,12 +55,8 @@ CONFIG_DIR = os.environ.get("CONFIG_DIR", "/config")
 ANI_JSON = os.path.join(CONFIG_DIR, "ani.json")
 PREFS_FILE = os.path.join(CONFIG_DIR, "web-prefs.json")
 RUN_STATE_FILE = os.path.join(CONFIG_DIR, "run_state.json")
-# Soft run-now trigger consumed by bot/anibot.py's sleep_until_next_cycle() /
-# consume_run_now_trigger() — replaces restarting the bot container (see
-# trigger_run_now() below). RUN_NOW_STATE_FILE is dashboard-only bookkeeping
-# for the cooldown: the bot deletes RUN_NOW_FILE within a few seconds of
-# consuming it, well before the cooldown window is up, so the cooldown can't
-# be tracked off that file's presence/mtime alone.
+# @decision sha:2468ef04 — RUN_NOW_STATE_FILE's cooldown can't be tracked off
+# RUN_NOW_FILE's own presence/mtime; see docs/decisions/2468ef04-*.md.
 RUN_NOW_FILE = os.path.join(CONFIG_DIR, "run_now")
 RUN_NOW_STATE_FILE = os.path.join(CONFIG_DIR, "run_now_last.json")
 RUN_NOW_COOLDOWN_SECONDS = int(os.environ.get("RUN_NOW_COOLDOWN_SECONDS", "120"))
@@ -100,10 +96,8 @@ def _normalize_origin(value):
     return "{}://{}".format(parsed.scheme.lower(), parsed.netloc.lower())
 
 
-# Explicit CSRF allowlist (full "scheme://host:port" origins, comma-separated)
-# for a reverse-proxy setup where neither the request's own Host nor
-# X-Forwarded-Host lines up with the browser's Origin/Referer — see
-# Handler._check_csrf's docstring.
+# @decision sha:e4844185 — an explicit origins allowlist, not request-inferred;
+# see docs/decisions/e4844185-*.md.
 DASHBOARD_ALLOWED_ORIGINS = {
     _normalize_origin(o) for o in os.environ.get("DASHBOARD_ALLOWED_ORIGINS", "").split(",") if o.strip()
 }
@@ -328,11 +322,8 @@ def parse_bot_logs(raw_lines):
             }
             continue
 
-        # Standalone events ([SKIP]/[COMPLETE]/[THROTTLE]) can appear between
-        # cycles with no active run. Handle them before the no-run guard below so
-        # they always create their own entry — these never attach to current_run,
-        # so hoisting them keeps active-run behavior identical while no longer
-        # dropping them when current_run is None.
+        # @decision sha:e22811ca — handle these before the no-run guard below;
+        # see docs/decisions/e22811ca-*.md.
         if content.startswith("[SKIP]"):
             skip_msg = content[len("[SKIP]"):].strip()
             runs.append({
@@ -419,13 +410,8 @@ def parse_bot_logs(raw_lines):
 
 BOT_LOG_MAX_LINES = 200
 
-# No general-purpose redactor existed for free-text log lines — bot/notify.py's
-# _redact() only reshapes a single already-parsed target URL down to
-# scheme+host, which doesn't help with a raw log line that embeds a secret
-# inline. Each rule below targets one secret shape named in the card: URL
-# credentials, MyJD/al_pass/API-key values, and Discord/ntfy/Gotify webhook
-# paths/tokens (whether the bot logged the canonical "scheme://host/path"
-# form notify.py builds, or the "?token=" query form _send_gotify() sends).
+# @decision sha:381a852f — each rule targets one specific secret shape the bot
+# can log; see docs/decisions/381a852f-*.md.
 _REDACT_RULES = (
     (re.compile(r"://[^\s/@]+:[^\s/@]+@"), "://<redacted>@"),
     (re.compile(r"(?i)(discord(?:app)?\.com/api/webhooks/)\d+/[^\s/?\"']+"), r"\1<redacted>"),
@@ -447,12 +433,8 @@ def redact_log_text(text):
     return text
 
 
-# bot/anibot.py's own rotating file log (LOG_FILE there) writes real levels —
-# "%(asctime)s %(levelname)s %(name)s %(message)s" — unlike its stdout handler
-# (message-only, see the docker-fallback heuristic below). The dashboard
-# container mounts the same LOG_DIR volume the bot writes into (LOG_DIR is
-# already used above for this container's OWN anime-web.log), so this is the
-# primary source: real WARNING/ERROR/CRITICAL levels, no guessing.
+# @decision sha:381a852f — the file log is the primary, real-level source over
+# the docker-stdout heuristic below; see docs/decisions/381a852f-*.md.
 BOT_LOG_FILE = os.path.join(LOG_DIR, "anibot.log")
 # Bounded so a 14-day rotated file is never read whole — only enough of the
 # tail to comfortably hold BOT_LOG_MAX_LINES worth of recent entries.
@@ -521,17 +503,8 @@ def filter_bot_log_file_lines(lines, limit=BOT_LOG_MAX_LINES):
     return matches[:limit]
 
 
-# Fallback only, used when the file log is absent/unreadable. The
-# docker-captured stdout stream carries no real logging level: the bot's
-# stdout handler formats records as "%(message)s" only (see bot/anibot.py),
-# so a _log.warning()/_log.error() call is byte-for-byte indistinguishable on
-# the wire from an _log.info() one except by its own wording. This matches on
-# the content markers the bot's own messages actually carry — the [ERROR] tag
-# the log() helper prefixes user-facing failures with, plus the English/German
-# words its direct _log.warning()/_log.error() calls tend to use — rather than
-# a true level field, which never survives the docker socket. Labelled
-# "approximate" in the rendered panel so this guesswork is never mistaken for
-# the real thing.
+# @decision sha:381a852f — content-heuristic fallback only, labelled
+# "approximate"; see docs/decisions/381a852f-*.md.
 _BOT_LOG_PROBLEM_RE = re.compile(
     r"\[ERROR\]|\berrors?\b|\bwarnings?\b|\bfailed\b|fehler|fehlgeschlagen",
     re.IGNORECASE,
@@ -623,10 +596,8 @@ def load_run_state():
         with open(RUN_STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
-    # ValueError also covers UnicodeDecodeError (a corrupt/non-UTF-8 file):
-    # both it and json.JSONDecodeError subclass ValueError, so this degrades
-    # a bad file to the empty state instead of a 500, without swallowing an
-    # unrelated bug (e.g. a TypeError) as if it were a corrupt file.
+    # @decision sha:1c51632b — ValueError also covers UnicodeDecodeError, don't
+    # narrow or widen it; see docs/decisions/1c51632b-*.md.
     except (FileNotFoundError, OSError, ValueError):
         return {}
 
@@ -662,14 +633,8 @@ def _parse_state_ts(ts):
         return None
 
 
-# Dates in the feed. Timestamps are stored as naive UTC and only turned into
-# local wall time here, at render time, so every time, day header and
-# "Today"/"Yesterday" is drawn on one clock: the process's own zone. None means
-# exactly that: astimezone() goes through libc, which honours TZ, and compose
-# hands the bot the same TZ, so the feed reads like the bot's own log lines. A
-# TZ libc cannot resolve falls back to UTC, which is the old output. Tests pin
-# the zone so they don't depend on the host's. `now` is always the current UTC
-# instant (naive) and is injectable so tests can pin it too.
+# @decision sha:62c140e1 — feed times render on the process's own local clock,
+# not a hardcoded zone; see docs/decisions/62c140e1-*.md.
 _display_tz = None
 
 
@@ -902,11 +867,8 @@ def get_activity():
         "next_run": next_run_estimate,
     }
 
-    # The persisted run-state record (when present) is authoritative for
-    # last_run / next_run — it survives the log-tail rollover that the block
-    # above is vulnerable to. The log-parsed `runs` still drive the event feed
-    # below as a fallback. `run_state` is also surfaced so a sibling run-history
-    # UI can render one summary per run from it.
+    # @decision sha:7f15a1a9 — run_state is authoritative over the log-tail
+    # parse above; see docs/decisions/7f15a1a9-*.md.
     run_state = load_run_state()
     state_last = run_state.get("last_run") if isinstance(run_state, dict) else None
     if isinstance(state_last, dict):
@@ -923,10 +885,8 @@ def get_activity():
     # fine while Health already flagged a stale cycle.
     result["staleness"] = check_bot_staleness(run_state)
 
-    # Surfaced so render_activity can say "Waiting for configuration" instead
-    # of a plain "Running" dot while the bot is stuck in its boot backoff loop
-    # (see bot/anibot.py's write_waiting_for_config) -- the container/process
-    # is up, but no cycle can start without a download backend.
+    # @decision 9cf82ae0 — must not render as a healthy "Running" dot;
+    # see docs/decisions/9cf82ae0-*.md.
     waiting = run_state.get("waiting_for_config") if isinstance(run_state, dict) else None
     if isinstance(waiting, dict):
         result["waiting_for_config"] = waiting
@@ -984,11 +944,8 @@ def update_ani(fn):
 # Soft run-now / per-entry check-now
 # ---------------------------------------------------------------------------
 
-# Guards trigger_run_now's cooldown check + state write as one atomic step —
-# under the threaded server, two concurrent /run-now or /check-now POSTs
-# (e.g. two browser tabs, or a double-click) could otherwise both read the
-# cooldown as elapsed before either one's write lands, both passing a check
-# meant to allow only one.
+# @decision sha:0b9d6f06 — cooldown check + state write as one atomic step;
+# see docs/decisions/0b9d6f06-*.md.
 _run_now_lock = threading.Lock()
 
 
@@ -1175,12 +1132,8 @@ def save_prefs(prefs):
 
 # ---------------------------------------------------------------------------
 # Health panel — JDownloader / TVDB / site login / disk / bot staleness.
-#
-# The dashboard polls /api/status every 10s (see the refresh() script below),
-# so a naive per-poll network probe would hammer JDownloader/TVDB constantly.
-# Each network-touching check is memoized in _HEALTH_CACHE for its own TTL;
-# the login/staleness checks are free (pure reads of already-loaded state) and
-# skip the cache entirely.
+# @decision sha:d5b5f67a — each network-touching check is memoized against the
+# 10s poll; see docs/decisions/d5b5f67a-*.md.
 # ---------------------------------------------------------------------------
 
 JD_HEALTH_PORT = 9666  # JDownloader's Flashgot/CNL interface (see bot/animeloads.py utils.addToJD)
@@ -1393,11 +1346,8 @@ def check_notify_health():
     raw = os.environ.get("NOTIFY_URL", "")
     raw_entries = [r for r in (e.strip() for e in raw.split(",")) if r] if raw else []
     if not raw_entries:
-        # Notifications are opt-in — leaving NOTIFY_URL unset is the common
-        # case, not a problem. "ok" (rather than "unknown") so this row never
-        # trips render_health_card's "No problems found · N unknown" wording
-        # and a reader who never configured notifications still sees a plain
-        # "All systems OK".
+        # @decision sha:afdfb17e — opt-in absence renders "ok", not "unknown";
+        # see docs/decisions/afdfb17e-*.md.
         return {"state": "ok", "detail": "Not configured (optional)"}
     targets = notify.parse_targets(raw)
     unrecognised = len(raw_entries) - len(targets)
@@ -1511,10 +1461,8 @@ def render_health_card():
 _notify_test_lock = threading.Lock()
 _notify_test_last = [0.0]  # time.monotonic() of the last accepted test send
 NOTIFY_TEST_COOLDOWN_SECONDS = 30
-# Bounds how long a POST /notify-test response can be held open — a slow or
-# unreachable target must not be able to hang the dashboard (see send_all's
-# own per-target try/except; this is a second, coarser backstop around the
-# whole batch since a hung urlopen still blocks its own thread).
+# @decision sha:afdfb17e — bounds the whole batch so one hung target can't hang
+# the dashboard; see docs/decisions/afdfb17e-*.md.
 NOTIFY_TEST_TIMEOUT_SECONDS = 15
 
 
@@ -1917,10 +1865,8 @@ def render_status_banner(msg, level):
             tone="ok" if level == "ok" else "err", msg=escape(msg))
 
 
-# Add-flow steps (search results, release picker, TVDB step) are rendered by a
-# POST. Post/Redirect/Get: the POST stashes the rendered step here and
-# redirects to ``/?flow=<token>``, so reloading re-renders it instead of
-# re-submitting. Read-only on GET; bounded and short-lived, in memory only.
+# @decision sha:79adb341 — Post/Redirect/Get via a flow token, read-only on GET;
+# see docs/decisions/79adb341-*.md.
 FLOW_TTL_SECONDS = 3600
 FLOW_MAX = 32
 _flow_lock = threading.Lock()
@@ -1988,10 +1934,8 @@ _VIDEO_EXTS = {'.mkv', '.mp4', '.avi'}
 _ARCHIVE_RE = re.compile(r'\.(rar|r\d\d)$')
 # External subtitle sidecars: moved alongside their video, never deleted.
 _SUBTITLE_EXTS = {'.srt', '.ass', '.ssa', '.sup', '.vtt'}
-# Known-junk leftovers safe to delete after a move (release nfo/readme,
-# NZB/torrent leftovers, poster thumbnails). Archives are handled separately,
-# earlier in the cycle. Anything else (an unrecognized extension) is left in
-# place rather than guessed at.
+# @decision sha:4e8842c9 — a narrow known-junk allowlist, not a guess;
+# see docs/decisions/4e8842c9-*.md.
 _JUNK_EXTS = {'.nfo', '.txt', '.url', '.jpg', '.jpeg', '.png'}
 
 
@@ -2097,12 +2041,8 @@ def match_anime_entry(parsed_name, dir_basename, anime_list, parsed_season=None)
     dir_tokens = _tokenize(dir_basename)
     parsed_tokens = _tokenize(parsed_name)
 
-    # Try download_folder_pattern first — auto-derived by the bot from the actual
-    # release filename, so matches the JD-created folder even when JD ignores
-    # customPackage (which is the user's chosen Plex output folder, not the DL folder).
-    # Pick the entry whose pattern shares the longest leading-token run with the
-    # dir name, so two entries about the same series (e.g. S01 + S03 of one show)
-    # don't both win on the generic prefix.
+    # @decision sha:a4cdbb9f — longest-leading-token-run wins, tiebroken by
+    # tvdb_season below; see docs/decisions/a4cdbb9f-*.md.
     candidates = []
     for entry in anime_list:
         pattern = entry.get("download_folder_pattern", "")
@@ -2114,10 +2054,8 @@ def match_anime_entry(parsed_name, dir_basename, anime_list, parsed_season=None)
     if candidates:
         max_score = max(s for s, _ in candidates)
         top = [e for s, e in candidates if s == max_score]
-        # Tiebreak by parsed season: when the JD folder name carries no season
-        # token (e.g. user named both seasons "Mob Psycho 100"), the leading-
-        # prefix score ties across entries. The filename's SxxExx is still
-        # authoritative — prefer the entry whose tvdb_season matches.
+        # @decision sha:a4cdbb9f — SxxExx stays authoritative on a prefix-score
+        # tie; see docs/decisions/a4cdbb9f-*.md.
         if parsed_season is not None and len(top) > 1:
             season_hits = [e for e in top if e.get("tvdb_season") == parsed_season]
             if season_hits:
@@ -2125,16 +2063,8 @@ def match_anime_entry(parsed_name, dir_basename, anime_list, parsed_season=None)
         chosen = top[0]
         return _entry_to_match(chosen, chosen.get("customPackage", ""))
 
-    # Try matching download dir against customPackage (legacy fallback for entries
-    # without a download_folder_pattern, where the user happened to pick a name
-    # that JD also used for the folder). Tokenized so a dotted/underscored
-    # release name (JDownloader's folder) still matches a space-separated
-    # customPackage/name — comparing the raw strings only ever worked when
-    # both sides happened to use the same separator. Among every entry whose
-    # customPackage is contained, the most-tokens one wins (see
-    # _most_specific_entries) — otherwise a watchlist holding both "Bleach"
-    # and "Bleach Thousand Year Blood War" would file a TYBW release under
-    # whichever entry happens to be listed first.
+    # @decision 325571d6 — tokenized containment, most-tokens-wins;
+    # see docs/decisions/325571d6-*.md.
     cp_candidates = [(len(_tokenize(entry["customPackage"])), entry)
                       for entry in anime_list
                       if entry.get("customPackage") and
@@ -2155,11 +2085,8 @@ def match_anime_entry(parsed_name, dir_basename, anime_list, parsed_season=None)
         chosen = top[0][1]
         return _entry_to_match(chosen, chosen.get("customPackage", chosen["name"]))
 
-    # Try matching parsed filename name against entry name, tolerating a
-    # release year present on exactly one side (e.g. "Foo.2021.S01E01" vs a
-    # watchlist entry named just "Foo") — a year present on BOTH sides must
-    # still differ to fail, so two distinct years never get treated as the
-    # same show.
+    # @decision 325571d6 — asymmetric year tolerance; see
+    # docs/decisions/325571d6-*.md.
     for entry in anime_list:
         if _tokens_equal_year_tolerant(_tokenize(entry.get("name", "")), parsed_tokens):
             return _entry_to_match(entry, entry.get("customPackage", entry["name"]))
@@ -2600,10 +2527,8 @@ def stuck_assign(key, entry_url, season_raw, episode_raw):
     except OSError as e:
         return False, "Error: failed to move {}: {}".format(src_name, e)
 
-    # Subtitle sidecars are only chased for a "parse"/"unmatched" item, whose
-    # source dir is a real single package folder — a "loose" file's dirname
-    # is DOWNLOAD_DIR itself, and _move_subtitles walks recursively, so
-    # reusing it there could sweep in an unrelated package's sidecar.
+    # @decision 325571d6 — only for a package-folder item, never a loose
+    # file; see docs/decisions/325571d6-*.md.
     if rec.get("reason") in ("parse", "unmatched"):
         video_stem = os.path.splitext(src_name)[0]
         new_stem = os.path.splitext(new_filename)[0]
@@ -2642,15 +2567,8 @@ def run_move_cycle():
         dir_path = os.path.join(DOWNLOAD_DIR, entry_name)
 
         if not os.path.isdir(dir_path):
-            # A video file sitting loose in the download root (JDownloader
-            # without package subfolders enabled has nowhere else to put
-            # it). The move logic below is entirely folder-oriented (recency
-            # scan, archive/junk cleanup, subtitle sidecars, empty-dir
-            # removal all key off dir_path) and match_anime_entry's reliable
-            # signals (download_folder_pattern, customPackage) are keyed off
-            # a package folder name that doesn't exist here — so rather than
-            # guess at a destination, surface it as stuck for a human to
-            # enable package subfolders or move it into one by hand.
+            # @decision sha:f1f6f5b2 — surfaced as stuck, never guessed into a
+            # folder; see docs/decisions/f1f6f5b2-*.md.
             if os.path.splitext(entry_name)[1].lower() not in _VIDEO_EXTS:
                 continue
             file_path = dir_path
@@ -2783,12 +2701,8 @@ def run_move_cycle():
                 # (e.g. S01/S02/S03 of the same show) are tiebroken by tvdb_season.
                 match = match_anime_entry(parsed_name, entry_name, anime_list, parsed_season=season)
 
-                # Check for existing folder in media library (case-insensitive).
-                # An unmatched download whose parsed name already has a folder
-                # in the library (a show removed from the watchlist, a manual
-                # JDownloader add of something already in Plex) still files
-                # normally — the stuck/unmatched path is only for a download
-                # that would otherwise SILENTLY CREATE a brand-new folder.
+                # @decision sha:4e8842c9 — stuck is only for a download that
+                # would silently create a new folder; see docs/decisions/4e8842c9-*.md.
                 existing = find_existing_media_folder(match["folder_name"])
 
                 move_anyway = False
@@ -2819,10 +2733,8 @@ def run_move_cycle():
                 if ep_offset:
                     episode += ep_offset
 
-                # A season/offset set from the dashboard (no tvdb_id required —
-                # see apply_entry_edit) can carry an offset that undershoots a
-                # low parsed episode (e.g. offset -12 on E05): guard the result
-                # rather than file a bogus E00 or negative episode.
+                # @decision sha:437e2490 — clamp the result, never file a bogus
+                # E00 or negative episode; see docs/decisions/437e2490-*.md.
                 if episode < 1:
                     msg = "{} — offset {:+d} gives episode {} (from parsed {})".format(
                         filename, ep_offset, episode, orig_episode)
@@ -2832,10 +2744,8 @@ def run_move_cycle():
                         events.append({"type": "error", "msg": msg})
                     continue
 
-                # Rebuild the SxxExx token in the filename itself whenever the
-                # season or episode was overridden — Plex's scanner reads
-                # SxxExx from the filename, not just the folder, so leaving
-                # a stale S01 token behind would still file it under season 1.
+                # @decision sha:d3e80962 — Plex reads SxxExx from the filename
+                # too; see docs/decisions/d3e80962-*.md.
                 if season != orig_season or episode != orig_episode:
                     filename = _rename_season_episode(filename, season, episode)
 
@@ -3749,18 +3659,13 @@ def render_activity(activity, now=None):
     waiting = activity.get("waiting_for_config")
 
     if status.get("docker_available") is False and not isinstance(waiting, dict):
-        # The container status comes only from Docker — when the socket isn't
-        # reachable we genuinely don't know whether the bot is running, so a
-        # red "Stopped" here would be a false signal. run_state-derived
-        # Last/Next Run (below) stay authoritative regardless.
+        # @decision sha:fba18c5c — Docker-unreachable is "unknown", never a red
+        # "Stopped"; see docs/decisions/fba18c5c-*.md.
         status_text = ('<span class="status-dot unknown"></span>Unknown '
                         '<span class="hint">&mdash; Docker socket unavailable</span>')
     elif status.get("docker_available") is False:
-        # waiting_for_config comes from run_state.json, not Docker, so it's
-        # still the most useful fact even when the socket is unreachable and
-        # container status is otherwise unknown (card 205ba5b4) — reason +
-        # Settings link presented the same way as Health's Download Backend
-        # row (check_download_backend_health).
+        # @decision 205ba5b4 — shown regardless of Docker availability;
+        # see docs/decisions/205ba5b4-*.md.
         reason = waiting.get("reason") or "no download backend configured"
         href = "/?" + urlencode({"at": ANCHOR_SETTINGS}) + "#" + ANCHOR_SETTINGS
         status_text = (
@@ -3772,18 +3677,16 @@ def render_activity(activity, now=None):
         bot_running = status.get("running", False)
         dot_class = "running" if bot_running else "stopped"
         if isinstance(waiting, dict):
-            # The container/process is up but stuck in its boot backoff loop
-            # (see bot/anibot.py's write_waiting_for_config) -- a plain
-            # "Running" dot here would look identical to a healthy fresh
-            # start, which is exactly the gap card 9cf82ae0 closes.
+            # @decision 9cf82ae0 — must not look like a healthy fresh start;
+            # see docs/decisions/9cf82ae0-*.md.
             status_text = '<span class="status-dot {}"></span>Waiting for configuration'.format(
                 dot_class)
         else:
             status_text = '<span class="status-dot {}"></span>{}'.format(
                 dot_class, "Running" if bot_running else "Stopped"
             )
-            # Health's own "Bot Cycles" row is the authority on staleness; don't
-            # let a green "Running" dot silently contradict it.
+            # @decision 9cf82ae0 — never contradict Health's own staleness
+            # verdict; see docs/decisions/9cf82ae0-*.md.
             staleness = activity.get("staleness")
             if bot_running and isinstance(staleness, dict) and staleness.get("state") == "warn":
                 status_text += ' <span class="hint">&mdash; {}</span>'.format(
@@ -3844,13 +3747,8 @@ def render_event(etype, msg):
         tone=tone, label=label, msg=escape(msg))
 
 
-# A cycle's events split by signal: downloads, errors and numbering mismatches
-# are the news and always get their own visible line; unavailable/complete are
-# background detail that hides behind the expand toggle so the feed stays
-# readable. A "mismatch" (a release numbering its files 41-46 while the
-# watchlist wants 1-7) is the most actionable line the feed can show — it names
-# the config change that fixes it — so it is LOUD: never behind the toggle, and
-# never folded into a "nothing new" group.
+# @decision sha:a9f7bc76 — downloads/errors/mismatches are always loud, never
+# behind the toggle; see docs/decisions/a9f7bc76-*.md.
 _LOUD_EVENT_KINDS = ("download", "error", "mismatch")
 _QUIET_EVENT_KINDS = ("unavailable", "complete")
 _RUN_EVENT_KINDS = _LOUD_EVENT_KINDS + _QUIET_EVENT_KINDS
@@ -3918,10 +3816,8 @@ def render_run_cycle_events(record):
             quiet_count += 1
 
     if isinstance(record, dict) and record.get("events_truncated"):
-        # Count the RAW recorded list, not the filtered one: an unrecognised
-        # kind (a newer bot than this dashboard) is dropped from rendering, but
-        # it was still recorded — and the one line whose whole job is saying
-        # "this list is incomplete" must not itself state a wrong number.
+        # @decision sha:a9f7bc76 — count the raw recorded list, not the filtered
+        # one; see docs/decisions/a9f7bc76-*.md.
         raw = record.get("events")
         recorded = len(raw) if isinstance(raw, list) else len(events)
         loud += render_event("info", "event list truncated — only the first {} "
@@ -5097,11 +4993,8 @@ def parse_have_episodes(raw, cap=_MAX_SANE_EPISODE_COUNT):
     return value if value <= cap else None
 
 
-# Bounds for the manual library-placement fields. A season is a folder number
-# (S00 specials up to a year-style season); the offset shifts release episode
-# numbers onto library ones (release + offset = library, the same rule the
-# mover and the bot's batch matcher apply), so it never needs to exceed a
-# long-runner's absolute episode count.
+# @decision sha:a243d89b — bounds must agree with the mover's/bot's own
+# release+offset=library rule; see docs/decisions/a243d89b-*.md.
 _MAX_LIBRARY_SEASON = 9999
 _MAX_EPISODE_OFFSET = 9999
 
@@ -5742,10 +5635,8 @@ def render_releases(anime_info, best_id=None, with_tvdb=True, note="", have_epis
 
     year = _parse_year(anime_info.get("year"))
     display_title = anime_info.get("display_title") or ""
-    # Every release id actually offered on this page — carried as a hidden
-    # field alongside the chosen release_id so /add-release and /tvdb-seasons
-    # can validate the selection is one the site really offered, without
-    # re-scraping to re-derive that set.
+    # @decision sha:0b9d6f06 — validate against this, never re-scrape;
+    # see docs/decisions/0b9d6f06-*.md.
     valid_ids = ",".join(str(rel["id"]) for rel in anime_info["releases"])
     for rel in anime_info["releases"]:
         dubs = escape(", ".join(rel["dubs"])) if rel["dubs"] else "&mdash;"
@@ -6591,10 +6482,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/bot-log":
-            # Fetched lazily by the client only when the "Recent bot
-            # warnings & errors" <details> is opened — never on the
-            # /api/status poll — so the file (or, as a fallback, a fresh
-            # 500-line docker tail) is only read when someone actually looks.
+            # @decision sha:381a852f — lazy fetch, never on the /api/status
+            # poll; see docs/decisions/381a852f-*.md.
             payload = json.dumps({"html": render_bot_log()})
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -6674,14 +6563,8 @@ class Handler(BaseHTTPRequestHandler):
                                anchor=entry_anchor_id(duplicate.get("url", "")))
             return
 
-        # Validate the release_id / media_type / episode-count carried
-        # as hidden fields from the release-selection page (or the TVDB
-        # step that followed it) rather than trusting them outright —
-        # see _resolve_release_selection's docstring for the
-        # validate-or-rescrape rule this applies. No release_id at all
-        # is a legitimate call shape (adding without ever going through
-        # release selection) — only a *posted-but-unconfirmable* one
-        # (tampered, or stale beyond recovery) is rejected outright.
+        # @decision sha:5f6449e3 — validate, don't trust or blindly reject;
+        # see docs/decisions/5f6449e3-*.md.
         posted_release_id = params.get("release_id", "")
         release_id, media_type, episodes = _resolve_release_selection(url, params)
         if posted_release_id and not release_id:
@@ -6690,10 +6573,8 @@ class Handler(BaseHTTPRequestHandler):
                 level="err", anchor=ANCHOR_ADD_FLOW)
             return
 
-        # If TVDB is available and user hasn't been through the TVDB step yet,
-        # show the correlation page instead of saving immediately.
-        # For movies the "through the TVDB step" signal is either tvdb_skip
-        # or a posted tvdb_id — there's no tvdb_season field to look for.
+        # @decision sha:5f6449e3 — the TVDB step is a mandatory gate before
+        # saving, when available; see docs/decisions/5f6449e3-*.md.
         has_tvdb_data = (
             "tvdb_season" in params
             or "tvdb_skip" in params
@@ -6740,10 +6621,8 @@ class Handler(BaseHTTPRequestHandler):
             "pref_audio_language": prefs.get("audio_language", "german"),
             "pref_sub_language": prefs.get("sub_language", "any"),
             "pref_resolution": prefs.get("min_resolution", 1080),
-            # Bot-owned scalars, known from the release fetch already: set
-            # now so e.g. a movie shows its Movie badge before the bot's
-            # first cycle (the bot's delta save overwrites them only when
-            # its own value differs).
+            # @decision sha:5f6449e3 — set now so the first render is correct;
+            # see docs/decisions/5f6449e3-*.md.
             "media_type": media_type,
         }
         year = _parse_year(params.get("year"))
@@ -7043,31 +6922,20 @@ class Handler(BaseHTTPRequestHandler):
             # picker even when auto-select would otherwise skip it.
             force_pick = "pick" in params
 
-            # Cheap pre-check so re-adding something already present skips
-            # the scrape below entirely. Not the authoritative check — that
-            # happens inside update_ani's single lock hold at save time, so
-            # a concurrent add (or a bot/resolver write landing while this
-            # request's scrape is in flight) is never missed or clobbered.
+            # @decision sha:0b9d6f06 — a cheap skip-ahead only; the real dedupe
+            # is inside update_ani's lock; see docs/decisions/0b9d6f06-*.md.
             duplicate = find_duplicate_entry(load_ani(), url)
             if duplicate is not None:
                 self._redirect_msg(_duplicate_msg(duplicate), level="err",
                                    anchor=entry_anchor_id(duplicate.get("url", "")))
                 return
 
-            # Fetch releases from site so user can see what's available. No
-            # anistore lock is held across this network/Selenium call — see
-            # update_ani's docstring for why that matters now the server is
-            # threaded.
+            # @decision sha:0b9d6f06 — no anistore lock held across this
+            # network/Selenium call; see docs/decisions/0b9d6f06-*.md.
             anime_info, err = get_releases(url)
             if err or not anime_info or not anime_info.get("releases"):
-                # Fallback: queue to pending if fetch fails. Dedupe + append
-                # happen in ONE lock hold so a write that landed during the
-                # multi-second scrape above (e.g. the bot, or another /add-url)
-                # can't be silently overwritten by this request's stale
-                # pre-scrape snapshot. Pending entries get no per-entry prefs
-                # preset: the resolver applies the global prefs current at
-                # resolve time, which is what its "adjust Preferences" hint
-                # promises.
+                # @decision sha:0b9d6f06 — dedupe + append in ONE lock hold;
+                # see docs/decisions/0b9d6f06-*.md.
                 slug = url.rstrip("/").split("/")[-1]
                 name = slug.replace("-", " ").title()
                 found = []
@@ -7172,13 +7040,8 @@ class Handler(BaseHTTPRequestHandler):
             # Fetch seasons for the selected series
             seasons = tvdb.get_seasons(tvdb_id) if tvdb.available and tvdb_id else []
 
-            # Validate the release_id / media_type / episode-count carried
-            # from the release step (for the season auto-suggestion) rather
-            # than re-scraping to look them up — see
-            # _resolve_release_selection's docstring for the
-            # validate-or-rescrape rule this applies. An invalid/tampered
-            # release_id resolves to "" here (no auto-suggestion); the
-            # actual save at /add-release rejects it outright.
+            # @decision sha:0b9d6f06 — validate against known data, don't
+            # re-scrape; see docs/decisions/0b9d6f06-*.md.
             release_id, media_type, ep_count = _resolve_release_selection(url, params)
 
             # Re-run the search so results stay visible
@@ -7781,9 +7644,7 @@ if __name__ == "__main__":
     mover = threading.Thread(target=move_completed_worker, daemon=True)
     mover.start()
 
-    # ThreadingHTTPServer (daemon_threads=True by default) so a slow
-    # Selenium-backed handler (add-anime's get_releases, up to ~a minute)
-    # can't freeze the whole dashboard, including the 10s /api/status poll,
-    # for every other concurrent request.
+    # @decision sha:0b9d6f06 — ThreadingHTTPServer so a slow Selenium handler
+    # can't freeze the dashboard; see docs/decisions/0b9d6f06-*.md.
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.serve_forever()

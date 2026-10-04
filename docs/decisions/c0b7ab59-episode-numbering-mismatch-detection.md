@@ -9,6 +9,13 @@ numbers its files in a different scheme (e.g. absolute numbering continuing acro
 This is detected and suggested only; it is never auto-applied, since guessing wrong would
 push the wrong episodes to JDownloader.
 
+## The live reproduction (card 62b4595a)
+
+The homelab logs that prompted this: Bleach TYBW, watchlist wanted episodes 1-7 (per-cour
+numbering), but the release numbered its files 41-46 (absolute, continuing across cours) —
+entirely disjoint from 1-7, but not because 1-7 are beyond the real max (46); a numbering
+mismatch, not an all-phantom case (see `6b9f0e32`).
+
 ## Do not
 
 Don't auto-apply the suggested `episode_offset` — a wrong guess would push the wrong episodes

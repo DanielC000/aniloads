@@ -1,6 +1,7 @@
 # Degrading a corrupt run_state.json instead of losing the write
 
-`bot/anibot.py` — `write_run_state()`'s read of the previous state file.
+`bot/anibot.py` — `write_run_state()`'s read of the previous state file. `web/app.py`'s
+`load_run_state()` (the dashboard-side reader of the same file) follows the same reasoning.
 
 `ValueError` also covers `UnicodeDecodeError` (a corrupt/non-UTF-8 file): both it and
 `json.JSONDecodeError` subclass `ValueError`, so this degrades a bad previous-state file to a

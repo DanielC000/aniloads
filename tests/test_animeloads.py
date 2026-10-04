@@ -48,11 +48,8 @@ class MatchBatchEpisodesTest(unittest.TestCase):
         self.assertEqual(len(result["filtered_links"]), 2)
 
     def test_live_bleach_mismatch_with_offset_unset(self):
-        # The exact reproduction from the live homelab logs (card 62b4595a):
-        # wanted 1-7 (per-cour watchlist numbering), release numbers its
-        # files 41-46 (absolute, continuing across cours). Entirely
-        # disjoint, but NOT because 1-7 are beyond the real max (46) — a
-        # numbering mismatch, not the 6b9f0e3 all-phantom case.
+        # @decision sha:c0b7ab59 — the live homelab reproduction (card
+        # 62b4595a); see docs/decisions.
         wanted = set(range(1, 8))
         grouped = _grouped(range(41, 47))
         result = match_batch_episodes(wanted, grouped)
@@ -66,12 +63,8 @@ class MatchBatchEpisodesTest(unittest.TestCase):
         self.assertEqual(result["available_max"], 46)
 
     def test_live_bleach_resolved_with_episode_offset(self):
-        # Same fixture, with the user-set episode_offset (-40) that resolves
-        # it: wanted 1-7 translates to release episodes 41-47, of which
-        # 41-46 exist. The return leg must translate the matched release
-        # episodes (41-46) back into watchlist numbering (1-6) — this is
-        # the dangerous direction (card priority #2): a sign error here
-        # would corrupt the watchlist on real data.
+        # Same fixture, resolved via episode_offset=-40: see
+        # _match_batch_episodes' docstring for the bidirectional translation.
         wanted = set(range(1, 8))
         grouped = _grouped(range(41, 47))
         result = match_batch_episodes(wanted, grouped, episode_offset=-40)
@@ -83,10 +76,8 @@ class MatchBatchEpisodesTest(unittest.TestCase):
         self.assertIsNone(result["reason"])
 
     def test_all_phantom_unaffected_by_mismatch_detection(self):
-        # 6b9f0e3's case: DOM over-reports, every wanted episode is
-        # genuinely beyond the real max. Must NOT be classified as a
-        # numbering mismatch — reason_code stays None so handle_failed_batch
-        # keeps routing it through the benign all-phantom path.
+        # @decision sha:6b9f0e32 — must stay None here, not misclassified as
+        # a mismatch; see docs/decisions.
         wanted = set(range(14, 28))
         grouped = _grouped(range(1, 14))
         result = match_batch_episodes(wanted, grouped)

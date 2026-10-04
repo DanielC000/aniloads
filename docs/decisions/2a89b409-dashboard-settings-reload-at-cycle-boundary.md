@@ -9,6 +9,15 @@ exactly what does/doesn't take effect without a restart (poll interval, hoster, 
 key and JD/MyJDownloader connection fields reload live; `browserengine`/`browserlocation`
 still need a container restart).
 
+## Why a jdhost/myjd_* edit needs no explicit reconnect
+
+There is no persisted JD/MyJDownloader connection object anywhere in this codebase —
+`animeloads.downloadEpisode`/`downloadBatchCNL` take `jdhost`/`myjd_*` as plain parameters and
+connect fresh on every call (see `animeloads.utils.addToMYJD`/`addToJD`). So once
+`reload_settings_for_cycle` picks up a changed value, "reconnect" is just that updated tuple
+value flowing into the next download call — there is no separate connection state to tear
+down or re-establish.
+
 ## Do not
 
 Don't apply a settings reload mid-cycle — it's deliberately read once at the top of each

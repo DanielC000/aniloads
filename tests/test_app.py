@@ -339,10 +339,8 @@ class MatchAnimeEntryTest(unittest.TestCase):
         self.assertEqual(res["folder_name"], "Mob Psycho 100 II")
 
     def test_custompackage_fallback(self):
-        # A realistic JDownloader folder name (dot-separated release name),
-        # not the space-separated customPackage it should still match —
-        # exercises the tokenized containment check, not a raw substring
-        # that only worked by accident when both sides shared a separator.
+        # @decision 325571d6 — exercises the tokenized containment check
+        # against a real dot-separated release name; see docs/decisions.
         anime = [{"name": "Frieren", "customPackage": "Frieren Dai 2 Ki", "tvdb_season": 2}]
         res = app.match_anime_entry("whatever", "Frieren.Dai.2.Ki.S02E01.1080p-GROUP", anime)
         self.assertEqual(res["folder_name"], "Frieren Dai 2 Ki")
@@ -381,11 +379,8 @@ class MatchAnimeEntryTest(unittest.TestCase):
         self.assertNotIn("/", res["folder_name"])
 
     def test_custompackage_with_colon_and_question_mark_unchanged(self):
-        # These are legal on the Linux media filesystem and common in
-        # anime-loads release names — must round-trip unchanged so an
-        # existing library folder of the same name keeps matching (a real
-        # regression: stripping them would split an existing show into a
-        # second, differently-named folder).
+        # See _safe_folder_segment's docstring: ':'/'?' are legal on Linux
+        # and must round-trip unchanged, or an existing folder splits in two.
         anime = [{"name": "ReZERO", "customPackage":
                   "Re:ZERO -Starting Life in Another World-"}]
         res = app.match_anime_entry("xxx", "ReZERO.S01E01.1080p", anime)
@@ -1849,10 +1844,8 @@ class WatchlistMutationKeyByUrlTest(unittest.TestCase):
         self.assertEqual(app.load_ani()["anime"][0]["missing"], [3])  # untouched
 
     def test_ep_add_beyond_downloaded_count_but_within_site_max_is_allowed(self):
-        # "Add to retry" with the NEXT, not-yet-downloaded episode (episodes+1)
-        # is the documented manual override for an episode published ahead of
-        # its TVDB airdate — entry["episodes"] (highest already downloaded)
-        # must NOT be the bound, only the site's known max.
+        # See ep_add_max's docstring: bound is the site's announced total,
+        # never entry["episodes"] (highest already downloaded).
         a = {"name": "A", "url": "http://x/a", "episodes": 6,
              "al_max_episodes": 12, "missing": []}
         app.save_ani({"anime": [a]})
@@ -1870,10 +1863,8 @@ class WatchlistMutationKeyByUrlTest(unittest.TestCase):
         self.assertEqual(app.load_ani()["anime"][0]["missing"], [])
 
     def test_ep_add_ignores_al_available_max(self):
-        # al_available_max is the CURRENTLY-PUBLISHED cap (the phantom-episode
-        # guard) — the early-release override is by definition adding an
-        # episode beyond it, so it must never bound /ep-add. Only
-        # al_max_episodes (the site's announced total) does.
+        # See ep_add_max's docstring: al_available_max must never bound
+        # /ep-add, only al_max_episodes does.
         a = {"name": "A", "url": "http://x/a", "episodes": 6,
              "al_available_max": 6, "al_max_episodes": 12, "missing": []}
         app.save_ani({"anime": [a]})
@@ -2079,11 +2070,8 @@ class ConfigUtf8Test(unittest.TestCase):
         self.assertEqual(loaded["last_run"]["detail"], detail)
 
     def test_undecodable_run_state_degrades_to_empty_state(self):
-        # 0x80 alone is a well-defined character under cp1252 (so a
-        # platform-default `open` would silently mangle rather than fail
-        # here) but is not valid standalone UTF-8 — reading it with
-        # encoding="utf-8" raises UnicodeDecodeError, which must degrade to
-        # {} rather than propagate as a 500.
+        # @decision sha:d136846b — UnicodeDecodeError must degrade to {}
+        # rather than propagate as a 500; see docs/decisions.
         with open(self._rs_path, "wb") as f:
             f.write(b'{"last_run": {"detail": "\x80"}}')
         self.assertEqual(app.load_run_state(), {})
@@ -2930,10 +2918,8 @@ class RunMoveCycleTest(unittest.TestCase):
             os.path.join(self.media, "Bleach", "S01", "Bleach.S01E17.mkv")))
 
     def test_negative_offset_taking_episode_to_zero_or_below_goes_stuck(self):
-        # A season/offset set from the dashboard's Edit panel (card
-        # 363098a6) needs no tvdb_id, so a steep negative offset on a low
-        # parsed episode is directly reachable — must not file a bogus E00
-        # or negative episode.
+        # @decision 363098a6 — guard the result rather than file a bogus
+        # E00 or negative episode; see docs/decisions.
         self._write_ani([{"name": "Frieren", "media_type": "series", "episode_offset": -12}])
         self._make_dl("Frieren.S01", ["Frieren.S01E05.mkv"])
         events = app.run_move_cycle()
@@ -3162,10 +3148,8 @@ class RunMoveCycleTest(unittest.TestCase):
         self.assertNotIn(key, app._stuck_items)
 
     def test_unmatched_download_with_existing_library_folder_files_normally(self):
-        # No watchlist entry at all, but a folder for the parsed name already
-        # exists in the library (e.g. a show removed from the watchlist, or a
-        # manual JDownloader add of something already in Plex) — this must
-        # file normally, not go stuck, matching main's existing-folder lookup.
+        # No watchlist entry, but an existing library folder for the parsed
+        # name (e.g. removed from the watchlist) still files normally.
         self._write_ani([])
         os.makedirs(os.path.join(self.media, "Old Show"))
         self._make_dl("Old.Show.S01", ["Old.Show.S01E01.mkv"])
@@ -3190,10 +3174,8 @@ class RunMoveCycleTest(unittest.TestCase):
         self.assertEqual(app._stuck_items, {})
 
     def test_existing_unmatched_stuck_item_autofiles_on_next_pass_once_matched(self):
-        # Scope 3: a stuck record written by an OLDER build (before this
-        # matching fix) sitting in _stuck_items must resolve on the very
-        # next ordinary mover pass, with no special re-check needed —
-        # run_move_cycle already re-scans DOWNLOAD_DIR unconditionally.
+        # @decision 325571d6 — a pre-fix stuck record resolves on the next
+        # ordinary mover pass, no special re-check needed; see docs/decisions.
         self._write_ani([{"name": "Tokyo Revengers", "media_type": "series", "tvdb_season": 4}])
         dirname = "Tokyo.Revengers.2021.German.1080p.WebDL-GROUP"
         filename = "Tokyo.Revengers.2021.S04E01.German.ML.AAC.1080p.WebDL.x264-GROUP.mkv"
@@ -3251,14 +3233,9 @@ class RunMoveCycleTest(unittest.TestCase):
         self.assertFalse(os.path.isdir(os.path.join(self.media, "a")))
 
     def test_colon_title_matches_existing_folder_without_touching_filesystem(self):
-        # Regression guard: ':' and '?' are legal on the real (Linux) media
-        # filesystem and common in anime-loads release names, so match-time
-        # sanitization must leave them alone — otherwise an existing library
-        # folder using them would stop matching and get a second, mangled
-        # folder created alongside it. Exercised at the match_anime_entry
-        # level (not a real os.makedirs) because ':'/'?' are themselves
-        # illegal in a real directory name on this Windows dev/CI host, even
-        # though they're legal on the Linux host this code actually runs on.
+        # See _safe_folder_segment's docstring. Exercised at the
+        # match_anime_entry level, not a real os.makedirs, since ':'/'?' are
+        # themselves illegal in a real directory name on this Windows host.
         existing_folder = "Re:ZERO -Starting Life in Another World-"
         self._write_ani([{"name": "ReZERO", "media_type": "series",
                            "customPackage": existing_folder}])
@@ -3350,10 +3327,8 @@ class RunMoveCycleTest(unittest.TestCase):
         self.assertEqual(len(stuck), 1)
 
     def test_mover_containment_check_blocks_movie_escape(self):
-        # _movie_target_name already sanitizes internally, so to exercise the
-        # mover's OWN containment check for the movie branch (defense in
-        # depth against a future regression there), patch it out directly
-        # rather than going through match_anime_entry.
+        # _movie_target_name already sanitizes internally, so patch it out
+        # directly to exercise the mover's OWN containment check instead.
         self._write_ani([{"name": "Evil", "media_type": "movie"}])
         orig_target_name = app._movie_target_name
         app._movie_target_name = lambda display_title, year: "../../escaped"
@@ -3772,10 +3747,8 @@ class ApplyResolvedPendingTest(unittest.TestCase):
         self.assertEqual([e["url"] for e in data["anime"]], ["https://x/a"])
 
     def test_user_removed_pending_entry_mid_scrape_stays_removed(self):
-        # The dashboard removed this pending entry (via its own single-lock
-        # update) while the resolver was mid-scrape on it — the fresh
-        # snapshot no longer has it, so the resolved result must NOT
-        # resurrect it into "anime".
+        # See apply_resolved_pending's docstring: a URL no longer in the
+        # fresh pending list is a no-op, never resurrected into "anime".
         data = {"pending": [], "anime": []}
         resolved = [{"url": "https://x/a", "name": "A", "episodes": 0, "missing": []}]
         app.apply_resolved_pending(data, resolved)
@@ -7524,10 +7497,8 @@ class AddUrlValidatorIntegrationTest(unittest.TestCase):
                 self.assertNotIn("URL must be", result.get("msg", ""))
 
     def test_existing_odd_url_entry_still_renders_and_is_removable(self):
-        # An entry saved before this validator existed (or added by some
-        # other path) with a url that would now fail is_valid_anime_url —
-        # it must keep rendering and stay removable; only NEW input is
-        # gated, never an already-stored entry.
+        # See is_valid_anime_url's docstring: it gates only NEW input, never
+        # an already-stored entry's url.
         odd_url = "https://anime-loads.org/anime/legacy-entry"
         app.save_ani({"settings": {}, "anime": [
             {"name": "Legacy", "url": odd_url, "episodes": 0, "missing": []},
@@ -8477,11 +8448,8 @@ class MoveStartupWaitTest(unittest.TestCase):
         start = time.time()
         app._move_startup_wait()
         elapsed = time.time() - start
-        # threading.Event.wait(timeout) can return a fraction of a
-        # millisecond before the nominal timeout on Windows (OS timer/
-        # scheduler granularity, not a bug in _move_startup_wait itself),
-        # so assert against the delay minus a small tolerance rather than
-        # the exact value.
+        # @decision sha:99247a09 — assert with a tolerance, not the exact
+        # delay; see docs/decisions.
         self.assertGreaterEqual(elapsed, 0.1 - 0.02)
         self.assertFalse(app._move_trigger.is_set())
 

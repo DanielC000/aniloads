@@ -141,10 +141,8 @@ class SaveTest(unittest.TestCase):
     @unittest.skipUnless(hasattr(os, "chmod") and sys.platform != "win32",
                           "POSIX file mode bits only")
     def test_existing_file_mode_is_preserved_across_save(self):
-        # The bot (root, no `user:` in compose) and the dashboard (a
-        # configured PUID/PGID) share this file across two containers —
-        # tempfile.mkstemp's default 0600 replacing straight over it would
-        # silently lock one of those two users out on the very next save.
+        # Cross-container sharing (root bot, PUID/PGID dashboard): see
+        # anistore._match_permissions for why mkstemp's 0600 must not leak.
         anistore.save(self._path, {"anime": []})
         os.chmod(self._path, 0o640)
         anistore.save(self._path, {"anime": [{"name": "A"}]})
@@ -153,10 +151,8 @@ class SaveTest(unittest.TestCase):
     @unittest.skipUnless(hasattr(os, "chmod") and sys.platform != "win32",
                           "POSIX file mode bits only")
     def test_new_file_is_not_left_at_mkstemp_default_mode(self):
-        # mkstemp's own default (0600) must not leak through for a brand new
-        # file either — that's tighter than a plain open(path, "w") would
-        # produce, and just as capable of locking out the other container's
-        # user.
+        # Same cross-container concern, for a brand new file: see
+        # anistore._match_permissions.
         anistore.save(self._path, {"anime": []})
         mode = stat.S_IMODE(os.stat(self._path).st_mode)
         self.assertNotEqual(mode, 0o600)
@@ -227,13 +223,8 @@ class LockedTest(unittest.TestCase):
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
                       "root bypasses POSIX permission bits")
     def test_lock_unwritable_by_caller_raises_clear_error_not_silent_fallback(self):
-        # anistore.locked() opens O_RDWR, not O_RDONLY: on NFS without
-        # local_lock, flock() is emulated with POSIX byte-range locks, and
-        # an exclusive lock on a read-only fd raises EBADF there (the
-        # outage this module exists to prevent). A lock file the caller
-        # can't write to must surface a clear, actionable error instead of
-        # silently falling back to a read-only open that would reproduce
-        # that same EBADF.
+        # @decision sha:dfa3f451 — don't fall back to O_RDONLY on EACCES;
+        # see docs/decisions.
         lock_path = self._path + ".lock"
         with anistore.locked(self._path):
             pass
@@ -583,12 +574,9 @@ class NfsLockRegressionTest(unittest.TestCase):
             with anistore.locked(self._path):
                 pass  # must not raise
 
-        # Demonstrate the failure mode this avoids: flock() against a fd
-        # that was never opened O_RDWR (as the pre-fix O_RDONLY open would
-        # produce) raises EBADF under this same fake NFS emulation. Use a
-        # sentinel fd number guaranteed absent from `writable_fds` rather
-        # than a fresh real fd -- real fd numbers get reused after close,
-        # so a newly-opened fd could collide with one already recorded.
+        # @decision sha:dfa3f451 — demonstrates the EBADF failure mode the
+        # O_RDWR open avoids; see docs/decisions. Sentinel fd, not a fresh
+        # real one, since real fd numbers get reused after close.
         never_writable_fd = max(writable_fds, default=0) + 1000
         with self.assertRaises(OSError) as cm:
             fake_fcntl.flock(never_writable_fd, fake_fcntl.LOCK_EX)
@@ -622,12 +610,8 @@ class NfsLockRegressionTest(unittest.TestCase):
         self.assertIn("chmod 666", str(cm.exception))
 
     def test_concurrent_threads_never_overlap_in_critical_section(self):
-        # (d) Would be RED on 75f16d0's design (no process-local
-        # serialization at all): with a fake flock that grants LOCK_EX to
-        # every fd unconditionally -- emulating NFS's per-PROCESS lock
-        # ownership, where two threads in this process can each "acquire"
-        # successfully -- only anistore.locked()'s own threading.RLock can
-        # still keep two threads out of the critical section at once.
+        # @decision sha:dfa3f451 — the RLock, not the fake-granted flock,
+        # is what serializes these threads; see docs/decisions.
         active = 0
         max_active = 0
         counter_lock = threading.Lock()
@@ -660,10 +644,8 @@ class NfsLockRegressionTest(unittest.TestCase):
         self.assertEqual(max_active, 1)
 
     def test_nested_same_thread_lock_does_not_deadlock_and_opens_one_fd(self):
-        # (e) Would hang (deadlock) on a naive fix that reuses a plain
-        # (non-reentrant) lock per path without depth tracking; would open
-        # a second fd (and, on the old code, drop the outer POSIX lock on
-        # close) without the depth guard.
+        # @decision sha:dfa3f451 — a nested locked(path) call must not
+        # open a second fd; see docs/decisions.
         open_calls = []
         real_open = os.open
 

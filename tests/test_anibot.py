@@ -568,15 +568,8 @@ class ConfigUtf8Test(unittest.TestCase):
         self.assertEqual(result[3], location)  # browserlocation
 
     def test_write_run_state_write_open_uses_utf8_encoding(self):
-        # A content round-trip can't catch a missing encoding="utf-8" on the
-        # *write* side here: write_run_state's json.dump call keeps the
-        # default ensure_ascii=True, so non-ASCII output is always escaped to
-        # plain-ASCII \uXXXX sequences regardless of which codec the file was
-        # opened with — a round-trip test would pass identically whether or
-        # not the fix is applied (confirmed: reverting just the write-side
-        # `open(tmp, "w", ...)` back to platform-default left a pure-content
-        # round-trip test green). So this asserts the open() call itself
-        # instead, which does regress if the encoding kwarg is dropped.
+        # @decision sha:d5b5f67a — assert the open() call itself, not a
+        # content round-trip; see docs/decisions.
         real_open = builtins.open
         write_calls = []
 
@@ -848,10 +841,8 @@ class HandleFailedBatchTest(unittest.TestCase):
         self.assertEqual(events[0]["detail"], "JDownloader nicht erreichbar")
 
     def test_mismatch_reason_code_is_not_an_error(self):
-        # The live Bleach shape from card 62b4595a: downloadBatchCNL flags
-        # reason_code, and all_wanted (1-7) sit entirely below available_max
-        # (46) — the phantom heuristic alone would (wrongly) call this a
-        # genuine failure. The reason_code must take priority over it.
+        # The live Bleach shape (card 62b4595a): see handle_failed_batch's
+        # docstring for why mismatch takes priority over all-phantom.
         batch_result = {
             "success": False,
             "reason": "wanted 1-7 but release numbers episodes 41-46 — set episode_offset to -40",
@@ -1011,10 +1002,8 @@ class TvdbSkipDecisionTest(unittest.TestCase):
         return tvdb_skip_decision(**defaults)
 
     # -- offset entry: skips until airdate ---------------------------------
-    # Bleach TYBW "The Calamity": site files 41-46, episode_offset -40,
-    # watchlist wants 1-7 → animeentry['episodes'] holds 6 (watchlist/TVDB
-    # numbering) once episodes 1-6 are downloaded; tvdb_season is the season
-    # whose own numbering is 1-7 for that cour.
+    # Bleach TYBW fixture: tvdb_season's own numbering (1-7) is what
+    # animeentry['episodes'] counts in here, not the release's site numbering.
     def test_offset_entry_skips_until_future_airdate(self):
         d = self._decide(series_status="Continuing", tvdb_season=4, episodes=6,
                           airdate="2026-09-24", missing_count=0)
@@ -1229,11 +1218,8 @@ class SleepUntilNextCycleTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
     def test_trigger_already_present_never_sleeps(self):
-        # Simulates a request that arrived *during the previous cycle* (not
-        # during this sleep) — by the time this sleep call begins, the file
-        # is already sitting there, so it must return instantly without
-        # ever calling sleep_fn. This is how a mid-cycle trigger is honored
-        # right after the cycle ends, never by interrupting it.
+        # @decision sha:2468ef04 — honored after the cycle, never mid-cycle;
+        # see docs/decisions.
         with open(self.trigger_path, "w", encoding="utf-8") as f:
             f.write("2026-06-13T19:00:00Z")
         calls = []
@@ -1313,10 +1299,8 @@ class ResolveForceCheckTest(unittest.TestCase):
         self.assertFalse(anibot.resolve_force_check(self.path, "http://x/nope"))
 
     def test_entry_removed_mid_cycle_does_not_resurrect_it(self):
-        # The bot's per-cycle snapshot still has this entry (with
-        # force_check=True from before the cycle started), but the
-        # dashboard has since removed it from the on-disk file — the fresh
-        # peek must see it as gone, not resurrect it via the unset merge.
+        # See resolve_force_check's docstring: a removed entry is simply not
+        # found in the fresh read, so nothing is cleared or resurrected.
         self._write([{"name": "Other", "url": "http://x/other"}])
         self.assertFalse(anibot.resolve_force_check(self.path, "http://x/a"))
         anime = self._read()["anime"]
@@ -1765,12 +1749,8 @@ class ReloadSettingsForCycleTest(unittest.TestCase):
         self.assertEqual(updated[5], 120)  # timedelay
 
     def test_changed_jdhost_flows_into_the_next_download_call(self):
-        # There is no persisted JD/MyJD connection object anywhere in this
-        # codebase -- animeloads.downloadEpisode/downloadBatchCNL take
-        # jdhost/myjd_* as plain parameters and connect fresh on every call
-        # (see animeloads.utils.addToMYJD/addToJD). So "reconnect" is just:
-        # the updated tuple value flowing into the *next* download call,
-        # which this asserts.
+        # @decision 2a89b409 — "reconnect" is just the updated tuple value
+        # flowing into the next download call; see docs/decisions.
         self._write_settings(jdhost="127.0.0.1")
         current = self._current()
 

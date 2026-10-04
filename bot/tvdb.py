@@ -36,10 +36,7 @@ class TVDBClient:
         self.available = bool(api_key)
         self._token = None
         self._token_expiry = 0
-        # Shared across the dashboard's request-handling threads (this client
-        # is a single module-level instance, see web/app.py's `tvdb = ...`) —
-        # without it, two threads racing _ensure_token when the cached token
-        # is expired both see it as invalid and both fire a redundant login.
+        # @decision sha:0b9d6f06 — don't drop this lock; see docs/decisions.
         self._token_lock = threading.Lock()
 
     def _login(self):

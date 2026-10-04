@@ -10,17 +10,12 @@ LOG_DIR = os.environ.get("LOG_DIR", "/config/logs")
 LOG_FILE = os.path.join(LOG_DIR, "anibot.log")
 LOGLEVEL = getattr(logging, os.environ.get("LOGLEVEL", "INFO").upper(), logging.INFO)
 
-# Days before a skip_until date to start scraping anyway. The bot defers
-# scraping a "Continuing" series until skip_until (the TVDB-predicted airdate),
-# but anime-loads.org sometimes publishes an episode early. Once today is within
-# this many days of skip_until, the bot scrapes anyway to catch the early
-# release. 0 disables (strict skip_until honoring). See should_scrape_despite_skip().
+# @decision sha:c81015e4 — don't remove without another way to catch anime-loads.org
+# releases published ahead of TVDB's predicted airdate.
 EARLY_SCRAPE_DAYS = int(os.environ.get("EARLY_SCRAPE_DAYS", "1"))
 
-# Hours between re-checks when TVDB's predicted airdate has already passed but
-# anime-loads.org hasn't published the episode yet. Without this throttle, a
-# "Continuing" series with a past-due airdate has no future skip_until to defer
-# to and gets scraped every poll cycle until the episode appears.
+# @decision sha:a0c2534a — don't drop; a past-due airdate has no future skip_until
+# to defer to, so without this throttle it gets scraped every poll cycle.
 TVDB_PASTDUE_RECHECK_HOURS = float(os.environ.get("TVDB_PASTDUE_RECHECK_HOURS", "2"))
 
 _stdout_handler = logging.StreamHandler(sys.stdout)
@@ -83,10 +78,8 @@ def is_docker():
     return False
 
 def log(message, pushbullet):
-    # Pushbullet no longer gets a push per call (that pushed every attempt,
-    # not just outcomes) — it now receives the same one-per-cycle summary as
-    # the other notify targets, sent from _notify_cycle(). `pushbullet` is
-    # kept as a parameter for call-site compatibility but is unused here.
+    # @decision sha:27f020e9 — don't push per call here; every call site already
+    # expects one cycle-summary notification from _notify_cycle().
     _log.info(message)
 
 def _pushkey_set(pushkey):
@@ -225,37 +218,9 @@ def tvdb_skip_decision(series_status, tvdb_season, tvdb_ep_count, airdate, episo
 
     return no_change
 
-# Field-level merge ownership for ani.json anime entries (see
-# anistore.merge_entry_fields, used by startbot()'s per-entry save_ani()).
-#
-# Every field listed here is written ONLY by the bot — verified by grepping
-# every `animeentry[...] =` / `.update(` / `.pop(` in this module. A scalar
-# field is safe to overwrite wholesale on each save because nothing else
-# ever writes it. Fields the dashboard can also edit through its POST
-# handlers — customPackage, tvdb_id, tvdb_season, episode_offset, name, url,
-# releaseID, pref_* overrides, settings — must NEVER be added here: the
-# bot's stale per-cycle snapshot would otherwise silently revert a
-# concurrent dashboard edit on its next save.
-#
-# `missing` is the one field BOTH sides mutate (the dashboard adds/removes a
-# single retry episode; the bot removes a downloaded one and adds a failed
-# one on the same list), so it is handled as a DELTA against the fresh
-# on-disk list, never a wholesale replacement — see BOT_OWNED_LIST_FIELDS
-# and compute_entry_delta() below.
-#
-# `episodes` is shared too: the dashboard sets it when the user says "I
-# already have episodes up to N". It stays in the scalar list, but the bot
-# writes it only through compute_entry_delta(), i.e. only when the bot itself
-# changed it this cycle (advanced it after a download, or rolled it back after
-# an episode turned out unavailable) — and then its value wins, even going
-# DOWN. The bot never writes back a value it merely read. startbot() re-reads
-# the entry fresh at the top of each entry (refresh_entry) and re-reads
-# `episodes` again right before deciding what to download
-# (sync_user_episodes), so a dashboard edit made up to that point is honored
-# this same cycle.
-#
-# `paused` is user-owned like releaseID and the pref_* overrides: the bot
-# only reads it (fresh, at the top of each entry) and never clears it.
+# @decision sha:1cfa177d — don't add a dashboard-editable field (customPackage,
+# tvdb_id, tvdb_season, episode_offset, name, url, releaseID, pref_*, settings)
+# here; see anistore.merge_entry_fields and docs/decisions for the full ownership split.
 BOT_OWNED_SCALAR_FIELDS = (
     "episodes", "skip_until", "skip_real_airdate", "skip_recheck_at",
     "al_status", "al_max_episodes", "al_available_max", "al_available_max_set_at",
@@ -403,13 +368,8 @@ def wanted_episodes(missing, episodes, cur_episodes):
     wanted_new = list(range(episodes + 1, cur_episodes + 1)) if episodes < cur_episodes else []
     return wanted_missing, wanted_new
 
-# Soft run-now: the dashboard drops this trigger file next to ani.json (see
-# web/app.py's trigger_run_now()) instead of restarting the bot container.
-# The bot wakes its inter-cycle sleep early when it appears (sleep_until_next_cycle)
-# and consumes (deletes) it at the start of the cycle it triggers
-# (consume_run_now_trigger) — a request arriving mid-cycle just sits there until
-# that point, so it is always honored *after* the running cycle, never by
-# interrupting it.
+# @decision sha:2468ef04 — a run-now request must only wake the inter-cycle sleep
+# early and get consumed at the next cycle's start, never interrupt an in-flight cycle.
 RUN_NOW_FILE = "run_now"
 RUN_NOW_SLEEP_SLICE = int(os.environ.get("RUN_NOW_SLEEP_SLICE", "5"))
 
@@ -562,13 +522,8 @@ def _boot_backoff(attempt, cap=300):
     Sequence: 5, 10, 20, 40, 80, 160, 300, 300, ... seconds (capped)."""
     return min(cap, 5 * (2 ** min(attempt, 6)))
 
-# Persisted run-state record. The dashboard derives last_run / next_run from
-# this file instead of scraping the rolling container-log tail (the German run
-# markers "Prüfe …"/"Schlafe N Sekunden" roll off the 500-line window under
-# verbose logging, which made the UI show "No runs yet" / "—" while the bot was
-# running fine). Written next to ani.json so the bot and the dashboard share one
-# config dir. The `runs` history is bounded and holds one summary per cycle, so
-# a future run-history UI can render one summary per run from it.
+# @decision sha:7f15a1a9 — don't derive last_run/next_run from the log tail again;
+# those lines roll off the window under verbose logging. Keep run_state.json.
 RUN_STATE_FILE = "run_state.json"
 RUN_STATE_HISTORY_MAX = 50
 EVENTS_CAP = 40
@@ -597,33 +552,9 @@ def _record_event(events, kind, anime, episodes=None, detail=None):
         event["detail"] = str(detail)[:200]
     events.append(event)
 
-# Per-entry check outcome, persisted in run_state.json's additive top-level
-# "entries" key (NOT ani.json — the watchlist store the dashboard also
-# writes; keeping this in run_state.json avoids write contention with it).
-# Answers "why didn't X download?" (UX audit finding 3, card 7bc5a4f0) without
-# scraping logs. Shape, keyed by entry URL:
-#
-#   "entries": {
-#     "<url>": {
-#       "checked_ts": "2026-09-17T02:00:00Z",   # this cycle's check, RFC3339 UTC
-#       "result": "skipped",                     # see ENTRY_RESULTS below
-#       "reason": "waiting for airdate 2026-09-20",  # human-readable, <=200 chars
-#       "episode": 12,                            # optional: the episode a
-#                                                  # downloaded/unavailable/error
-#                                                  # result concerns
-#       "last_error": {                           # optional: survives a LATER
-#         "reason": "JDownloader unreachable",    # non-error result, so "last
-#         "checked_ts": "2026-09-16T14:00:00Z"    # error" stays visible after
-#       }                                          # a subsequent clean skip
-#     }, ...
-#   }
-#
-# One entry per URL (latest outcome only, not a list) — bounded to the
-# current watchlist size since entries no longer on the watchlist are pruned
-# on every write (see _merge_entry_outcomes). Additive: a reader (the web
-# dashboard's later card) must tolerate both the key's absence (older
-# run_state.json) and any per-entry sub-key's absence (episode/last_error are
-# optional).
+# @decision 7bc5a4f0 — persisted in run_state.json (not ani.json) to avoid write
+# contention with the watchlist; see docs/decisions for the full "entries" shape,
+# the additive-reader contract, and the merge rules in _merge_entry_outcomes below.
 ENTRY_RESULTS = ("downloaded", "skipped", "unavailable", "error", "mismatch", "paused")
 
 def _record_entry_outcome(entry_outcomes, url, result, reason, episode=None):
@@ -800,11 +731,8 @@ def write_run_state(started_ts, finished_ts, timedelay, counts, events=None, tri
             runs = prev.get("runs")
             if not isinstance(runs, list):
                 runs = []
-        # ValueError also covers UnicodeDecodeError (a corrupt/non-UTF-8 file):
-        # both it and json.JSONDecodeError subclass ValueError, so this degrades
-        # a bad previous-state file to a fresh history instead of losing the
-        # whole write, without swallowing an unrelated bug as if it were a
-        # corrupt file.
+        # @decision sha:d136846b — keep ValueError (covers UnicodeDecodeError too);
+        # don't narrow to JSONDecodeError or widen to bare Exception.
         except (FileNotFoundError, OSError, ValueError):
             prev = {}
             runs = []
@@ -967,10 +895,8 @@ def load_ani_cycle_start(path):
 def loadconfig():
     try:
         os.makedirs(os.path.dirname(botfolder), exist_ok=True)
-        # Seed a fresh, fully-defaulted ani.json the first time anyone (bot or
-        # dashboard) looks for it — never overwrites a real, existing file
-        # (see anistore.seed_if_missing). Without this, a missing file used to
-        # mean "no/bad config" forever until someone hand-wrote one.
+        # @decision sha:84483803 — see docs/decisions for why this seeds instead of
+        # requiring a hand-written file, and which settings a missing backend is fatal for.
         anistore.seed_if_missing(botfile, config_defaults.default_ani_data)
         infile = open(botfile, "r", encoding="utf-8")
         data = json.load(infile)
@@ -992,11 +918,8 @@ def loadconfig():
                 _log.error("ani.json 'settings' ist kein Objekt / is not an object")
                 return False, False, False, False, False, False, False, False, False, False, False, False, False
 
-            # Missing OPTIONAL keys (anything a hand-edited or partially
-            # upgraded ani.json can simply omit) fall back to
-            # config_defaults.DEFAULT_SETTINGS instead of the old
-            # "Fehlerhafte ani.json Konfiguration" hard failure — only a
-            # missing download backend (below) is actually fatal.
+            # @decision sha:84483803 — a missing optional key falls back to
+            # config_defaults.DEFAULT_SETTINGS, not a hard failure.
             filled, missing = config_defaults.fill_settings_defaults(value)
             if missing:
                 _log.info(
@@ -1017,11 +940,8 @@ def loadconfig():
             jd_deprecated = filled['jd_deprecated']
             jd_deprecatedport = filled['jd_deprecatedport']
 
-            # The one thing loadconfig() truly cannot default: a download
-            # backend. Either a local JDownloader host, or a MyJDownloader
-            # user (its password can still be entered interactively at
-            # startup, see startbot()'s own jdhost=="" and myjd_pass==""
-            # handling) must be configured.
+            # @decision sha:84483803 — a download backend is the one thing
+            # loadconfig() cannot default; don't add a non-empty default for it.
             if not jdhost and not myjd_user:
                 _log.error(
                     "ani.json settings: kein Download-Ziel konfiguriert, setze 'jdhost' "
@@ -1384,9 +1304,6 @@ def addAnime():
                     fullanimedata = data['anime']
                     fullanimedata.append(animedata)
                     data['anime'] = fullanimedata 
-#                animedata = {"anime": animedata}
-#                data.append(animedata)
-
 
                     os.makedirs(os.path.dirname(botfolder), exist_ok=True)
                     jfile = open(botfile, "w", encoding="utf-8")
@@ -1550,8 +1467,6 @@ def addAnime():
                     fullanimedata = data['anime']
                     fullanimedata.append(animedata)
                     data['anime'] = fullanimedata 
-#                animedata = {"anime": animedata}
-#                data.append(animedata)
                     os.makedirs(os.path.dirname(botfolder), exist_ok=True)
                     jfile = open(botfile, "w", encoding="utf-8")
                     jfile.write(json.dumps(data, indent=4, sort_keys=True))
@@ -1755,10 +1670,8 @@ def startbot():
             editconfig()
             jdhost, hoster, browser, browserlocation, pushkey, timedelay, myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport, al_user, al_pass = loadconfig()
         else:
-            # Non-interactive (Docker): do NOT sys.exit — a transient cause such as
-            # the /config volume not being mounted yet on host boot would otherwise
-            # crash-loop the container under `restart: unless-stopped`. Stay alive
-            # and re-read the config with backoff so it self-heals once available.
+            # @decision sha:412fde90 — see docs/decisions; don't sys.exit here or
+            # it crash-loops the container under `restart: unless-stopped`.
             config_attempt += 1
             delay = _boot_backoff(config_attempt)
             _log.error("Keine oder fehlerhafte Konfiguration (Versuch %d) — erneuter Versuch in %ds "
@@ -1771,13 +1684,8 @@ def startbot():
     last_pushkey = pushkey
     notify_targets = notify.parse_targets(os.environ.get("NOTIFY_URL", ""))
 
-    # The animeloads() constructor launches headless Firefox/geckodriver to fetch
-    # DDoS-Guard cookies. A cold-start Selenium failure (resource contention while
-    # the host is still bringing services up, a stale profile/geckodriver hiccup)
-    # raises here. Unguarded, that exception exits the process and crash-loops the
-    # container under `restart: unless-stopped` — the most likely "didn't start
-    # automatically" path. Retry in-process with backoff so a transient failure
-    # self-recovers and the container stays up.
+    # @decision sha:412fde90 — don't let a cold-start Selenium failure here raise
+    # unguarded; see docs/decisions for why it crash-loops the container.
     al = None
     init_attempt = 0
     while al is None:
@@ -1826,10 +1734,8 @@ def startbot():
 
     if(jdhost == "" and myjd_pass == ""):
         if(interactive == False):
-            # Misconfiguration: neither a local JD host nor a MyJDownloader
-            # password. Don't sys.exit (crash-loops under unless-stopped); stay
-            # alive and re-read the config with backoff so the owner can fix it
-            # without manually restarting the container.
+            # @decision sha:412fde90 — don't sys.exit on this misconfiguration
+            # either; see docs/decisions.
             write_waiting_for_config("no MyJDownloader password and no JD host set")
             jdpw_attempt = 0
             while(jdhost == "" and myjd_pass == ""):
@@ -1860,8 +1766,7 @@ def startbot():
         if interactive:
             _log.error("Kein JD port gesetzt. beende...")
             sys.exit(1)
-        # Non-interactive: keep the container alive and re-read config so a fix
-        # (or a late volume mount) is picked up without a manual restart.
+        # @decision sha:412fde90 — same self-heal-instead-of-exit policy; see docs/decisions.
         port_attempt += 1
         delay = _boot_backoff(port_attempt)
         _log.error("Kein JD port gesetzt — Container bleibt aktiv, erneute Pruefung in %ds", delay)
@@ -1871,11 +1776,8 @@ def startbot():
     clear_waiting_for_config()
 
     while(True):
-        # Per-cycle run-state bookkeeping (persisted for the dashboard's
-        # last_run/next_run, independent of the rolling log tail).
-        # Consumed at the START of the cycle it triggers — a request that
-        # arrived mid-cycle just sat in the file until now, so it is always
-        # honored *after* the previous cycle finished, never by interrupting it.
+        # @decision sha:7f15a1a9 — run-now is consumed at the START of the cycle it
+        # triggers, so it's always honored after the previous cycle, never mid-cycle.
         manual_trigger = consume_run_now_trigger(_run_now_path())
         trigger = "manual" if manual_trigger else None
         run_started = _utcnow_iso()
@@ -1884,9 +1786,8 @@ def startbot():
         events = []
         entry_outcomes = {}
 
-        # Apply dashboard settings changes at this cycle boundary (card
-        # 2a89b409) -- see reload_settings_for_cycle's own docstring for
-        # exactly what does/doesn't take effect without a restart.
+        # @decision 2a89b409 — reload happens here, once per cycle, never mid-cycle;
+        # see reload_settings_for_cycle's docstring for what does/doesn't take effect.
         (jdhost, hoster, browser, browserlocation, pushkey, timedelay,
          myjd_user, myjd_pass, myjd_device, jd_deprecated, jd_deprecatedport,
          al_user, al_pass), settings_reloaded, settings_reload_reason = reload_settings_for_cycle(
@@ -1921,12 +1822,8 @@ def startbot():
         try:
             anidata = data['anime']
         except:
-            # No anime configured yet (fresh deploy, or none added via the
-            # dashboard). Do NOT return — that exits the process (exit 0) and
-            # stops/tight-loops the container under `restart: unless-stopped`,
-            # which reads as "the bot won't stay running". Stay alive and
-            # re-check after the poll interval so entries added later via the
-            # dashboard are picked up without a manual container restart.
+            # @decision sha:412fde90 — don't return here either (exits the process);
+            # see docs/decisions.
             recheck = timedelay if isinstance(timedelay, int) and timedelay > 0 else 600
             _log.info("Keine Anime in der Liste — erneute Pruefung in " + str(recheck) + " Sekunden")
             # watchlist_urls=[]: unlike the corrupt-file case above, we DO know
@@ -1967,12 +1864,9 @@ def startbot():
                 missingEpisodes = animeentry['missing']
                 episodes = animeentry['episodes']
 
-                # Baseline for this entry's field-level merge: what's been
-                # persisted so far this cycle (initially, what cycle-start
-                # load_ani_cycle_start() read). save_ani() below diffs the
-                # live `animeentry` against this on each call and writes only
-                # what changed, onto a FRESH re-read of ani.json under the
-                # lock — never the whole stale `data` snapshot.
+                # @decision sha:1cfa177d — save_ani() below diffs animeentry against
+                # this baseline and writes only what changed, onto a FRESH re-read of
+                # ani.json under the lock — never the whole stale `data` snapshot.
                 saved_state = {f: animeentry[f] for f in BOT_OWNED_SCALAR_FIELDS if f in animeentry}
                 saved_state["missing"] = list(missingEpisodes)
 
@@ -1998,10 +1892,8 @@ def startbot():
                     return found
 
                 # --- Smart skip logic -------------------------------------------
-                # force_check: a dashboard "Check now" click on this one entry.
-                # Peeked fresh (not this cycle's snapshot) and cleared unconditionally
-                # right here — a one-shot bypass of Steps 1-4 below, honored at most
-                # once even if the scrape that follows fails.
+                # @decision sha:a4cdbb9f — force_check is a one-shot bypass of Steps
+                # 1-4, cleared unconditionally; see docs/decisions.
                 force_check = resolve_force_check(botfile, url)
                 if force_check:
                     _log.info("[CHECK-NOW] " + name + " — forced check requested, bypassing skip logic")
@@ -2017,10 +1909,8 @@ def startbot():
                     if not save_ani(): continue
                 if decision["skip"]:
                     run_counts["skipped"] += 1
-                    # By this point Step 1 ("already complete") and Step 2
-                    # ("al_status complete", mark_complete above) are the only
-                    # ways `complete` can be set — Step 3 (skip_until) returns
-                    # before ever touching it. So `complete` alone tells them apart.
+                    # @decision sha:26bdb568 — complete alone tells Step 1/2 apart
+                    # from Step 3; see docs/decisions.
                     if animeentry.get('complete'):
                         reason = "complete"
                     elif animeentry.get('skip_real_airdate') and animeentry.get('skip_until'):
@@ -2063,10 +1953,8 @@ def startbot():
                             getattr(_log, level)("[" + tag + "] " + name + " — " + message)
                         if decision["terminal"]:
                             run_counts["skipped"] += 1
-                            # decision["log"][1] is already a human reason for
-                            # every terminal case tvdb_skip_decision can return
-                            # (complete / waiting-for-airdate / TVDB past-due
-                            # recheck throttle / no-airdate-known synthetic skip).
+                            # @decision sha:26bdb568 — don't re-derive this reason;
+                            # see docs/decisions.
                             reason = decision["log"][1] if decision["log"] else "TVDB skip"
                             _record_entry_outcome(entry_outcomes, url, "skipped", reason)
                             continue
@@ -2095,11 +1983,8 @@ def startbot():
                 # updateInfo already called by getAnime — skip redundant call
                 curEpisodes = release.getEpisodeCount()               #Anzahl der Episoden aktuell online
 
-                # Cap curEpisodes by known-available max (DOM may over-report if tabs have no links).
-                # The cap is single-day: a stale cap from a prior day must not permanently hide
-                # episodes that the site has since added. Revalidate by clearing yesterday's cap
-                # when DOM reports more — if those new episodes are still phantom, the batch/single-ep
-                # paths below will re-set the cap with today's date.
+                # @decision sha:a4cdbb9f — the al_available_max cap is single-day,
+                # not permanent; see docs/decisions for why it must be revalidated daily.
                 today_iso = date.today().isoformat()
                 al_available_max = animeentry.get('al_available_max')
                 cap_set_at = animeentry.get('al_available_max_set_at')
@@ -2205,13 +2090,8 @@ def startbot():
                                     _log.warning("[BATCH] Episoden nicht im Batch gefunden: %s — werden beim nächsten Lauf erneut versucht",
                                                  batch_result["episodes_not_found"])
                             else:
-                                # Decide error-vs-benign and refresh the cap in one place
-                                # (see handle_failed_batch). save_ani() stays here so the
-                                # helper remains pure/testable.
-                                # Mirrors handle_failed_batch's own classification (kept in
-                                # sync with it — see that function's docstring) so the
-                                # persisted entry outcome matches the [MISMATCH]/
-                                # [UNAVAILABLE]/[ERROR] tag it actually logged.
+                                # @decision sha:6b9f0e32 — must stay in sync with
+                                # handle_failed_batch's own classification; see docs/decisions.
                                 _batch_max = batch_result.get("available_max")
                                 _all_phantom = (_batch_max is not None and
                                                 all(_e > _batch_max for _e in all_wanted))
@@ -2386,11 +2266,7 @@ def printhelp():
     print("[remove]:  Lösche Anime aus deiner Liste")
 
 
-# CLI dispatch. Guarded by __name__ == "__main__" so that `import anibot`
-# (e.g. from the test suite) does NOT launch the bot, while running the module
-# as a script — `python anibot.py [args]`, the Docker ENTRYPOINT/CMD — still
-# dispatches identically. The if-blocks below don't create a new scope, so the
-# module-level globals botfile/botfolder are reassigned exactly as before.
+# @decision sha:b388c2ba — don't remove this guard; see docs/decisions.
 if __name__ == "__main__":
     commandSet = False
     if(arglen >= 2):

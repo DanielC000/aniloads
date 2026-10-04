@@ -148,23 +148,13 @@ def save(path, data):
         raise
 
 
-# Module-level per-lock-path threading.RLock registry, guarded by its own
-# lock. The homelab's /config is NFS without local_lock, so flock()/fcntl
-# locks are emulated with POSIX byte-range locks there -- and those are
-# owned per PROCESS, not per fd: two threads in this same process can each
-# "acquire" LOCK_EX at once, and closing ANY fd for the file drops every one
-# of this process's locks on it. The dashboard is multithreaded
-# (ThreadingHTTPServer request threads, the resolver thread, the mover
-# thread), so the OS-level lock alone does not serialize concurrent
-# `update_ani` calls within this process on NFS -- this RLock is what does.
+# @decision sha:dfa3f451 — don't rely on the OS-level flock/POSIX lock alone to
+# serialize concurrent update_ani calls in this process; see docs/decisions.
 _PATH_LOCKS_GUARD = threading.Lock()
 _PATH_LOCKS = {}
 
-# Per-thread reentrancy depth, keyed by lock_path. A thread already holding
-# `locked(path)` that calls it again (directly or via a helper) must not
-# open a second fd or flock/close again -- an inner close would drop the
-# outer POSIX lock on NFS. Only the outermost call for a given thread+path
-# actually opens/locks/closes; a nested call just extends the RLock hold.
+# @decision sha:dfa3f451 — a nested locked(path) call must not open/close a
+# second fd; see docs/decisions.
 _THREAD_LOCAL = threading.local()
 
 

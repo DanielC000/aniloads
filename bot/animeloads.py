@@ -217,12 +217,8 @@ def _match_batch_episodes(wanted_episodes, grouped, episode_offset=0):
     reason = None
     if not filtered_links:
         reason = "Keine gewünschten Episoden im Batch gefunden"
-        # Entirely disjoint from `grouped`, but not because every wanted
-        # episode is genuinely beyond what the release has published yet
-        # (that's the benign all-phantom case, left to the caller) — the
-        # release numbers its files in a different scheme. Detected and
-        # suggested only; never auto-applied, since guessing wrong would
-        # push the wrong episodes to JDownloader.
+        # @decision sha:c0b7ab59 — never auto-apply this suggested offset; see
+        # docs/decisions.
         if (wanted_episodes and grouped
                 and not all(ep > available_max_site for ep in site_wanted)):
             reason_code = "episode_numbering_mismatch"
@@ -287,12 +283,9 @@ class animeloads:
         if(searchdata.status_code == 302):  #only 1 result, got redirect
             redir_url = searchdata.headers['Location']
             redir_anime = anime(redir_url, self.session, self)
-            #num__results = 1
             result = searchResult(redir_url, redir_anime.getName(), redir_anime.getType(), redir_anime.getYear(), redir_anime.getCurrentEpisodes(), redir_anime.getMaxEpisodes(), ["UNKNOWN"], ["UNKNOWN"], redir_anime.getMainGenre(), self.session, self)
             searchresults.append(result)
-            # updateInfo() keeps its driver alive for downloadEpisode reuse, but
-            # this anime object is thrown away right here, so quit it now or the
-            # Firefox process leaks on every single-result search.
+            # @decision sha:0a428ed8 — quit this driver here; see docs/decisions.
             try:
                 if getattr(redir_anime, "_driver", None):
                     redir_anime._driver.quit()
@@ -302,7 +295,6 @@ class animeloads:
         else:
             search_dom = etree.HTML(searchdata.text)
             searchboxes = search_dom.xpath("//div/div[@class='panel panel-default' and 1]/div[@class='panel-body' and 1]")
-            #num__results = len(searchboxes)
             for result in searchboxes:
                 url = ""                #done
                 name = ""               #done
@@ -319,8 +311,6 @@ class animeloads:
                 for link in result_links:
                     linktext = link.text
                     href = link.get('href')
-                    #if linktext is None or href is None:
-                    #    continue
                     if("genre" in href):
                         genre = linktext
                     elif("https://www.anime-loads.org/anime-series" in href):
@@ -393,12 +383,6 @@ class animeloads:
 class utils:
     @staticmethod
     def decodeCNL(k, crypted):
-#        k_list = list(k)
-#        tmp = k_list[15]
-#        k_list[15] = k_list[16]
-#        k_list[16] = tmp
-#        k = "".join(k_list)
-
         key = unhexlify(k)
         data = base64.standard_b64decode(crypted)
         obj = AES.new(key, AES.MODE_CBC, key)
@@ -1265,46 +1249,9 @@ class anime():
 
         anime_identifier = self.url.split("/")[len(self.url.split("/"))-1] #Name of Anime, used for POST Request
         unenc_request = "[\"media\",\"" + anime_identifier + "\",\"downloads\"," + str(release.getID()) + "," + str(int(episode)-1) + "]"
-        #print(unenc_request)
         b64 = base64.b64encode(unenc_request.encode("ascii"))
         data = {"enc": b64,
        "response": "nocaptcha"}
-
-        ######################################
-        #Requests code ohne benötigten Browser, wird allerdings als adblock erkannt
-        ######################################
-
-
-#        headers = {
-#        'User-Agent': MODERN_UA,
-#        "Referer": self.url,
-#        "Accept": "application/json, text/javascript, */*; q=0.01",
-#        "Accept-Language": "en-US,en;q=0.5",
-#        "Connection": "keep-alive",
-#        "Content-Length": "83",
-#        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-#        "TE": "Trailers",
-#        "X-Requested-With": "XMLHttpRequest",
-#        "Cookie": "ci_session=a%3A4%3A%7Bs%3A10%3A%22session_id%22%3Bs%3A32%3A%227fda60af7999159425b7143f63cd5202%22%3Bs%3A10%3A%22ip_address%22%3Bs%3A13%3A%2289.244.161.10%22%3Bs%3A10%3A%22user_agent%22%3Bs%3A94%3A%22Mozilla%2F5.0+%28Windows+NT+10.0%3B+Win64%3B+x64%3B+rv%3A78.0%29+Gecko%2F20100101+Firefox%2F78.0+Waterfox%2F78.7.0%22%3Bs%3A13%3A%22last_activity%22%3Bi%3A1612911522%3B%7D3a772b4afefd4887a6eba3fffd868265c5769de6"
-#        }
-
-#        print("Session Cookies: " + str(cock))
-#        r = requests.post("https://webhook.site/75132056-b86a-4285-ab83-2cf785a202a1", data=data, headers=headers)
-#        rad = self.session.get("https://www.anime-loads.org/assets/pub/js/ads.com/ads.js?cb=13881964231")
-#        print(rad.text)
-#        print(rad.status_code)
-#        print(rad.cookies)
-#        r = self.session.post("https://www.anime-loads.org/ajax/captcha", data=data)
-#        print(r.text)
-#        r.raw.decode_content = True
-#        print("Response: " + str(r.text))
-#        cock = [
-#            {'name': c.name, 'value': c.value, 'domain': c.domain, 'path': c.path}
-#            for c in self.session.cookies
-#        ]
-#        print("d_Cock: " + str(cock))
-#        print("\n\n\n\ndl_Other cookies: " + str(r.cookies))
-
 
         # Reuse the browser session from updateInfo if available.
         # This is the same session that loaded the anime page with ads,

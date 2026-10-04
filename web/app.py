@@ -2094,8 +2094,8 @@ def match_anime_entry(parsed_name, dir_basename, anime_list, parsed_season=None)
     as a tiebreaker: when multiple entries share the same generic prefix, the
     one whose `tvdb_season` matches the file's parsed season wins.
     """
-    dir_lower = dir_basename.lower()
-    parsed_lower = parsed_name.lower()
+    dir_tokens = _tokenize(dir_basename)
+    parsed_tokens = _tokenize(parsed_name)
 
     # Try download_folder_pattern first — auto-derived by the bot from the actual
     # release filename, so matches the JD-created folder even when JD ignores
@@ -2127,21 +2127,41 @@ def match_anime_entry(parsed_name, dir_basename, anime_list, parsed_season=None)
 
     # Try matching download dir against customPackage (legacy fallback for entries
     # without a download_folder_pattern, where the user happened to pick a name
-    # that JD also used for the folder).
-    for entry in anime_list:
-        cp = entry.get("customPackage", "")
-        if cp and cp.lower() in dir_lower:
-            return _entry_to_match(entry, cp)
+    # that JD also used for the folder). Tokenized so a dotted/underscored
+    # release name (JDownloader's folder) still matches a space-separated
+    # customPackage/name — comparing the raw strings only ever worked when
+    # both sides happened to use the same separator. Among every entry whose
+    # customPackage is contained, the most-tokens one wins (see
+    # _most_specific_entries) — otherwise a watchlist holding both "Bleach"
+    # and "Bleach Thousand Year Blood War" would file a TYBW release under
+    # whichever entry happens to be listed first.
+    cp_candidates = [(len(_tokenize(entry["customPackage"])), entry)
+                      for entry in anime_list
+                      if entry.get("customPackage") and
+                      _tokens_contained(_tokenize(entry["customPackage"]), dir_tokens)]
+    top = _most_specific_entries(cp_candidates, parsed_season)
+    if top:
+        chosen = top[0][1]
+        return _entry_to_match(chosen, chosen["customPackage"])
 
-    # Try matching download dir against entry name
-    for entry in anime_list:
-        name = entry.get("name", "")
-        if name and name.lower() in dir_lower:
-            return _entry_to_match(entry, entry.get("customPackage", name))
+    # Try matching download dir against entry name — same most-specific-wins
+    # selection as the customPackage step above.
+    name_candidates = [(len(_tokenize(entry["name"])), entry)
+                        for entry in anime_list
+                        if entry.get("name") and
+                        _tokens_contained(_tokenize(entry["name"]), dir_tokens)]
+    top = _most_specific_entries(name_candidates, parsed_season)
+    if top:
+        chosen = top[0][1]
+        return _entry_to_match(chosen, chosen.get("customPackage", chosen["name"]))
 
-    # Try matching parsed filename name against entry name
+    # Try matching parsed filename name against entry name, tolerating a
+    # release year present on exactly one side (e.g. "Foo.2021.S01E01" vs a
+    # watchlist entry named just "Foo") — a year present on BOTH sides must
+    # still differ to fail, so two distinct years never get treated as the
+    # same show.
     for entry in anime_list:
-        if entry.get("name", "").lower() == parsed_lower:
+        if _tokens_equal_year_tolerant(_tokenize(entry.get("name", "")), parsed_tokens):
             return _entry_to_match(entry, entry.get("customPackage", entry["name"]))
 
     return {
@@ -2211,6 +2231,81 @@ def _token_prefix_score(pattern, dir_name):
     return score
 
 
+_YEAR_TOKEN_RE = re.compile(r'(19|20)\d{2}')
+
+
+def _is_year_token(token):
+    return bool(_YEAR_TOKEN_RE.fullmatch(token))
+
+
+def _strip_single_year(tokens):
+    """Return (core_tokens, year) when `tokens` contains EXACTLY one
+    year-like token (anywhere in the list), else (tokens, None) unchanged.
+
+    Zero or multiple year-like tokens are ambiguous about which one (if any)
+    is a release year rather than part of the title itself, so they're left
+    alone rather than guessed at.
+    """
+    years = [t for t in tokens if _is_year_token(t)]
+    if len(years) != 1:
+        return tokens, None
+    idx = tokens.index(years[0])
+    return tokens[:idx] + tokens[idx + 1:], years[0]
+
+
+def _tokens_equal_year_tolerant(a_tokens, b_tokens):
+    # @decision 325571d6 — only ever drop a year token that has no
+    # counterpart on the other side; see docs/decisions/325571d6-*.md.
+    """Token-list equality tolerating a release year present on exactly one
+    side (e.g. a release filename carrying "2021" that the watchlist
+    entry's name doesn't)."""
+    if a_tokens == b_tokens:
+        return True
+    a_core, a_year = _strip_single_year(a_tokens)
+    b_core, b_year = _strip_single_year(b_tokens)
+    if a_year and b_year:
+        return False
+    if a_year and a_core:
+        return a_core == b_tokens
+    if b_year and b_core:
+        return b_core == a_tokens
+    return False
+
+
+def _tokens_contained(needle_tokens, haystack_tokens):
+    # @decision 325571d6 — single-token needle anchors at haystack[0];
+    # see docs/decisions/325571d6-*.md.
+    """True if `needle_tokens` appears as a contiguous run inside
+    `haystack_tokens`."""
+    n = len(needle_tokens)
+    if n == 0:
+        return False
+    if n == 1:
+        return bool(haystack_tokens) and haystack_tokens[0] == needle_tokens[0]
+    for i in range(len(haystack_tokens) - n + 1):
+        if haystack_tokens[i:i + n] == needle_tokens:
+            return True
+    return False
+
+
+def _most_specific_entries(candidates, parsed_season):
+    # @decision 325571d6 — the most-tokens entry wins a containment match
+    # (e.g. "Bleach Thousand Year Blood War" over "Bleach"); see
+    # docs/decisions/325571d6-*.md.
+    """From a list of (token_count, entry) pairs, return the sublist with the
+    most tokens, tie-broken by tvdb_season == parsed_season when given, else
+    left in their original (anime_list) order."""
+    if not candidates:
+        return []
+    max_len = max(c[0] for c in candidates)
+    top = [c for c in candidates if c[0] == max_len]
+    if parsed_season is not None and len(top) > 1:
+        season_hits = [c for c in top if c[1].get("tvdb_season") == parsed_season]
+        if season_hits:
+            top = season_hits
+    return top
+
+
 def _movie_target_name(display_title, year):
     """Plex movie naming: 'Title (Year)' if year known, else 'Title'."""
     base = _sanitize_folder(display_title) or "Unknown"
@@ -2266,14 +2361,18 @@ def _stuck_key(rel_path, reason):
     return "{}::{}".format(rel_path, reason)
 
 
-def _stuck_touch(rel_path, reason, entry_name, msg, entry_url="", episode=None):
+def _stuck_touch(rel_path, reason, entry_name, msg, entry_url="", episode=None,
+                  would_create_folder=""):
     """Record (or refresh) a stuck item, keyed by its path under DOWNLOAD_DIR
     and the reason it's stuck. ``entry_url`` / ``episode`` (the watchlist
     entry and library episode, when the mover knows them) let a watchlist card
     show this download's trail; older records lack both, see
-    entry_download_trails. Returns (is_new, ignored, move_anyway) —
-    move_anyway is a one-shot flag consumed here, so clicking "Move anyway"
-    only applies to the very next cycle."""
+    entry_download_trails. ``would_create_folder`` (an "unmatched" item only)
+    names the folder a "Move anyway" would create, for the dashboard's button
+    label — an older record lacks it too, and the render falls back to a
+    generic label rather than assume it's present. Returns (is_new, ignored,
+    move_anyway) — move_anyway is a one-shot flag consumed here, so clicking
+    "Move anyway" only applies to the very next cycle."""
     key = _stuck_key(rel_path, reason)
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     with _move_lock:
@@ -2295,6 +2394,8 @@ def _stuck_touch(rel_path, reason, entry_name, msg, entry_url="", episode=None):
             rec["entry_url"] = entry_url
         if isinstance(episode, int):
             rec["episode"] = episode
+        if would_create_folder:
+            rec["would_create_folder"] = would_create_folder
         move_anyway = rec.pop("move_anyway", False)
         ignored = rec.get("ignored", False)
     return is_new, ignored, move_anyway
@@ -2428,12 +2529,19 @@ def _cleanup_download_dir(dir_path):
                 pass
 
 
-_STUCK_ASSIGNABLE_REASONS = ("parse", "loose")
+_STUCK_ASSIGNABLE_REASONS = ("parse", "loose", "unmatched")
 
 
 def stuck_assign(key, entry_url, season_raw, episode_raw):
-    """Manually assign a season/episode to a "parse" or "loose" stuck item
-    and move it through the normal library layout, one-off.
+    """Manually assign a season/episode to a "parse", "loose" or "unmatched"
+    stuck item and move it through the normal library layout, one-off.
+
+    For an "unmatched" item (which DID parse a season/episode, it just had
+    no watchlist entry) the dashboard recomputes season/episode client-side
+    from the chosen entry's tvdb_season/episode_offset before the form is
+    submitted (see _render_stuck_assign_form) — this function still treats
+    season_raw/episode_raw as the literal final values, same as it always
+    has for "parse"/"loose", so that contract (and its tests) stay unchanged.
 
     Security: the source path is resolved from the server-side stuck store
     ONLY (``key`` is the sole path-bearing input trusted from the form —
@@ -2492,11 +2600,11 @@ def stuck_assign(key, entry_url, season_raw, episode_raw):
     except OSError as e:
         return False, "Error: failed to move {}: {}".format(src_name, e)
 
-    # Subtitle sidecars are only chased for a "parse" item, whose source dir
-    # is a real single package folder — a "loose" file's dirname is
-    # DOWNLOAD_DIR itself, and _move_subtitles walks recursively, so reusing
-    # it there could sweep in an unrelated package's sidecar.
-    if rec.get("reason") == "parse":
+    # Subtitle sidecars are only chased for a "parse"/"unmatched" item, whose
+    # source dir is a real single package folder — a "loose" file's dirname
+    # is DOWNLOAD_DIR itself, and _move_subtitles walks recursively, so
+    # reusing it there could sweep in an unrelated package's sidecar.
+    if rec.get("reason") in ("parse", "unmatched"):
         video_stem = os.path.splitext(src_name)[0]
         new_stem = os.path.splitext(new_filename)[0]
         src_dir = os.path.dirname(src_path)
@@ -2687,7 +2795,9 @@ def run_move_cycle():
                 if not match.get("matched", True) and not existing:
                     msg = "{} — no watchlist match (would create '{}')".format(
                         filename, match["folder_name"])
-                    is_new, ignored, move_anyway = _stuck_touch(rel_path, "unmatched", entry_name, msg)
+                    is_new, ignored, move_anyway = _stuck_touch(
+                        rel_path, "unmatched", entry_name, msg,
+                        would_create_folder=match["folder_name"])
                     if not move_anyway:
                         if is_new and not ignored:
                             events.append({"type": "error", "msg": msg})
@@ -3361,6 +3471,34 @@ document.addEventListener('submit', function(e) {
   var dst = e.target.querySelector('input[type=hidden][name=have_episodes]');
   if (src && dst) dst.value = src.value || '0';
 }, true);
+
+// Unmatched-stuck assign form: picking a series recomputes Season/Episode
+// from that entry's tvdb_season/episode_offset against the file's own
+// parsed values (data-parsed-season/-episode on the select) — still
+// editable afterward, and the inputs' own values are what actually submits,
+// so this is pure UX sugar; with JS disabled the raw parsed values submit.
+document.addEventListener('change', function(e) {
+  var sel = e.target;
+  if (!sel.classList || !sel.classList.contains('stuck-assign-recompute')) return;
+  var opt = sel.options[sel.selectedIndex];
+  if (!opt || !opt.value) return;
+  var form = sel.closest('form');
+  if (!form) return;
+  var seasonInput = form.querySelector('input[name="season"]');
+  var episodeInput = form.querySelector('input[name="episode"]');
+  var parsedSeason = sel.getAttribute('data-parsed-season');
+  var parsedEpisode = sel.getAttribute('data-parsed-episode');
+  var tvdbSeason = opt.getAttribute('data-tvdb-season');
+  var offsetRaw = opt.getAttribute('data-episode-offset');
+  if (seasonInput) {
+    seasonInput.value = tvdbSeason || parsedSeason || seasonInput.value;
+  }
+  if (episodeInput && parsedEpisode) {
+    var offset = parseInt(offsetRaw, 10);
+    var ep = parseInt(parsedEpisode, 10) + (isNaN(offset) ? 0 : offset);
+    if (ep >= 1) episodeInput.value = ep;
+  }
+});
 
 function scrapeBusy(form, label) {
   var btn = form.querySelector('button[type=submit]');
@@ -4135,7 +4273,10 @@ def _stuck_folder_prefill(rec, anime_list):
     folder-name guess, reusing the same ``match_anime_entry`` logic the
     mover itself uses for an automatic move. A "loose" item's ``dir`` is
     just the bare filename, not a folder — there's nothing folder-shaped to
-    match against, so its entry is always picked by hand.
+    match against, so its entry is always picked by hand. An "unmatched"
+    item already failed exactly this lookup (that's why it's stuck), so
+    there's no entry to guess here either — see
+    _render_stuck_assign_form's client-side recompute instead.
     """
     if rec.get("reason") != "parse":
         return "", ""
@@ -4146,12 +4287,34 @@ def _stuck_folder_prefill(rec, anime_list):
     return match.get("url", ""), ("" if season is None else str(season))
 
 
+def _stuck_parsed_season_episode(rec):
+    """(season, episode) parsed fresh from the stuck item's own filename, at
+    render time rather than persisted — so a record written before this
+    existed (or by an older build) still renders a correct prefill with no
+    `/config` schema change. Returns (None, None) if the filename no longer
+    parses (shouldn't happen for an "unmatched" item, which got stuck
+    precisely because it DID parse)."""
+    parsed = parse_season_episode(os.path.basename(rec.get("path", "")))
+    if not parsed:
+        return None, None
+    _, season, episode = parsed
+    return season, episode
+
+
 def _render_stuck_assign_form(rec, anime_list, idx):
-    """The "assign season/episode and move" form for a "parse"/"loose" stuck
-    item — the only two reasons the mover can't resolve on its own but a
-    human easily can from the dashboard. Movies are excluded from the entry
-    picker (they have no season/episode of their own); the Edit panel is
-    where a movie's own metadata gets fixed instead."""
+    """The "assign season/episode and move" form for a "parse"/"loose"/
+    "unmatched" stuck item — the reasons the mover can't resolve on its own
+    but a human easily can from the dashboard. Movies are excluded from the
+    entry picker (they have no season/episode of their own); the Edit panel
+    is where a movie's own metadata gets fixed instead.
+
+    For "unmatched" the Season/Episode inputs start from the file's own
+    parsed (pre-offset) values; picking a series then recomputes them
+    client-side from that entry's tvdb_season/episode_offset (see the
+    "stuck-assign-recompute" JS below) — still editable, and still exactly
+    the literal values stuck_assign() uses, so its contract is unchanged.
+    With JS disabled, the raw parsed values submit as-is.
+    """
     if rec.get("reason") not in _STUCK_ASSIGNABLE_REASONS:
         return ""
 
@@ -4161,13 +4324,35 @@ def _render_stuck_assign_form(rec, anime_list, idx):
         return '<p class="wl-edit-hint">No series in the watchlist to assign to.</p>'
 
     prefill_url, prefill_season = _stuck_folder_prefill(rec, anime_list)
+    prefill_episode = ""
+    recompute = rec.get("reason") == "unmatched"
+    if recompute:
+        parsed_season, parsed_episode = _stuck_parsed_season_episode(rec)
+        if parsed_season is not None:
+            prefill_season = str(parsed_season)
+        if parsed_episode is not None:
+            prefill_episode = str(parsed_episode)
+
+    select_attrs = ""
+    select_class = "wl-select"
+    if recompute:
+        select_class += " stuck-assign-recompute"
+        select_attrs = ' data-parsed-season="{}" data-parsed-episode="{}"'.format(
+            escape(prefill_season), escape(prefill_episode))
+
     options = '<option value="">-- choose series --</option>'
     for e in series_entries:
         url = e.get("url", "")
         name = e.get("display_title") or e.get("name", "")
-        options += '<option value="{v}"{sel}>{t}</option>'.format(
+        option_attrs = ""
+        if recompute:
+            tvdb_season = e.get("tvdb_season")
+            offset = e.get("episode_offset", 0) or 0
+            option_attrs = ' data-tvdb-season="{}" data-episode-offset="{}"'.format(
+                "" if tvdb_season is None else tvdb_season, offset)
+        options += '<option value="{v}"{sel}{attrs}>{t}</option>'.format(
             v=escape(url, quote=True), t=escape(name),
-            sel=" selected" if url == prefill_url else "")
+            sel=" selected" if url == prefill_url else "", attrs=option_attrs)
 
     key_input = '<input type="hidden" name="key" value="{}">'.format(escape(rec.get("key", "")))
     return """
@@ -4176,7 +4361,7 @@ def _render_stuck_assign_form(rec, anime_list, idx):
             <div class="wl-prefs" role="group" aria-label="Assign season and episode">
               <div class="wl-field">
                 <label for="assign-entry-{idx}">Series</label>
-                <select id="assign-entry-{idx}" name="entry" class="wl-select" required>{options}</select>
+                <select id="assign-entry-{idx}" name="entry" class="{select_class}"{select_attrs} required>{options}</select>
               </div>
               <div class="wl-field" style="flex-basis:90px;">
                 <label for="assign-season-{idx}">Season</label>
@@ -4186,13 +4371,14 @@ def _render_stuck_assign_form(rec, anime_list, idx):
               <div class="wl-field" style="flex-basis:90px;">
                 <label for="assign-episode-{idx}">Episode</label>
                 <input type="number" id="assign-episode-{idx}" name="episode" min="1" max="9999"
-                       inputmode="numeric" required class="wl-num">
+                       value="{episode}" inputmode="numeric" required class="wl-num">
               </div>
               <button type="submit" class="btn btn-sm">Assign &amp; move</button>
             </div>
             <p class="wl-edit-hint">Movies aren't listed here — edit that entry directly instead.</p>
           </form>""".format(key_input=key_input, idx=idx, options=options,
-                            season=escape(prefill_season))
+                            season=escape(prefill_season), episode=escape(prefill_episode),
+                            select_class=select_class, select_attrs=select_attrs)
 
 
 def render_move_stuck(anime_list=None):
@@ -4239,11 +4425,14 @@ def render_move_stuck(anime_list=None):
                 <button type="submit" class="btn btn-danger btn-sm" onclick="{confirm}">Delete download copy</button>
               </form>""".format(key_input=key_input, confirm=delete_confirm)
         elif reason == "unmatched":
+            folder = rec.get("would_create_folder")
+            anyway_label = ('Create "{}" and move'.format(folder) if folder
+                             else "Create new folder and move")
             actions += """
               <form method="POST" action="/move-stuck-anyway" style="display:inline;margin:0;">
                 {key_input}
-                <button type="submit" class="btn btn-warning btn-sm">Move anyway</button>
-              </form>""".format(key_input=key_input)
+                <button type="submit" class="btn btn-warning btn-sm">{label}</button>
+              </form>""".format(key_input=key_input, label=escape(anyway_label))
 
         # The folder a "parse" item is stuck inside — not otherwise shown,
         # and needed context for picking the right series below.

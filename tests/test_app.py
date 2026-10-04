@@ -339,8 +339,12 @@ class MatchAnimeEntryTest(unittest.TestCase):
         self.assertEqual(res["folder_name"], "Mob Psycho 100 II")
 
     def test_custompackage_fallback(self):
+        # A realistic JDownloader folder name (dot-separated release name),
+        # not the space-separated customPackage it should still match —
+        # exercises the tokenized containment check, not a raw substring
+        # that only worked by accident when both sides shared a separator.
         anime = [{"name": "Frieren", "customPackage": "Frieren Dai 2 Ki", "tvdb_season": 2}]
-        res = app.match_anime_entry("whatever", "somefolder.frieren dai 2 ki.x", anime)
+        res = app.match_anime_entry("whatever", "Frieren.Dai.2.Ki.S02E01.1080p-GROUP", anime)
         self.assertEqual(res["folder_name"], "Frieren Dai 2 Ki")
         self.assertEqual(res["tvdb_season"], 2)
 
@@ -392,6 +396,97 @@ class MatchAnimeEntryTest(unittest.TestCase):
         res2 = app.match_anime_entry("xxx", "DanMachi.S01E01.1080p", anime2)
         self.assertEqual(res2["folder_name"],
                           "Is It Wrong to Try to Pick Up Girls in a Dungeon?")
+
+
+class MatchAnimeEntryYearToleranceTest(unittest.TestCase):
+    """match_anime_entry's tokenized + year-tolerant comparison (card
+    325571d6) — a release year present on exactly one side must not block a
+    match, but a year present on BOTH sides must still differ to fail."""
+
+    def test_year_in_release_name_matches_entry_without_year(self):
+        # The owner's actual stuck download: a release year the watchlist
+        # entry's own name doesn't carry.
+        anime = [{"name": "Tokyo Revengers", "tvdb_season": 4}]
+        res = app.match_anime_entry("Tokyo Revengers 2021", "misc_download_dir", anime)
+        self.assertTrue(res["matched"])
+        self.assertEqual(res["folder_name"], "Tokyo Revengers")
+
+    def test_year_present_on_both_sides_and_equal_still_matches(self):
+        # No regression: an entry whose own name legitimately includes the
+        # year must keep matching the same-year release exactly as before.
+        anime = [{"name": "Foo 2021", "tvdb_season": 1}]
+        res = app.match_anime_entry("Foo 2021", "misc_download_dir", anime)
+        self.assertTrue(res["matched"])
+        self.assertEqual(res["folder_name"], "Foo 2021")
+
+    def test_different_year_on_both_sides_does_not_match(self):
+        # Two distinct years must never be treated as the same show.
+        anime = [{"name": "Foo 2021", "tvdb_season": 1}]
+        res = app.match_anime_entry("Foo 2023", "misc_download_dir", anime)
+        self.assertFalse(res["matched"])
+
+    def test_different_show_negative_case(self):
+        anime = [{"name": "Tokyo Revengers", "tvdb_season": 4}]
+        res = app.match_anime_entry("Some Other Show 2021", "misc_download_dir", anime)
+        self.assertFalse(res["matched"])
+
+    def test_short_token_name_does_not_match_mid_name(self):
+        # A short/generic single-token watchlist name must not match an
+        # unrelated release that merely contains that token mid-name.
+        anime = [{"name": "86", "tvdb_season": 1}]
+        res = app.match_anime_entry("Fate 86 Project", "fate.86.project.s01e01", anime)
+        self.assertFalse(res["matched"])
+
+    def test_short_token_name_matches_when_anchored_first(self):
+        anime = [{"name": "86", "tvdb_season": 1}]
+        res = app.match_anime_entry("86", "86.S01E01.1080p-GROUP", anime)
+        self.assertTrue(res["matched"])
+
+    def test_separator_variants_all_match(self):
+        anime = [{"name": "Tokyo Revengers", "tvdb_season": 4}]
+        for dir_name in ("Tokyo.Revengers.S04E01", "Tokyo_Revengers_S04E01",
+                          "Tokyo-Revengers-S04E01", "Tokyo Revengers S04E01"):
+            with self.subTest(dir_name=dir_name):
+                res = app.match_anime_entry("whatever", dir_name, anime)
+                self.assertTrue(res["matched"])
+
+
+class MatchAnimeEntryMostSpecificContainmentTest(unittest.TestCase):
+    """match_anime_entry's name/customPackage containment steps (card
+    325571d6 review): with tokenizing, containment now actually fires on
+    real dotted folder names — so a watchlist holding both "Bleach" and
+    "Bleach Thousand Year Blood War" must not let a TYBW release fall onto
+    the shorter "Bleach" entry just because it's listed first (a real past
+    incident with Bleach's episode offset)."""
+
+    def test_name_step_picks_most_specific_regardless_of_list_order(self):
+        bleach = {"name": "Bleach", "tvdb_season": 1}
+        tybw = {"name": "Bleach Thousand Year Blood War", "tvdb_season": 17}
+        for anime in ([bleach, tybw], [tybw, bleach]):
+            with self.subTest(order=[e["name"] for e in anime]):
+                res = app.match_anime_entry(
+                    "whatever", "Bleach.Thousand.Year.Blood.War.S01E05.1080p-GROUP", anime)
+                self.assertEqual(res["folder_name"], "Bleach Thousand Year Blood War")
+                self.assertEqual(res["tvdb_season"], 17)
+
+                res2 = app.match_anime_entry("whatever", "Bleach.S01E01.1080p", anime)
+                self.assertEqual(res2["folder_name"], "Bleach")
+                self.assertEqual(res2["tvdb_season"], 1)
+
+    def test_custompackage_step_picks_most_specific_regardless_of_list_order(self):
+        bleach = {"name": "Bleach", "customPackage": "Bleach", "tvdb_season": 1}
+        tybw = {"name": "Bleach TYBW", "customPackage": "Bleach Thousand Year Blood War",
+                "tvdb_season": 17}
+        for anime in ([bleach, tybw], [tybw, bleach]):
+            with self.subTest(order=[e["customPackage"] for e in anime]):
+                res = app.match_anime_entry(
+                    "whatever", "Bleach.Thousand.Year.Blood.War.S01E05.1080p-GROUP", anime)
+                self.assertEqual(res["folder_name"], "Bleach Thousand Year Blood War")
+                self.assertEqual(res["tvdb_season"], 17)
+
+                res2 = app.match_anime_entry("whatever", "Bleach.S01E01.1080p", anime)
+                self.assertEqual(res2["folder_name"], "Bleach")
+                self.assertEqual(res2["tvdb_season"], 1)
 
 
 class SafeFolderSegmentTest(unittest.TestCase):
@@ -3079,6 +3174,43 @@ class RunMoveCycleTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(
             os.path.join(self.media, "Old Show", "S01", "Old.Show.S01E01.mkv")))
         self.assertEqual(app._stuck_items, {})
+
+    def test_year_in_release_name_matches_watchlist_entry_and_its_folder(self):
+        # End-to-end regression for card 325571d6: a release year the
+        # watchlist entry's own name doesn't carry must not send this to the
+        # unmatched/stuck path or create a bogus "...2021" folder.
+        self._write_ani([{"name": "Tokyo Revengers", "media_type": "series", "tvdb_season": 4}])
+        self._make_dl("Tokyo.Revengers.2021.German.1080p.WebDL-GROUP",
+                      ["Tokyo.Revengers.2021.S04E01.German.ML.AAC.1080p.WebDL.x264-GROUP.mkv"])
+        events = app.run_move_cycle()
+        self.assertIn("moved", self._types(events))
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.media, "Tokyo Revengers", "S04",
+            "Tokyo.Revengers.2021.S04E01.German.ML.AAC.1080p.WebDL.x264-GROUP.mkv")))
+        self.assertEqual(app._stuck_items, {})
+
+    def test_existing_unmatched_stuck_item_autofiles_on_next_pass_once_matched(self):
+        # Scope 3: a stuck record written by an OLDER build (before this
+        # matching fix) sitting in _stuck_items must resolve on the very
+        # next ordinary mover pass, with no special re-check needed —
+        # run_move_cycle already re-scans DOWNLOAD_DIR unconditionally.
+        self._write_ani([{"name": "Tokyo Revengers", "media_type": "series", "tvdb_season": 4}])
+        dirname = "Tokyo.Revengers.2021.German.1080p.WebDL-GROUP"
+        filename = "Tokyo.Revengers.2021.S04E01.German.ML.AAC.1080p.WebDL.x264-GROUP.mkv"
+        self._make_dl(dirname, [filename])
+        rel_path = os.path.join(dirname, filename)
+        key = app._stuck_key(rel_path, "unmatched")
+        app._stuck_items[key] = {
+            "key": key, "reason": "unmatched", "dir": dirname, "path": rel_path,
+            "ignored": False, "first_seen": "2026-01-01T00:00:00",
+            "last_seen": "2026-01-01T00:00:00",
+            "msg": "{} — no watchlist match (would create 'Tokyo Revengers 2021')".format(filename),
+        }
+        events = app.run_move_cycle()
+        self.assertIn("moved", self._types(events))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.media, "Tokyo Revengers", "S04", filename)))
+        self.assertNotIn(key, app._stuck_items)
 
     def test_ignored_stuck_item_stops_repeating(self):
         self._write_ani([{"name": "Akira", "media_type": "series"}])
@@ -6973,8 +7105,9 @@ class StuckAssignTest(unittest.TestCase):
         self.assertEqual(msg, "Error: stuck item not found")
 
     def test_assign_wrong_reason_not_actionable_here(self):
-        # An "exists"/"unmatched"/"unsafe_folder" stuck item has its own
-        # dedicated action — this route only ever acts on "parse"/"loose".
+        # An "exists"/"unsafe_folder"/"bad_offset" stuck item has its own
+        # dedicated action instead — this route only acts on
+        # "parse"/"loose"/"unmatched".
         app._stuck_items["k-exists"] = {
             "key": "k-exists", "reason": "exists", "ignored": False,
             "msg": "x", "path": "d/x.mkv", "dir": "d",
@@ -7041,6 +7174,58 @@ class StuckAssignTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("no longer exists", msg)
 
+    # --- "unmatched" items (card 325571d6): same stuck_assign() machinery,
+    # reused rather than re-implemented. ---
+
+    def _make_unmatched_stuck(self, dirname, filename):
+        """A package-folder download that doesn't match any watchlist entry,
+        run through one move cycle so it's recorded as a real "unmatched"
+        stuck item — never hand-crafted — and return its key."""
+        d = os.path.join(self.download, dirname)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("x")
+        self._age(path)
+        app.run_move_cycle()
+        stuck = [v for v in app._stuck_items.values() if v["reason"] == "unmatched"]
+        self.assertEqual(len(stuck), 1)
+        return stuck[0]["key"]
+
+    def test_assign_unmatched_item_happy_path(self):
+        self._write_ani([{"name": "Kaiju No 8", "url": "http://x/kaiju", "media_type": "series"}])
+        key = self._make_unmatched_stuck("Totally.Unrelated.Folder",
+                                          "Totally.Unrelated.S01E05.mkv")
+        ok, msg = app.stuck_assign(key, "http://x/kaiju", "1", "5")
+        self.assertTrue(ok, msg)
+        dest = os.path.join(self.media, "Kaiju No 8", "S01", "Totally.Unrelated.S01E05.mkv")
+        self.assertTrue(os.path.isfile(dest))
+        self.assertNotIn(key, app._stuck_items)
+
+    def test_assign_unmatched_item_movie_entry_rejected(self):
+        self._write_ani([{"name": "Akira", "url": "http://x/akira",
+                           "media_type": "movie", "year": 1988}])
+        key = self._make_unmatched_stuck("Totally.Unrelated.Folder",
+                                          "Totally.Unrelated.S01E05.mkv")
+        ok, msg = app.stuck_assign(key, "http://x/akira", "1", "5")
+        self.assertFalse(ok)
+        self.assertIn("movies aren't supported", msg.lower())
+        self.assertIn(key, app._stuck_items)
+
+    def test_assign_unmatched_item_out_of_range_season_rejected(self):
+        self._write_ani([{"name": "Kaiju No 8", "url": "http://x/kaiju", "media_type": "series"}])
+        key = self._make_unmatched_stuck("Totally.Unrelated.Folder",
+                                          "Totally.Unrelated.S01E05.mkv")
+        ok, msg = app.stuck_assign(key, "http://x/kaiju", "0", "5")
+        self.assertFalse(ok)
+        self.assertIn("out of range", msg)
+        self.assertIn(key, app._stuck_items)
+
+    def test_assign_unmatched_item_bad_key_rejected(self):
+        ok, msg = app.stuck_assign("does-not-exist::unmatched", "http://x/kaiju", "1", "5")
+        self.assertFalse(ok)
+        self.assertEqual(msg, "Error: stuck item not found")
+
 
 class RenderMoveStuckAssignFormTest(unittest.TestCase):
     """render_move_stuck(anime_list): the assign form for "parse"/"loose"
@@ -7099,6 +7284,49 @@ class RenderMoveStuckAssignFormTest(unittest.TestCase):
         }
         out = app.render_move_stuck([])
         self.assertNotIn("/move-stuck-assign", out)
+
+    def test_unmatched_item_renders_assign_form_with_recompute_data_attrs(self):
+        # Season/episode are derived at render time from the stuck item's
+        # own path (card 325571d6, manager direction #2) — no persisted
+        # parsed_season/parsed_episode fields needed on the record.
+        app._stuck_items["k6"] = {
+            "key": "k6", "reason": "unmatched", "ignored": False,
+            "msg": "no watchlist match", "path": "d/Tokyo.Revengers.2021.S04E01.mkv",
+            "dir": "d", "first_seen": "t", "last_seen": "t",
+        }
+        anime_list = [{"name": "Tokyo Revengers", "url": "http://x/tr",
+                        "media_type": "series", "tvdb_season": 4, "episode_offset": 2}]
+        out = app.render_move_stuck(anime_list)
+        self.assertIn("/move-stuck-assign", out)
+        self.assertIn("stuck-assign-recompute", out)
+        self.assertIn('data-parsed-season="4"', out)
+        self.assertIn('data-parsed-episode="1"', out)
+        self.assertIn('data-tvdb-season="4"', out)
+        self.assertIn('data-episode-offset="2"', out)
+        # Visible/editable before submit, not just available via JS.
+        self.assertIn('value="4"', out)
+        self.assertIn('value="1"', out)
+
+    def test_unmatched_item_create_folder_button_names_the_folder(self):
+        app._stuck_items["k7"] = {
+            "key": "k7", "reason": "unmatched", "ignored": False,
+            "msg": "no watchlist match", "path": "d/Show.S01E01.mkv", "dir": "d",
+            "first_seen": "t", "last_seen": "t",
+            "would_create_folder": "Tokyo Revengers 2021",
+        }
+        out = app.render_move_stuck([])
+        self.assertIn('Create &quot;Tokyo Revengers 2021&quot; and move', out)
+        self.assertNotIn(">Move anyway<", out)
+
+    def test_unmatched_item_without_would_create_folder_falls_back(self):
+        # An older stuck record written before this field existed.
+        app._stuck_items["k8"] = {
+            "key": "k8", "reason": "unmatched", "ignored": False,
+            "msg": "no watchlist match", "path": "d/Show.S01E01.mkv", "dir": "d",
+            "first_seen": "t", "last_seen": "t",
+        }
+        out = app.render_move_stuck([])
+        self.assertIn("Create new folder and move", out)
 
     def test_corrupt_ani_json_degrades_to_empty_entry_list(self):
         # render_move_stuck()'s own default-load path (the /api/status

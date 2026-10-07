@@ -126,6 +126,22 @@ def _format_ep_range(episodes):
     return "%d-%d" % (eps[0], eps[-1])
 
 
+def _count_episode_links(rel_dom, relID):
+    """Count real per-episode download anchors for `relID` within `rel_dom`.
+
+    Every per-episode anchor's `aria-controls` is `downloads_episodes_<relID>_<n>`
+    (0-based), but the release's single "Click'n'Load alle Folgen!"
+    batch-download-all anchor is `downloads_episodes_<relID>_cnl` — sharing
+    the exact same prefix. A bare `starts-with` match over-counts by one
+    (that "download all" button, not a 27th episode); exclude it explicitly.
+    """
+    prefix = "downloads_episodes_%d_" % relID
+    all_eps = rel_dom.xpath(
+        "//a[starts-with(@aria-controls, '" + prefix + "') "
+        "and @aria-controls != '" + prefix + "cnl']")
+    return len(all_eps)
+
+
 def _group_urls_by_episode(decoded_urls, total_episodes):
     """Group decrypted URL byte-strings by episode number.
 
@@ -1029,8 +1045,7 @@ class anime():
                 #UGLY CODE END
                 ##############
                 _t_ep = time.time()
-                all_eps = rel_dom.xpath("//a[starts-with(@aria-controls, 'downloads_episodes_" + str(relID) + "_')]")
-                epnum = len(all_eps)
+                epnum = _count_episode_links(rel_dom, relID)
                 _log.debug("updateInfo: release %d/%d: %s %s — %d eps (xpath %.3fs)",
                            relID, numReleases, group, res, epnum, time.time() - _t_ep)
 

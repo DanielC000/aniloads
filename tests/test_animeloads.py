@@ -2,13 +2,31 @@
 
 import unittest
 
+from lxml import etree
+
 import support
 
 animeloads = support.load_animeloads()
 match_batch_episodes = animeloads._match_batch_episodes
 format_ep_range = animeloads._format_ep_range
+count_episode_links = animeloads._count_episode_links
 searchResult = animeloads.searchResult
 apihelper = animeloads.apihelper
+
+
+def _release_dom(relID, episode_count, with_cnl_anchor=True):
+    """Build a minimal HTML fragment mirroring a release's download anchors:
+    `episode_count` per-episode anchors (`downloads_episodes_<relID>_0..N-1`)
+    plus, when requested, the "Click'n'Load alle Folgen!" batch-download-all
+    anchor (`downloads_episodes_<relID>_cnl`) that real release pages also
+    carry (card c3074a3c: this shares the per-episode anchors' prefix and
+    was previously miscounted as an extra episode)."""
+    anchors = []
+    if with_cnl_anchor:
+        anchors.append('<a aria-controls="downloads_episodes_%d_cnl">Alle Folgen</a>' % relID)
+    for i in range(episode_count):
+        anchors.append('<a aria-controls="downloads_episodes_%d_%d">%d</a>' % (relID, i, i + 1))
+    return etree.HTML("<html><body>%s</body></html>" % "".join(anchors))
 
 
 def _grouped(episode_numbers):
@@ -169,6 +187,28 @@ class SearchAnimeBuilderTest(unittest.TestCase):
         self.assertEqual(out[0]["dubs"], "German")
         self.assertEqual(out[1]["dubs"], "")
         self.assertEqual(out[1]["subs"], "English")
+
+
+class CountEpisodeLinksTest(unittest.TestCase):
+    """card c3074a3c: the "Click'n'Load alle Folgen!" batch-download-all
+    anchor (`downloads_episodes_<relID>_cnl`) shares its prefix with every
+    real per-episode anchor, so a bare `starts-with` xpath over-counts a
+    26-episode release as 27 (one Gantz release 4 actually hit in
+    production)."""
+
+    def test_cnl_anchor_is_not_counted_as_an_episode(self):
+        dom = _release_dom(relID=4, episode_count=26, with_cnl_anchor=True)
+        self.assertEqual(count_episode_links(dom, 4), 26)
+
+    def test_release_with_no_cnl_anchor_counts_unchanged(self):
+        dom = _release_dom(relID=4, episode_count=26, with_cnl_anchor=False)
+        self.assertEqual(count_episode_links(dom, 4), 26)
+
+    def test_only_matches_the_given_release_id(self):
+        # relID 1's anchors (including its own _cnl) must not bleed into
+        # relID's count — the prefix match is release-scoped.
+        dom = _release_dom(relID=1, episode_count=5, with_cnl_anchor=True)
+        self.assertEqual(count_episode_links(dom, 2), 0)
 
 
 class GetSearchURLEncodingTest(unittest.TestCase):

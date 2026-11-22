@@ -268,6 +268,21 @@ def compute_entry_delta(before, after, scalar_fields=BOT_OWNED_SCALAR_FIELDS,
     return fields, unset, list_deltas
 
 
+def merge_entry_fields_or_skip(path, url, fields=None, unset=None, list_deltas=None):
+    """``anistore.merge_entry_fields`` for the bot's per-cycle saves, which
+    must never crash the cycle: if the store refuses the write (file missing
+    right now, corrupt, or a write the guard rejects) log it at ERROR and
+    return None — the caller skips just this save and carries on. Otherwise
+    returns the usual found/not-found bool."""
+    try:
+        return anistore.merge_entry_fields(
+            path, "anime", url, fields=fields, unset=unset, list_deltas=list_deltas)
+    except (anistore.MissingStoreError, anistore.UnsafeWriteError,
+            anistore.CorruptStoreError) as e:
+        _log.error("[anistore] bot save for %s skipped: %s", url, e)
+        return None
+
+
 def _peek_entry(path, url):
     """A fresh on-disk copy of `url`'s anime entry, read under the lock.
 
@@ -452,7 +467,7 @@ def resolve_force_check(path, url):
             pending = bool(entry.get('force_check'))
             break
     if pending:
-        anistore.merge_entry_fields(path, "anime", url, unset=["force_check"])
+        merge_entry_fields_or_skip(path, url, unset=["force_check"])
     return pending
 
 def pre_scrape_skip_decision(animeentry, name, missing_count, episodes, force_check, today):
@@ -1881,8 +1896,12 @@ def startbot():
                     fields, unset, list_deltas = compute_entry_delta(saved_state, animeentry)
                     if not fields and not unset and not list_deltas:
                         return True
-                    found = anistore.merge_entry_fields(
-                        botfile, "anime", url, fields=fields, unset=unset, list_deltas=list_deltas)
+                    found = merge_entry_fields_or_skip(
+                        botfile, url, fields=fields, unset=unset, list_deltas=list_deltas)
+                    if found is None:
+                        # Save skipped (logged): saved_state stays put, so the
+                        # next save re-sends the same delta. Keep going.
+                        return True
                     if found:
                         saved_state.update(fields)
                         for f in unset:

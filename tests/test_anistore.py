@@ -277,12 +277,15 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(result, {"anime": [{"name": "REPLACED"}]})
         self.assertEqual(anistore.load(self._path), {"anime": [{"name": "REPLACED"}]})
 
-    def test_update_on_missing_file_uses_default(self):
+    def test_update_on_missing_file_raises_and_does_not_create_it(self):
+        # A vanished file must never be silently replaced by the empty default
+        # (first-run seeding is seed_if_missing's job).
         def add_entry(data):
             data["anime"].append({"name": "First"})
 
-        result = anistore.update(self._path, add_entry)
-        self.assertEqual(result["anime"], [{"name": "First"}])
+        with self.assertRaises(anistore.MissingStoreError):
+            anistore.update(self._path, add_entry)
+        self.assertFalse(os.path.exists(self._path))
 
     def test_update_propagates_corrupt_store_error_without_saving(self):
         with open(self._path, "w", encoding="utf-8") as f:
@@ -294,6 +297,130 @@ class UpdateTest(unittest.TestCase):
         # File must be untouched — still the same corrupt bytes.
         with open(self._path, "r", encoding="utf-8") as f:
             self.assertEqual(f.read(), "not json")
+
+
+def _drop_first(data):
+    data["anime"].pop(0)
+
+
+class WriteGuardTest(unittest.TestCase):
+    """Only an explicit removal may drop a watchlist entry (card 5fa3b486)."""
+
+    A = {"name": "A", "url": "https://x/a"}
+    B = {"name": "B", "url": "https://x/b"}
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp(prefix="anistore-tests-")
+        self._path = os.path.join(self._dir, "ani.json")
+        anistore.save(self._path, {"settings": {}, "anime": [dict(self.A), dict(self.B)],
+                                   "pending": [{"name": "P", "url": "https://x/p"}]})
+
+    def tearDown(self):
+        for name in os.listdir(self._dir):
+            os.remove(os.path.join(self._dir, name))
+        os.rmdir(self._dir)
+
+    def _urls(self):
+        return [e["url"] for e in anistore.load(self._path)["anime"]]
+
+    def _bak(self):
+        return anistore.backup_path(self._path)
+
+    def test_undeclared_drop_is_refused_and_file_unchanged(self):
+        with open(self._path, "rb") as f:
+            before = f.read()
+        with self.assertLogs("anistore", level="ERROR") as logs:
+            with self.assertRaises(anistore.UnsafeWriteError) as ctx:
+                anistore.update(self._path, _drop_first)
+        self.assertEqual(ctx.exception.lost_urls, ["https://x/a"])
+        with open(self._path, "rb") as f:
+            self.assertEqual(f.read(), before)
+        self.assertFalse(os.path.exists(self._bak()))
+        self.assertIn("https://x/a", logs.output[0])
+
+    def test_replacement_return_that_drops_an_entry_is_refused(self):
+        with self.assertRaises(anistore.UnsafeWriteError):
+            anistore.update(self._path, lambda d: {"anime": [dict(self.B)]})
+        self.assertEqual(self._urls(), ["https://x/a", "https://x/b"])
+
+    def test_clearing_the_anime_list_is_refused(self):
+        with self.assertRaises(anistore.UnsafeWriteError):
+            anistore.update(self._path, lambda d: d.update(anime=[]))
+        self.assertEqual(len(self._urls()), 2)
+
+    def test_declared_removal_is_allowed_and_leaves_a_backup(self):
+        with self.assertLogs("anistore", level="WARNING") as logs:
+            anistore.update(self._path, _drop_first,
+                            removing=["https://x/a"])
+        self.assertEqual(self._urls(), ["https://x/b"])
+        self.assertEqual([e["url"] for e in anistore.load(self._bak())["anime"]],
+                         ["https://x/a", "https://x/b"])
+        self.assertTrue(any("anime count 2->1" in l and "pid" in l for l in logs.output))
+
+    def test_declared_removal_does_not_license_dropping_another(self):
+        with self.assertRaises(anistore.UnsafeWriteError) as ctx:
+            anistore.update(self._path, lambda d: d.update(anime=[]),
+                            removing=["https://x/a"])
+        self.assertEqual(ctx.exception.lost_urls, ["https://x/b"])
+        self.assertEqual(len(self._urls()), 2)
+
+    def test_non_shrinking_write_writes_no_backup(self):
+        anistore.update(self._path, lambda d: d["anime"][0].update(episodes=3))
+        anistore.update(self._path, lambda d: d["anime"].append({"url": "https://x/c"}))
+        self.assertFalse(os.path.exists(self._bak()))
+
+    def test_pending_list_shrinking_is_not_an_anime_removal(self):
+        # /remove-pending and pending -> anime promotion must keep working.
+        def promote(d):
+            d["pending"] = []
+            d["anime"].append({"url": "https://x/p", "name": "P"})
+
+        anistore.update(self._path, promote)
+        self.assertEqual(self._urls(), ["https://x/a", "https://x/b", "https://x/p"])
+        anistore.update(self._path, lambda d: d.update(pending=[]))
+        self.assertFalse(os.path.exists(self._bak()))
+
+    def test_existing_backup_is_overwritten_atomically(self):
+        with open(self._bak(), "w", encoding="utf-8") as f:
+            f.write("old")
+        anistore.update(self._path, _drop_first, removing=["https://x/a"])
+        self.assertEqual(len(anistore.load(self._bak())["anime"]), 2)
+        self.assertEqual([n for n in os.listdir(self._dir) if n.endswith(".tmp")], [])
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX mode bits")
+    def test_backup_keeps_an_existing_backups_mode(self):
+        with open(self._bak(), "w", encoding="utf-8") as f:
+            f.write("old")
+        os.chmod(self._bak(), 0o666)
+        anistore.update(self._path, _drop_first, removing=["https://x/a"])
+        self.assertEqual(stat.S_IMODE(os.stat(self._bak()).st_mode), 0o666)
+
+    def test_unwritable_backup_does_not_block_a_declared_removal(self):
+        real_save = anistore.save
+
+        def flaky_save(path, data):
+            if path.endswith(".bak"):
+                raise OSError("read-only")
+            return real_save(path, data)
+
+        with mock.patch.object(anistore, "save", flaky_save):
+            with self.assertLogs("anistore", level="WARNING"):
+                anistore.update(self._path, _drop_first,
+                                removing=["https://x/a"])
+        self.assertEqual(self._urls(), ["https://x/b"])
+
+    def test_merge_entry_fields_on_missing_file_raises_and_creates_nothing(self):
+        os.remove(self._path)
+        with self.assertRaises(anistore.MissingStoreError):
+            anistore.merge_entry_fields(self._path, "anime", "https://x/a",
+                                        fields={"episodes": 1})
+        self.assertFalse(os.path.exists(self._path))
+
+    def test_seed_if_missing_still_creates_the_first_file(self):
+        os.remove(self._path)
+        self.assertTrue(anistore.seed_if_missing(self._path, lambda: {"settings": {}, "anime": []}))
+        anistore.update(self._path, lambda d: d["anime"].append({"url": "https://x/n"}))
+        self.assertEqual(self._urls(), ["https://x/n"])
 
 
 class SeedIfMissingTest(unittest.TestCase):

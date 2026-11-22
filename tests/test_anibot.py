@@ -1266,6 +1266,42 @@ class ConsumeRunNowTriggerTest(unittest.TestCase):
         self.assertIsNone(anibot.consume_run_now_trigger(self.path))
 
 
+class BotSaveSurvivesRefusedWriteTest(unittest.TestCase):
+    """A refused/failed ani.json write skips that one save, never the cycle."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aniloads-botsave-")
+        self.path = os.path.join(self.tmp, "ani.json")
+
+    def test_missing_file_is_skipped_not_raised_and_not_recreated(self):
+        with self.assertLogs("anibot", level="ERROR"):
+            result = anibot.merge_entry_fields_or_skip(
+                self.path, "http://x/a", fields={"episodes": 1})
+        self.assertIsNone(result)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_refused_write_is_skipped_not_raised(self):
+        err = anibot.anistore.UnsafeWriteError(self.path, ["u"])
+        with mock.patch.object(anibot.anistore, "merge_entry_fields", side_effect=err):
+            with self.assertLogs("anibot", level="ERROR"):
+                self.assertIsNone(anibot.merge_entry_fields_or_skip(self.path, "u"))
+
+    def test_normal_save_returns_found(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"anime": [{"url": "http://x/a", "episodes": 0}]}, f)
+        self.assertTrue(anibot.merge_entry_fields_or_skip(
+            self.path, "http://x/a", fields={"episodes": 2}))
+        self.assertFalse(anibot.merge_entry_fields_or_skip(self.path, "http://x/zzz"))
+
+    def test_force_check_clear_survives_a_refused_write(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"anime": [{"url": "http://x/a", "force_check": True}]}, f)
+        err = anibot.anistore.MissingStoreError(self.path)
+        with mock.patch.object(anibot.anistore, "merge_entry_fields", side_effect=err):
+            with self.assertLogs("anibot", level="ERROR"):
+                self.assertTrue(anibot.resolve_force_check(self.path, "http://x/a"))
+
+
 class ResolveForceCheckTest(unittest.TestCase):
     """Per-entry force_check (dashboard 'Check now'): a one-shot flag the bot
     peeks fresh and clears explicitly, independent of the bot-owned

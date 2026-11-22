@@ -1827,6 +1827,88 @@ class ParseBotLogsStandaloneTest(unittest.TestCase):
         self.assertEqual(runs[1]["events"], [])
 
 
+class WatchlistWriteGuardTest(unittest.TestCase):
+    """Card 5fa3b486: only an explicit /remove may delete a watchlist entry,
+    and a refused write is an error banner, never a 500."""
+
+    def setUp(self):
+        fd, self._path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self._orig_ani = app.ANI_JSON
+        app.ANI_JSON = self._path
+        self.addCleanup(self._cleanup)
+        self.a = {"name": "A", "url": "http://x/a", "episodes": 1, "missing": []}
+        self.b = {"name": "B", "url": "http://x/b", "episodes": 1, "missing": []}
+        app.save_ani({"settings": {}, "anime": [self.a, self.b],
+                      "pending": [{"name": "P", "url": "http://x/p", "status": "pending"}]})
+
+    def _cleanup(self):
+        app.ANI_JSON = self._orig_ani
+        for suffix in ("", ".bak", ".lock"):
+            try:
+                os.remove(self._path + suffix)
+            except OSError:
+                pass
+
+    def _post(self, path, params):
+        captured = {}
+        h = app.Handler.__new__(app.Handler)
+        h.path = path
+        h._read_post = lambda: params
+        h._redirect_msg = lambda msg, level=None, **kw: captured.update(msg=msg, level=level, **kw)
+        h._redirect = _capture_redirect(captured)
+        h._respond = lambda code, html: captured.__setitem__("html", html)
+        h.do_POST()
+        return captured
+
+    def _urls(self):
+        return [e["url"] for e in app.load_ani()["anime"]]
+
+    def test_remove_declares_its_url_logs_it_and_leaves_a_backup(self):
+        with self.assertLogs("anime-web", level="INFO") as logs:
+            result = self._post("/remove", {"key": "http://x/a"})
+        self.assertIn("Removed: A", result["msg"])
+        self.assertEqual(self._urls(), ["http://x/b"])
+        self.assertTrue(any("http://x/a" in l for l in logs.output))
+        self.assertEqual(len(app.anistore.load(self._path + ".bak")["anime"]), 2)
+
+    def test_handler_that_would_drop_an_entry_gets_an_error_banner_not_a_500(self):
+        def evil(entries, url):  # a buggy handler: finds A but also drops B
+            entry = entries[0]
+            del entries[1]
+            return 0, entry
+
+        with open(self._path, "rb") as f:
+            before = f.read()
+        with mock.patch.object(app, "find_entry_by_url", evil):
+            with self.assertLogs("anime-web", level="ERROR"):
+                result = self._post("/mark-incomplete", {"key": "http://x/a"})
+        self.assertEqual(result["level"], "err")
+        self.assertTrue(result["msg"].startswith("Error"))
+        with open(self._path, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_vanished_file_mid_update_is_an_error_banner_and_not_recreated(self):
+        os.remove(self._path)
+        with mock.patch.object(app.anistore, "seed_if_missing", lambda *a, **k: False):
+            with self.assertLogs("anime-web", level="ERROR"):
+                result = self._post("/mark-incomplete", {"key": "http://x/a"})
+        self.assertEqual(result["level"], "err")
+        self.assertFalse(os.path.exists(self._path))
+
+    def test_remove_pending_and_pending_promotion_still_work(self):
+        self._post("/remove-pending", {"key": "http://x/p"})
+        self.assertEqual(app.load_ani()["pending"], [])
+        self.assertEqual(self._urls(), ["http://x/a", "http://x/b"])
+        app.update_ani(lambda d: d.setdefault("pending", []).append(
+            {"name": "Q", "url": "http://x/q", "status": "pending"}))
+        entry = {"url": "http://x/q", "name": "Q", "releaseID": 1, "episodes": 0,
+                 "missing": [], "customPackage": "Q"}
+        app.update_ani(lambda d: app.apply_resolved_pending(d, [entry]))
+        self.assertEqual(self._urls(), ["http://x/a", "http://x/b", "http://x/q"])
+        self.assertEqual(app.load_ani()["pending"], [])
+
+
 class WatchlistMutationKeyByUrlTest(unittest.TestCase):
     """UI-1: watchlist mutations must resolve their target by stable URL, not by
     array index. The ``resolve_pending`` thread pops/appends entries concurrently,

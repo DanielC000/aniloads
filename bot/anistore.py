@@ -16,6 +16,7 @@ Stdlib only.
 import contextlib
 import copy
 import json
+import logging
 import os
 import stat
 import sys
@@ -29,6 +30,8 @@ else:
     import fcntl
 
 DEFAULT_DATA = {"settings": {}, "anime": []}
+
+_log = logging.getLogger("anistore")
 
 
 class CorruptStoreError(Exception):
@@ -45,8 +48,42 @@ class CorruptStoreError(Exception):
         self.cause = cause
 
 
-def load(path, default=None):
+class MissingStoreError(Exception):
+    """The file was expected to exist (a read-modify-write on a store that
+    ``seed_if_missing`` already created) but is not there right now.
+
+    Raised by ``update`` instead of falling back to the empty default: a
+    transient "file not found" (an NFS stale handle or rename race) followed
+    by a save would replace the real watchlist with an empty one. Nothing is
+    written when this is raised.
+    """
+
+    def __init__(self, path):
+        super().__init__("{} is missing; refusing to read-modify-write".format(path))
+        self.path = path
+
+
+class UnsafeWriteError(Exception):
+    """A write would have dropped watchlist entries nobody asked to remove.
+
+    Raised by ``update`` when the saved ``anime`` list would lose a URL that
+    was on disk and the caller did not declare it in ``removing``. Nothing
+    is written when this is raised.
+    """
+
+    def __init__(self, path, lost_urls):
+        self.path = path
+        self.lost_urls = sorted(lost_urls)
+        super().__init__("refusing to drop {} watchlist entr{} from {}: {}".format(
+            len(self.lost_urls), "y" if len(self.lost_urls) == 1 else "ies",
+            path, ", ".join(self.lost_urls)))
+
+
+def load(path, default=None, must_exist=False):
     """Read and parse the JSON file at `path`.
+
+    With ``must_exist=True`` a missing file raises ``MissingStoreError``
+    instead of returning the default (see that class).
 
     Missing file -> a fresh deep copy of `default` (or of DEFAULT_DATA when
     no default is given) — never a shared reference, so one caller mutating
@@ -59,6 +96,8 @@ def load(path, default=None):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
+        if must_exist:
+            raise MissingStoreError(path)
         return copy.deepcopy(default) if default is not None else copy.deepcopy(DEFAULT_DATA)
     except ValueError as e:
         raise CorruptStoreError(path, e) from e
@@ -402,7 +441,25 @@ def merge_entry_fields(path, collection, url, fields=None, unset=None, list_delt
     return result["found"]
 
 
-def update(path, fn, default=None):
+def _anime_urls(data):
+    """The set of URLs in ``data["anime"]`` (entries without a URL ignored);
+    a missing or non-list ``anime`` is an empty set."""
+    items = data.get("anime") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return set()
+    return {e.get("url") for e in items if isinstance(e, dict) and e.get("url")}
+
+
+def _anime_count(data):
+    items = data.get("anime") if isinstance(data, dict) else None
+    return len(items) if isinstance(items, list) else 0
+
+
+def backup_path(path):
+    return str(path) + ".bak"
+
+
+def update(path, fn, default=None, removing=()):
     """Load-modify-save under the lock.
 
     Acquires the lock, loads a fresh copy of the data, calls ``fn(data)`` to
@@ -412,10 +469,41 @@ def update(path, fn, default=None):
     should build on, instead of composing bare load()/save() calls — those
     two calls alone leave a window where another process's write in between
     gets silently clobbered by the stale in-memory copy.
+
+    Only an explicit removal may delete a watchlist entry. If the result
+    would lose any URL that was in ``anime`` on disk and that URL is not in
+    ``removing``, nothing is saved and ``UnsafeWriteError`` is raised. A
+    permitted removal first copies the previous file to ``<path>.bak``. A
+    missing file raises ``MissingStoreError`` rather than starting from
+    ``default`` — first-run seeding is ``seed_if_missing``'s job.
     """
+    removing = set(removing or ())
     with locked(path):
-        data = load(path, default=default)
+        data = load(path, default=default, must_exist=True)
+        before = copy.deepcopy(data)
         result = fn(data)
         data = data if result is None else result
+
+        before_urls, after_urls = _anime_urls(before), _anime_urls(data)
+        lost = before_urls - after_urls - removing
+        caller = getattr(fn, "__name__", repr(fn))
+        if lost:
+            _log.error("[anistore] refused write by %s (pid %d): it would drop %d "
+                       "watchlist entr%s not declared as removed: %s",
+                       caller, os.getpid(), len(lost), "y" if len(lost) == 1 else "ies",
+                       ", ".join(sorted(lost)))
+            raise UnsafeWriteError(path, lost)
+
+        n_before, n_after = _anime_count(before), _anime_count(data)
+        if before_urls - after_urls or n_after < n_before:
+            _log.warning("[anistore] anime count %d->%d (caller %s, pid %d)",
+                         n_before, n_after, caller, os.getpid())
+            try:
+                # save(): atomic tmp + os.replace, owner/mode matched to an
+                # existing .bak so neither container is locked out of it.
+                save(backup_path(path), before)
+            except OSError as e:
+                _log.warning("[anistore] could not write %s: %s", backup_path(path), e)
+
         save(path, data)
         return data

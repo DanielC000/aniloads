@@ -923,7 +923,7 @@ def save_ani(data):
         anistore.save(ANI_JSON, data)
 
 
-def update_ani(fn):
+def update_ani(fn, removing=()):
     """Read-modify-write ani.json in ONE lock hold.
 
     A handler doing load_ani() ... mutate ... save_ani(data) acquires and
@@ -935,9 +935,15 @@ def update_ani(fn):
 
     Seeds a fresh, fully-defaulted ani.json first if none exists yet (see
     load_ani's docstring) — a POST arriving before any GET has must not
-    persist a bare {"settings": {}, ...} skeleton."""
+    persist a bare {"settings": {}, ...} skeleton.
+
+    Only an explicit user removal may drop a watchlist entry: ``removing`` is
+    the URLs fn is allowed to delete from ``anime``. Any other write that
+    would lose one raises anistore.UnsafeWriteError (nothing saved), and a
+    file that vanished mid-update raises anistore.MissingStoreError."""
     anistore.seed_if_missing(ANI_JSON, config_defaults.default_ani_data)
-    return anistore.update(ANI_JSON, fn, default=config_defaults.default_ani_data())
+    return anistore.update(ANI_JSON, fn, default=config_defaults.default_ani_data(),
+                           removing=removing)
 
 
 # ---------------------------------------------------------------------------
@@ -6566,6 +6572,18 @@ class Handler(BaseHTTPRequestHandler):
             self._redirect_msg(
                 "Error: ani.json is corrupt — refused to save. Fix or restore the file, then reload.",
                 level="err")
+        except anistore.UnsafeWriteError as e:
+            _log.error("[watchlist] refused POST %s: %s", parsed.path, e)
+            self._redirect_msg(
+                "Error: refused to save — that change would have dropped {} watchlist "
+                "entr{}. Nothing was changed.".format(
+                    len(e.lost_urls), "y" if len(e.lost_urls) == 1 else "ies"),
+                level="err", anchor=ANCHOR_WATCHLIST)
+        except anistore.MissingStoreError as e:
+            _log.error("[watchlist] refused POST %s: %s", parsed.path, e)
+            self._redirect_msg(
+                "Error: ani.json is missing right now — refused to save. Reload and try again.",
+                level="err", anchor=ANCHOR_WATCHLIST)
 
     def _add_release(self, params, auto_release=None):
         """/add-release: the TVDB step, then the save. Also entered straight
@@ -7147,9 +7165,10 @@ class Handler(BaseHTTPRequestHandler):
                     anime_list.pop(idx)
                     removed = entry
 
-            update_ani(_remove)
+            update_ani(_remove, removing=[entry_url])
             if removed is not None:
-                _log.info("[watchlist] Removed anime: %s", removed.get("name", "?"))
+                _log.info("[watchlist] Removed anime: %s (%s)",
+                          removed.get("name", "?"), removed.get("url", entry_url))
                 self._redirect_msg("Removed: {}".format(removed.get("name", "?")),
                                    anchor=ANCHOR_WATCHLIST)
             else:

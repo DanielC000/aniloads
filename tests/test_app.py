@@ -446,6 +446,72 @@ class MatchAnimeEntryYearToleranceTest(unittest.TestCase):
                 self.assertTrue(res["matched"])
 
 
+class MatchAnimeEntrySubtitleEntryTest(unittest.TestCase):
+    """A watchlist name with a season subtitle ("Show: Subtitle") vs a release
+    whose folder has JDownloader's ':' → ';' rewrite and/or whose filename
+    omits the subtitle (card 621c6372)."""
+
+    SUB = "Tokyo Revengers: War of the Three Titans"
+    FOLDER = "Tokyo Revengers; War of the Three Titans"
+
+    def _anime(self, *names):
+        return [{"name": n, "url": "u" + str(i), "tvdb_season": 4}
+                for i, n in enumerate(names)]
+
+    def test_package_folder_with_semicolon_matches(self):
+        anime = self._anime(self.SUB)
+        for ep in ("S04E02", "S04E03"):
+            with self.subTest(ep=ep):
+                res = app.match_anime_entry(
+                    "Tokyo Revengers 2021", self.FOLDER, anime, parsed_season=4)
+                self.assertTrue(res["matched"])
+                self.assertEqual(res["folder_name"], self.SUB)
+
+    def test_filename_prefix_matches_when_folder_unrelated(self):
+        res = app.match_anime_entry("Tokyo Revengers 2021", "misc_dir",
+                                    self._anime(self.SUB))
+        self.assertTrue(res["matched"])
+        self.assertEqual(res["folder_name"], self.SUB)
+
+    def test_prefix_sharing_entries_most_specific_wins(self):
+        anime = self._anime("Tokyo Revengers", self.SUB)
+        res = app.match_anime_entry("Tokyo Revengers 2021", self.FOLDER, anime)
+        self.assertEqual(res["folder_name"], self.SUB)
+        # Plain folder still resolves to the shorter entry.
+        res = app.match_anime_entry("Tokyo Revengers 2021",
+                                    "Tokyo.Revengers.2021.S01E01", anime)
+        self.assertEqual(res["folder_name"], "Tokyo Revengers")
+
+    def test_ambiguous_prefix_stays_unmatched(self):
+        anime = self._anime(self.SUB, "Tokyo Revengers: Christmas Showdown")
+        res = app.match_anime_entry("Tokyo Revengers 2021", "misc_dir", anime)
+        self.assertFalse(res["matched"])
+
+    def test_one_token_prefix_never_matches(self):
+        res = app.match_anime_entry("Tokyo 2021", "misc_dir", self._anime(self.SUB))
+        self.assertFalse(res["matched"])
+
+    def test_different_subtitle_or_year_does_not_match(self):
+        anime = self._anime(self.SUB)
+        res = app.match_anime_entry("Tokyo Revengers 2021",
+                                    "Tokyo Revengers; Tenjiku Arc", anime)
+        self.assertFalse(res["matched"])
+        anime = self._anime("Tokyo Revengers 2019: Subtitle")
+        res = app.match_anime_entry("Tokyo Revengers 2021", "misc_dir", anime)
+        self.assertFalse(res["matched"])
+
+    def test_apostrophe_and_colon_names_match_own_folders(self):
+        anime = self._anime("JoJo's Bizarre Adventure", "Re:ZERO")
+        res = app.match_anime_entry("x", "JoJo's.Bizarre.Adventure.S01E01", anime)
+        self.assertEqual(res["folder_name"], "JoJo's Bizarre Adventure")
+        res = app.match_anime_entry("x", "Re;ZERO.S01E01", anime)
+        self.assertEqual(res["folder_name"], "Re:ZERO")
+
+    def test_unmatched_folder_name_unchanged(self):
+        res = app.match_anime_entry("Foo: Bar 2021", "misc_dir", [])
+        self.assertEqual(res["folder_name"], "Foo: Bar 2021")
+
+
 class MatchAnimeEntryMostSpecificContainmentTest(unittest.TestCase):
     """match_anime_entry's name/customPackage containment steps (card
     325571d6 review): with tokenizing, containment now actually fires on

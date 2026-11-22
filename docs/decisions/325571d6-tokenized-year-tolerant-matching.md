@@ -98,3 +98,22 @@ picked is done client-side (JS), purely as UX — the submitted
 season/episode values are still what `stuck_assign` treats as literal
 finals, so its contract and tests are unchanged; with JS disabled the raw
 parsed values submit as-is.
+
+## Subtitle entries and JDownloader's `:` → `;` package names (card 621c6372)
+
+Live stuck items: `Tokyo Revengers; War of the Three Titans/Tokyo.Revengers.2021.S04E0x...`
+against the entry "Tokyo Revengers: War of the Three Titans". Two causes:
+
+- `_tokenize` only split on `. _ whitespace -`, so `revengers;` ≠ `revengers:`. It now splits
+  on every non-word character (`[\W_]+`), dropping empty tokens, so punctuation drift between
+  the JDownloader package name and the entry name can't block containment. It is used for
+  matching only; the unmatched "would create X" name comes from the parsed filename, not tokens.
+- The filename's show name ("Tokyo Revengers" + year) omits the subtitle. A last-resort step
+  in `match_anime_entry` matches when the year-stripped name (≥2 tokens) is a strict
+  token-prefix of exactly ONE entry's name.
+
+Guards (prefer staying stuck over guessing): the prefix step runs only after every other step
+failed; it is skipped when the folder already names the show (it may carry a different
+subtitle); two prefix candidates, a one-token prefix, or years that differ on both sides all
+stay unmatched. Existing most-tokens-wins still sends a folder to "Tokyo Revengers: War of the
+Three Titans" over a bare "Tokyo Revengers" entry.

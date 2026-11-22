@@ -2091,6 +2091,26 @@ def match_anime_entry(parsed_name, dir_basename, anime_list, parsed_season=None)
         if _tokens_equal_year_tolerant(_tokenize(entry.get("name", "")), parsed_tokens):
             return _entry_to_match(entry, entry.get("customPackage", entry["name"]))
 
+    # @decision 325571d6 — last resort: the file's show name is a token-prefix
+    # of exactly ONE entry's name (a season subtitle the release omits);
+    # ambiguity stays stuck. See docs/decisions/325571d6-*.md.
+    core, parsed_year = _strip_single_year(parsed_tokens)
+    # A folder that already names the show (but matched no entry above) may
+    # carry a DIFFERENT subtitle, so only an unrelated folder lets the filename
+    # decide.
+    if len(core) >= 2 and not _tokens_contained(core, dir_tokens):
+        prefixed = []
+        for entry in anime_list:
+            e_tokens = _tokenize(entry.get("name", ""))
+            e_core, e_year = _strip_single_year(e_tokens)
+            if parsed_year and e_year and parsed_year != e_year:
+                continue
+            if len(e_core) > len(core) and e_core[:len(core)] == core:
+                prefixed.append(entry)
+        if len(prefixed) == 1:
+            entry = prefixed[0]
+            return _entry_to_match(entry, entry.get("customPackage", entry["name"]))
+
     return {
         "folder_name": parsed_name,
         "tvdb_season": None,
@@ -2133,10 +2153,15 @@ def _safe_folder_segment(name):
     return cleaned
 
 
-_TOKEN_SPLIT_RE = re.compile(r'[._\s\-]+')
+# @decision 325571d6 — splits on every non-word character, not just
+# separators, so JDownloader's ':' → ';' package-name rewrite can't glue
+# punctuation onto a token; see docs/decisions/325571d6-*.md.
+_TOKEN_SPLIT_RE = re.compile(r'[\W_]+')
 
 
 def _tokenize(s):
+    """Lowercased word tokens of ``s``; matching only — never used to build a
+    folder name, so the created/"would create" names are unaffected."""
     return [t for t in _TOKEN_SPLIT_RE.split((s or '').lower()) if t]
 
 

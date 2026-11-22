@@ -35,6 +35,68 @@ def _grouped(episode_numbers):
     return {ep: ["https://example.invalid/ep%d.mkv" % ep] for ep in episode_numbers}
 
 
+class BatchDiagTest(unittest.TestCase):
+    """`[BATCH-DIAG]` logging (card ec1eb846): diagnostic only, must not leak
+    URLs/hosts/tokens and must not change grouping."""
+
+    GANTZ = "Gantz.S%02dE%02d.German.DL.EAC3.1080p.WebDL.x264-PuddingSama.mkv"
+    SECRET = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6"
+
+    def _urls(self):
+        out = []
+        for s in (1, 2):
+            for e in (1, 2):
+                f = self.GANTZ % (s, e)
+                out.append(("https://host.example/dl/%s/%s?key=%s" % (self.SECRET, f, self.SECRET)).encode())
+        out.append(("https://host.example/f/%s" % self.SECRET).encode())
+        return out
+
+    def test_parse_season_episode(self):
+        p = animeloads._parse_season_episode_from_url
+        self.assertEqual(p("x.S02E13.mkv"), (2, 13))
+        self.assertEqual(p("x.s01e05.mkv"), (1, 5))
+        self.assertEqual(p("Show.Episode.7.mkv"), (None, 7))
+        self.assertEqual(p("Show - 12 .mkv"), (None, 12))
+        self.assertEqual(p("nothing.mkv"), (None, None))
+
+    def test_parse_episode_unchanged(self):
+        self.assertEqual(animeloads._parse_episode_from_url("x.S02E13.mkv"), 13)
+
+    def test_tail_scrubbed(self):
+        tail = animeloads._diag_filename_tail(
+            "https://host.example/dl/%s/%s?key=%s" % (self.SECRET, self.GANTZ % (1, 1), self.SECRET))
+        self.assertLessEqual(len(tail), 60)
+        self.assertNotIn("http", tail)
+        self.assertNotIn("/", tail)
+        self.assertNotIn(self.SECRET, tail)
+        self.assertIn("E01", tail)
+
+    def test_opaque_and_long_token_redacted(self):
+        self.assertEqual(animeloads._diag_filename_tail("https://h.example/f/" + self.SECRET), "<opaque>")
+        tail = animeloads._diag_filename_tail("https://h/x/%s.mkv" % self.SECRET)
+        self.assertNotIn(self.SECRET, tail)
+
+    def test_log_lines_do_not_leak(self):
+        with self.assertLogs("animeloads", level="INFO") as cm:
+            animeloads._log_batch_diag(self._urls())
+        text = "\n".join(cm.output)
+        for bad in ("http", "/", "host.example", self.SECRET, "key="):
+            self.assertNotIn(bad, text)
+        self.assertEqual(len([o for o in cm.output if "#" in o]), 5)
+        self.assertIn("season=1 count=2 max_ep=2", text)
+        self.assertIn("season=2 count=2 max_ep=2", text)
+        self.assertIn("season=None count=1", text)
+
+    def test_grouping_unchanged(self):
+        urls = self._urls()
+        before = animeloads._group_urls_by_episode(urls, 4)
+        with self.assertLogs("animeloads", level="INFO"):
+            animeloads._log_batch_diag(urls)
+        self.assertEqual(animeloads._group_urls_by_episode(urls, 4), before)
+        self.assertEqual(sorted(before), [1, 2])
+        self.assertEqual(len(before[1]), 2)
+
+
 class FormatEpRangeTest(unittest.TestCase):
     def test_single_episode(self):
         self.assertEqual(format_ep_range([5]), "5")

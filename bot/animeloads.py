@@ -100,6 +100,63 @@ def _parse_episode_from_url(url_str):
     return None
 
 
+def _parse_season_episode_from_url(url_str):
+    """Diagnostic twin of `_parse_episode_from_url`: returns (season, episode).
+
+    `season` is an int only when the SxxExx pattern matched, else None.
+    `episode` is exactly what `_parse_episode_from_url` returns (int or None).
+    Diagnostics only — grouping still uses `_parse_episode_from_url`.
+    """
+    m = re.search(r'[Ss](\d+)[Ee](\d+)', url_str)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None, _parse_episode_from_url(url_str)
+
+
+_DIAG_FILE_EXT = re.compile(r'\.(mkv|mp4|avi|rar|zip|7z|r\d{2,3})$', re.IGNORECASE)
+
+
+def _diag_filename_tail(url_str, limit=60):
+    """Hoster-secret-safe tail of a link for logging.
+
+    Drops scheme/host/path/query/fragment, keeps only the final path segment,
+    and only when it looks like a release file name (known media/archive
+    extension) — an opaque hoster file id is replaced by "<opaque>". Long
+    token-like runs are redacted and the result is capped to `limit` chars
+    (the tail is kept, since the season/episode/release group live there).
+    """
+    base = url_str.split('?', 1)[0].split('#', 1)[0].rstrip('/').rsplit('/', 1)[-1]
+    if not _DIAG_FILE_EXT.search(base):
+        return "<opaque>"
+    base = re.sub(r'[A-Za-z0-9_-]{24,}', '<tok>', base)
+    base = base.replace(':', '_')
+    return base[-limit:]
+
+
+def _log_batch_diag(links_decoded):
+    """Log one `[BATCH-DIAG]` INFO line per decrypted link plus a summary of
+    per-season counts and maxima. Diagnostic only — no URLs, hosts or tokens."""
+    per_season = {}
+    for i, url_bytes in enumerate(links_decoded, 1):
+        if not url_bytes:
+            continue
+        if isinstance(url_bytes, bytes):
+            url_str = url_bytes.decode('utf-8', errors='replace')
+        else:
+            url_str = str(url_bytes)
+        season, ep = _parse_season_episode_from_url(url_str)
+        _log.info("[BATCH-DIAG] #%d season=%s ep=%s file=%s",
+                  i, season, ep, _diag_filename_tail(url_str))
+        stats = per_season.setdefault(season, {"count": 0, "max": None})
+        stats["count"] += 1
+        if ep is not None and (stats["max"] is None or ep > stats["max"]):
+            stats["max"] = ep
+    summary = ", ".join(
+        "season=%s count=%d max_ep=%s" % (s, v["count"], v["max"])
+        for s, v in sorted(per_season.items(), key=lambda kv: (kv[0] is None, kv[0] or 0)))
+    _log.info("[BATCH-DIAG] summary: %s", summary or "no links")
+
+
 def _release_name_from_links(links_decoded):
     """Derive a release-name pattern from the first decoded CNL link.
 
@@ -1680,6 +1737,10 @@ return xhr.response"
             links_decoded = utils.decodeCNL(k, crypted)
             self._last_release_pattern = _release_name_from_links(links_decoded)
             _log.info("[BATCH] Decrypted %d links", len(links_decoded))
+            try:
+                _log_batch_diag(links_decoded)
+            except Exception:
+                _log.debug("[BATCH-DIAG] failed", exc_info=True)
         except Exception as e:
             _log.error("[BATCH] Failed to decrypt CNL: %s", e)
             driver.quit()

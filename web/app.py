@@ -2004,6 +2004,30 @@ def _stuck_target_filename(filename, season, episode):
     return "{} - S{:02d}E{:02d}{}".format(stem, season, episode, ext)
 
 
+def _absolute_season_shift(season_max_eps, tvdb_season, file_season):
+    """Episodes to add when a release folded several seasons into one run.
+
+    The bot records `season_max_eps` ({"1": 13, "2": 13}) when it renumbered a
+    multi-season batch absolutely. A file from a season later than the entry's
+    `tvdb_season` (Gantz: tvdb_season 1, file S02) is then filed in that
+    season at the sum of the earlier seasons' maxes plus its own episode.
+    Returns 0 — no shift — unless the entry has a tvdb_season, the file's
+    season is greater than it, and every season 1..file_season-1 is recorded.
+    An entry mapped to the file's own season is never shifted.
+    """
+    if not isinstance(season_max_eps, dict) or tvdb_season is None:
+        return 0
+    if file_season is None or file_season <= tvdb_season:
+        return 0
+    total = 0
+    for s in range(1, file_season):
+        m = season_max_eps.get(str(s), season_max_eps.get(s))
+        if not isinstance(m, int) or isinstance(m, bool) or m < 1:
+            return 0
+        total += m
+    return total
+
+
 def _lookup_anime_entries():
     """Load the anime list once per cycle for move lookups."""
     return load_ani().get("anime", [])
@@ -2025,6 +2049,7 @@ def _entry_to_match(entry, folder_name):
         "folder_name": _safe_folder_segment(folder_name),
         "tvdb_season": entry.get("tvdb_season"),
         "episode_offset": entry.get("episode_offset", 0) or 0,
+        "season_max_eps": entry.get("season_max_eps"),
         "media_type": entry.get("media_type", "series"),
         "year": entry.get("year"),
         "display_title": entry.get("display_title") or entry.get("name", ""),
@@ -2754,6 +2779,16 @@ def run_move_cycle():
                 entry_url = match.get("url", "") if match.get("matched") else ""
 
                 orig_season, orig_episode = season, episode
+
+                # Absolute renumber of a multi-season release folded into one
+                # TVDB season (the bot recorded season_max_eps); see
+                # docs/decisions/5dbc5b68-*.md. Runs before the offset.
+                shift = _absolute_season_shift(
+                    match.get("season_max_eps"), match["tvdb_season"], season)
+                if shift:
+                    episode += shift
+                    _log.info("[mover] absolute renumber S%02dE%02d → S%02dE%02d (season_max_eps)",
+                             orig_season, orig_episode, match["tvdb_season"], episode)
 
                 # TVDB season override
                 if match["tvdb_season"] is not None:

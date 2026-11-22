@@ -3065,6 +3065,45 @@ class RunMoveCycleTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(
             os.path.join(self.media, "Bleach", "S01", "Bleach.S01E17.mkv")))
 
+    def test_absolute_season_renumber_files_s02e05_as_s01e18(self):
+        # card 5dbc5b68: Gantz S02 folded into TVDB season 1 as E14-E26.
+        self._write_ani([{"name": "Gantz", "customPackage": "GantZ", "media_type": "series",
+                          "tvdb_season": 1, "season_max_eps": {"1": 13, "2": 13}}])
+        self._make_dl("GantZ", ["Gantz.S02E05.German.DL.1080p.mkv",
+                                "Gantz.S01E05.German.DL.1080p.mkv"])
+        with self.assertLogs("anime-web", level="INFO") as cm:
+            app.run_move_cycle()
+        self.assertIn("[mover] absolute renumber S02E05 \u2192 S01E18 (season_max_eps)",
+                      "\n".join(cm.output))
+        s1 = os.path.join(self.media, "GantZ", "S01")
+        self.assertTrue(os.path.isfile(os.path.join(s1, "Gantz.S01E18.German.DL.1080p.mkv")))
+        self.assertTrue(os.path.isfile(os.path.join(s1, "Gantz.S01E05.German.DL.1080p.mkv")))
+
+    def test_absolute_renumber_never_shifts_entry_mapped_to_its_own_season(self):
+        self._write_ani([{"name": "Gantz", "customPackage": "GantZ", "media_type": "series",
+                          "tvdb_season": 2, "season_max_eps": {"1": 13, "2": 13}}])
+        self._make_dl("GantZ", ["Gantz.S02E05.German.DL.1080p.mkv"])
+        app.run_move_cycle()
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.media, "GantZ", "S02", "Gantz.S02E05.German.DL.1080p.mkv")))
+
+    def test_absolute_shift_helper_edges(self):
+        f = app._absolute_season_shift
+        m = {"1": 13, "2": 13}
+        self.assertEqual(f(m, 1, 2), 13)
+        self.assertEqual(f(m, 1, 1), 0)
+        self.assertEqual(f(m, None, 2), 0)
+        self.assertEqual(f(None, 1, 2), 0)
+        self.assertEqual(f({"2": 13}, 1, 2), 0)  # earlier season missing: don't guess
+
+    def test_entry_edit_preserves_season_max_eps(self):
+        entry = {"name": "Gantz", "releaseID": 4, "tvdb_season": 1,
+                 "season_max_eps": {"1": 13, "2": 13}}
+        for edit, value in (("episodes", 5), ("paused", True),
+                            ("library", {"tvdb_season": 1, "episode_offset": 2})):
+            app.apply_entry_edit(entry, edit, value)
+            self.assertEqual(entry["season_max_eps"], {"1": 13, "2": 13})
+
     def test_negative_offset_taking_episode_to_zero_or_below_goes_stuck(self):
         # @decision 363098a6 — guard the result rather than file a bogus
         # E00 or negative episode; see docs/decisions.

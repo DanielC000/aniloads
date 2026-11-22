@@ -225,7 +225,7 @@ BOT_OWNED_SCALAR_FIELDS = (
     "episodes", "skip_until", "skip_real_airdate", "skip_recheck_at",
     "al_status", "al_max_episodes", "al_available_max", "al_available_max_set_at",
     "complete", "media_type", "year", "display_title", "download_folder_pattern",
-    "tvdb_series_status",
+    "tvdb_series_status", "season_max_eps",
 )
 BOT_OWNED_LIST_FIELDS = ("missing",)
 
@@ -2114,6 +2114,11 @@ def startbot():
                                 release_pattern = batch_result.get("release_pattern") or getattr(anime, '_last_release_pattern', '')
                                 if release_pattern:
                                     animeentry['download_folder_pattern'] = release_pattern
+                                # Per-season maxes the batch was renumbered with, so the
+                                # mover can file S02Exx files at their absolute episode.
+                                if batch_result.get("season_max_eps"):
+                                    animeentry['season_max_eps'] = {
+                                        str(s): m for s, m in batch_result["season_max_eps"].items()}
                                 if not save_ani(): continue
                                 if batch_result["episodes_not_found"]:
                                     _log.warning("[BATCH] Episoden nicht im Batch gefunden: %s — werden beim nächsten Lauf erneut versucht",

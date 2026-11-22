@@ -97,6 +97,87 @@ class BatchDiagTest(unittest.TestCase):
         self.assertEqual(len(before[1]), 2)
 
 
+def _gantz_urls():
+    """The live 37-link Gantz release (card 5dbc5b68): S01 16 links, S02 21
+    links; E01/E03/E07 of S01 and E02-E08/E13 of S02 are two-part rars."""
+    single = "https://h.example/Gantz.S%02dE%02d.German.DL.EAC3.1080p.WebDL.x264-PuddingSama.rar"
+    part = "https://h.example/S%02dE%02d.German.DL.EAC3.1080p.WebDL.x264-PuddingSama.part%d.rar"
+    out = []
+    for s, two_part in ((1, {1, 3, 7}), (2, set(range(2, 9)) | {13})):
+        for e in range(1, 14):
+            if e in two_part:
+                out += [(part % (s, e, 1)).encode(), (part % (s, e, 2)).encode()]
+            else:
+                out.append((single % (s, e)).encode())
+    return out
+
+
+class SeasonAwareGroupingTest(unittest.TestCase):
+    def test_fixture_is_37_links(self):
+        self.assertEqual(len(_gantz_urls()), 37)
+
+    def test_full_fixture_groups_into_1_to_26(self):
+        info = {}
+        with self.assertLogs("animeloads", level="INFO") as cm:
+            grouped = animeloads._group_urls_by_episode(_gantz_urls(), 26, info)
+        self.assertEqual(sorted(grouped), list(range(1, 27)))
+        self.assertEqual(info["season_max_eps"], {1: 13, 2: 13})
+        self.assertIn("season-aware numbering: seasons {1: 13, 2: 13}", "\n".join(cm.output))
+        self.assertEqual(sum(len(v) for v in grouped.values()), 37)
+
+    def test_wanted_14_to_26_selects_s02_including_both_rar_parts(self):
+        grouped = animeloads._group_urls_by_episode(_gantz_urls(), 26)
+        m = match_batch_episodes(set(range(14, 27)), grouped)
+        self.assertEqual(m["episodes_sent"], list(range(14, 27)))
+        self.assertEqual(m["available_max"], 26)
+        self.assertEqual(len(m["filtered_links"]), 21)
+        self.assertTrue(all("S02E" in u or "/S02" in u for u in m["filtered_links"]))
+        # S02E02 -> absolute 15: both parts present
+        self.assertEqual(len(grouped[15]), 2)
+        self.assertTrue(any("part1" in u for u in grouped[15]))
+        self.assertTrue(any("part2" in u for u in grouped[15]))
+
+    def test_last_season_may_be_partial(self):
+        urls = [u for u in _gantz_urls() if b"S02E13" not in u and b"S02E12" not in u]
+        info = {}
+        grouped = animeloads._group_urls_by_episode(urls, 26, info)
+        self.assertEqual(info["season_max_eps"], {1: 13, 2: 11})
+        self.assertEqual(sorted(grouped), list(range(1, 25)))
+
+    def test_incomplete_earlier_season_falls_back(self):
+        urls = [u for u in _gantz_urls() if b"S01E05" not in u]
+        info = {}
+        with self.assertLogs("animeloads", level="INFO") as cm:
+            grouped = animeloads._group_urls_by_episode(urls, 26, info)
+        self.assertEqual(sorted(grouped), list(range(1, 14)))
+        self.assertNotIn("season_max_eps", info)
+        self.assertIn("incomplete", "\n".join(cm.output))
+
+    def test_season_gap_or_not_starting_at_1_falls_back(self):
+        gap = [b"x.S01E01.mkv", b"x.S01E02.mkv", b"x.S03E01.mkv"]
+        self.assertEqual(sorted(animeloads._group_urls_by_episode(gap, 3)), [1, 2])
+        late = [b"x.S02E01.mkv", b"x.S03E01.mkv"]
+        self.assertEqual(sorted(animeloads._group_urls_by_episode(late, 2)), [1])
+
+    def test_single_season_unchanged(self):
+        urls = [("x.S01E%02d.mkv" % e).encode() for e in range(1, 6)]
+        info = {}
+        grouped = animeloads._group_urls_by_episode(urls, 5, info)
+        self.assertEqual(sorted(grouped), [1, 2, 3, 4, 5])
+        self.assertNotIn("season_max_eps", info)
+
+    def test_mixed_fixture_with_seasonless_link_falls_back(self):
+        urls = _gantz_urls() + [b"https://h.example/Gantz.Episode.5.rar"]
+        info = {}
+        grouped = animeloads._group_urls_by_episode(urls, 26, info)
+        self.assertEqual(sorted(grouped), list(range(1, 14)))
+        self.assertNotIn("season_max_eps", info)
+
+    def test_link_order_does_not_matter(self):
+        grouped = animeloads._group_urls_by_episode(list(reversed(_gantz_urls())), 26)
+        self.assertEqual(sorted(grouped), list(range(1, 27)))
+
+
 class FormatEpRangeTest(unittest.TestCase):
     def test_single_episode(self):
         self.assertEqual(format_ep_range([5]), "5")

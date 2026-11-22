@@ -199,7 +199,41 @@ def _count_episode_links(rel_dom, relID):
     return len(all_eps)
 
 
-def _group_urls_by_episode(decoded_urls, total_episodes):
+def _season_absolute_numbering(url_strs):
+    """Decide whether a batch spans several seasons that must be renumbered
+    into one absolute run (e.g. Gantz S01E01-13 + S02E01-13 -> 1-26).
+
+    Returns ``(season_max_eps, reason)``. `season_max_eps` is ``{season:
+    max_ep}`` (taken from the links themselves, never from link order) when
+    renumbering applies, else None with `reason` saying why not (None when
+    the batch is simply single-season). Renumbering needs every link to carry
+    a season and an episode, more than one season, a lowest season of 1, no
+    season gap, and every season but the last gapless 1..max — an earlier
+    season's max sets the offset for the ones after it. The last season may
+    be partial (still airing / a missing upload). Duplicate (season, ep)
+    entries (multi-part rars) are fine. Never guess: anything else keeps the
+    bare-episode numbering.
+    """
+    eps_by_season = {}
+    for url_str in url_strs:
+        season, ep = _parse_season_episode_from_url(url_str)
+        if season is None or ep is None:
+            return None, "a link has no parsed season/episode"
+        eps_by_season.setdefault(season, set()).add(ep)
+    if len(eps_by_season) < 2:
+        return None, None
+    seasons = sorted(eps_by_season)
+    if seasons[0] != 1:
+        return None, "lowest season is %d, not 1" % seasons[0]
+    if seasons != list(range(1, seasons[-1] + 1)):
+        return None, "season gap in %s" % seasons
+    for s in seasons[:-1]:
+        if eps_by_season[s] != set(range(1, max(eps_by_season[s]) + 1)):
+            return None, "season %d is incomplete" % s
+    return {s: max(eps_by_season[s]) for s in seasons}, None
+
+
+def _group_urls_by_episode(decoded_urls, total_episodes, season_info=None):
     """Group decrypted URL byte-strings by episode number.
 
     Returns dict mapping episode number, exactly as it appears in the
@@ -207,14 +241,33 @@ def _group_urls_by_episode(decoded_urls, total_episodes):
     to be 1-based — a release may number its episodes absolutely across
     cours (e.g. a season-2 release continuing from episode 41 instead of
     restarting at 1).
+
+    A multi-season batch (see `_season_absolute_numbering`) is renumbered
+    absolutely: earlier seasons' max episodes + ep. When `season_info` is a
+    dict it receives ``season_max_eps`` ({season: max_ep}) in that case.
     """
     grouped = {}
     unparsed = []
 
-    for url_bytes in decoded_urls:
-        if not url_bytes:
-            continue
-        url_str = url_bytes.decode('utf-8', errors='replace')
+    url_strs = [u.decode('utf-8', errors='replace') for u in decoded_urls if u]
+    season_max, why = _season_absolute_numbering(url_strs)
+    if season_max:
+        base, acc = {}, 0
+        for s in sorted(season_max):
+            base[s] = acc
+            acc += season_max[s]
+        for url_str in url_strs:
+            season, ep = _parse_season_episode_from_url(url_str)
+            grouped.setdefault(base[season] + ep, []).append(url_str)
+        _log.info("[BATCH] season-aware numbering: seasons %s → 1–%d",
+                  {s: season_max[s] for s in sorted(season_max)}, acc)
+        if season_info is not None:
+            season_info["season_max_eps"] = dict(season_max)
+        return grouped
+    if why:
+        _log.info("[BATCH] season-aware numbering skipped: %s", why)
+
+    for url_str in url_strs:
         ep = _parse_episode_from_url(url_str)
         if ep is not None:
             grouped.setdefault(ep, []).append(url_str)
@@ -1752,7 +1805,8 @@ return xhr.response"
 
         # Group URLs by episode number
         total_episodes = release.getEpisodeCount()
-        grouped = _group_urls_by_episode(links_decoded, total_episodes)
+        season_info = {}
+        grouped = _group_urls_by_episode(links_decoded, total_episodes, season_info)
         _log.info("[BATCH] Grouped into %d episodes: %s", len(grouped), sorted(grouped.keys()))
 
         match = _match_batch_episodes(wanted_episodes, grouped, episode_offset)
@@ -1811,7 +1865,10 @@ return xhr.response"
 
         _log.info("[BATCH] Erfolg: %d Episoden gesendet, %d fehlten",
                   len(episodes_sent), len(episodes_not_found))
-        return {"success": True, "episodes_sent": episodes_sent, "episodes_not_found": episodes_not_found, "available_max": available_max, "release_pattern": getattr(self, '_last_release_pattern', '')}
+        result = {"success": True, "episodes_sent": episodes_sent, "episodes_not_found": episodes_not_found, "available_max": available_max, "release_pattern": getattr(self, '_last_release_pattern', '')}
+        if season_info.get("season_max_eps"):
+            result["season_max_eps"] = season_info["season_max_eps"]
+        return result
 
 
 class release:

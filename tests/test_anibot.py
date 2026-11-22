@@ -946,6 +946,25 @@ class ComputeEntryDeltaTest(unittest.TestCase):
         self.assertEqual(fields, {})
         self.assertEqual(sorted(unset), ["al_available_max", "al_available_max_set_at"])
 
+    def test_season_max_eps_is_bot_owned_and_reaches_ani_json(self):
+        self.assertIn("season_max_eps", anibot.BOT_OWNED_SCALAR_FIELDS)
+        before = {"episodes": 13}
+        after = {"episodes": 26, "season_max_eps": {"1": 13, "2": 13}}
+        fields, unset, list_deltas = self._delta(before, after)
+        self.assertEqual(fields["season_max_eps"], {"1": 13, "2": 13})
+        import tempfile, json, os
+        tmp = tempfile.mkdtemp(prefix="aniloads-smax-")
+        path = os.path.join(tmp, "ani.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"settings": {}, "anime": [
+                {"name": "Gantz", "url": "http://x/g", "episodes": 13}]}, f)
+        anibot.merge_entry_fields_or_skip(path, "http://x/g", fields=fields, unset=unset,
+                                          list_deltas=list_deltas)
+        with open(path, encoding="utf-8") as f:
+            saved = json.load(f)["anime"][0]
+        self.assertEqual(saved["season_max_eps"], {"1": 13, "2": 13})
+        self.assertEqual(saved["episodes"], 26)
+
     def test_field_newly_appearing_is_a_field_not_unset(self):
         before = {}
         after = {"tvdb_series_status": "Continuing"}

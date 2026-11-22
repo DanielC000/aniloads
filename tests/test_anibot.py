@@ -1349,6 +1349,42 @@ class ResolveForceCheckTest(unittest.TestCase):
         self.assertFalse(anibot.resolve_force_check(self.path, "http://x/a"))
 
 
+class CapNeedsRevalidationTest(unittest.TestCase):
+    """The Gantz shape: cap 13 set today, DOM reports 26, entry has 13 eps.
+    A forced "Check now" must clear the same-day cap so the scrape reaches the
+    download decision instead of the complete-but-short throttle."""
+
+    TODAY = "2026-11-22"
+
+    def test_forced_check_revalidates_same_day_cap(self):
+        self.assertTrue(anibot.cap_needs_revalidation(13, self.TODAY, 26, self.TODAY, True))
+
+    def test_forced_check_unthrottled_and_wants_the_missing_episodes(self):
+        entry = {"al_available_max": 13, "al_available_max_set_at": self.TODAY}
+        cur = 26
+        if anibot.cap_needs_revalidation(entry["al_available_max"],
+                                         entry["al_available_max_set_at"],
+                                         cur, self.TODAY, True):
+            entry.pop("al_available_max")
+            entry.pop("al_available_max_set_at")
+        self.assertNotIn("al_available_max", entry)
+        # Throttle needs curEpisodes < al_max_episodes (26); cur stays 26.
+        self.assertFalse(cur < 26)
+        _, wanted_new = anibot.wanted_episodes([], 13, cur)
+        self.assertEqual(wanted_new, list(range(14, 27)))
+
+    def test_non_forced_same_day_cap_is_honoured(self):
+        self.assertFalse(anibot.cap_needs_revalidation(13, self.TODAY, 26, self.TODAY, False))
+
+    def test_prior_day_cap_cleared_with_or_without_force(self):
+        self.assertTrue(anibot.cap_needs_revalidation(13, "2026-11-21", 26, self.TODAY, False))
+        self.assertTrue(anibot.cap_needs_revalidation(13, None, 26, self.TODAY, False))
+
+    def test_no_cap_or_cap_not_below_dom_never_clears(self):
+        self.assertFalse(anibot.cap_needs_revalidation(None, None, 26, self.TODAY, True))
+        self.assertFalse(anibot.cap_needs_revalidation(26, self.TODAY, 26, self.TODAY, True))
+
+
 class PreScrapeSkipDecisionTest(unittest.TestCase):
     """Steps 1-3 of the smart-skip logic, and the force_check bypass that
     overrides all of them for one scrape."""

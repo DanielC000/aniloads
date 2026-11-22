@@ -18,6 +18,16 @@ episodes the site has since added. It's revalidated by clearing yesterday's cap 
 reports more episodes than the cap allows — if those new episodes are still phantom, the
 batch/single-episode download paths further down re-set the cap with today's date.
 
+## Forced check re-tests a same-day cap
+
+`cap_needs_revalidation()` clears a cap below the DOM count when it was set on an earlier day
+**or** the cycle is a `force_check`. Without the second clause a cap set today (Gantz: cap 13,
+DOM 26, 13 eps, Complete) clamped `curEpisodes` to 13, left `missing` empty and tripped the
+complete-but-short throttle, so "Check now" never reached the batch path. A user-forced check
+is a real check: the cap is cleared (logged `[CAP-RESET] ... forced check`), the scrape and
+batch run, and a still-unavailable episode re-sets the cap through the normal path. Non-forced
+cycles keep honouring a same-day cap. No release fallback.
+
 ## match_anime_entry's download_folder_pattern tiebreak (web/app.py)
 
 `web/app.py` — `match_anime_entry()`'s `download_folder_pattern` path, `_token_prefix_score`.
@@ -36,7 +46,7 @@ the tie is broken by preferring the entry whose `tvdb_season` matches.
 Don't let a `force_check` bypass apply more than once per request — it must be cleared
 unconditionally in `resolve_force_check()` regardless of whether the scrape that follows
 succeeds. Don't make the `al_available_max` cap permanent — it must be re-checked daily
-(`cap_set_at != today_iso`) and cleared when the DOM reports more episodes than it allows, or
+(`cap_set_at != today_iso`, or on a user-forced check — never a standing bypass) and cleared when the DOM reports more episodes than it allows, or
 genuinely-new episodes stay hidden forever behind a stale cap. Don't let
 `download_folder_pattern`'s longest-leading-token-run tiebreak ignore a parsed `SxxExx` when
 prefix scores tie — the filename's season is still authoritative.

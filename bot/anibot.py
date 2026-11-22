@@ -383,6 +383,14 @@ def wanted_episodes(missing, episodes, cur_episodes):
     wanted_new = list(range(episodes + 1, cur_episodes + 1)) if episodes < cur_episodes else []
     return wanted_missing, wanted_new
 
+def cap_needs_revalidation(cap, cap_set_at, cur_episodes, today_iso, force_check):
+    """True when an `al_available_max` cap below the DOM count must be cleared
+    and re-tested: it was set on an earlier day, or this cycle is a user-forced
+    "Check now" (so a same-day cap can't hide the episodes the user asked about).
+    @decision sha:a4cdbb9f"""
+    return (cap is not None and cap < cur_episodes
+            and (cap_set_at != today_iso or bool(force_check)))
+
 # @decision sha:2468ef04 — a run-now request must only wake the inter-cycle sleep
 # early and get consumed at the next cycle's start, never interrupt an in-flight cycle.
 RUN_NOW_FILE = "run_now"
@@ -2007,9 +2015,11 @@ def startbot():
                 today_iso = date.today().isoformat()
                 al_available_max = animeentry.get('al_available_max')
                 cap_set_at = animeentry.get('al_available_max_set_at')
-                if al_available_max is not None and al_available_max < curEpisodes and cap_set_at != today_iso:
+                if cap_needs_revalidation(al_available_max, cap_set_at, curEpisodes,
+                                          today_iso, force_check):
                     _log.info("[CAP-RESET] " + name + ": clearing stale al_available_max="
                               + str(al_available_max) + " (set " + (cap_set_at or "never")
+                              + (", forced check" if cap_set_at == today_iso else "")
                               + ") — DOM reports " + str(curEpisodes))
                     animeentry.pop('al_available_max', None)
                     animeentry.pop('al_available_max_set_at', None)
